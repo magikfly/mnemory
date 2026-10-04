@@ -1,5 +1,26 @@
 # Configuration Reference
 
+## Cognis-managed inference
+
+When managed inference is enabled, unset `LLM_REASONING_EFFORT`,
+`FIND_REASONING_EFFORT`, `FSCK_REASONING_EFFORT` and
+`CONSOLIDATION_REASONING_EFFORT` to inherit Cognis's routing defaults. Standalone
+implicit low/medium defaults are not sent in managed mode. Explicit values
+remain client overrides, including background maintenance/consolidation calls.
+Empty values omit effort.
+
+Set `COGNIS_INFERENCE_URL` to Cognis's `/v1` endpoint and
+`COGNIS_INFERENCE_TOKEN_FILE` to a protected file containing a Mnemory inference
+service JWT. Cognis then owns the global extraction, retrieval, consolidation,
+maintenance and embedding routes. Direct provider settings remain supported
+when these variables are absent.
+
+The SDK loads the JWT on each call, allowing startup before Cognis provisions
+the file and atomic rotation without restarting Mnemory. Missing credentials or
+routes mean inference is unavailable, not bypassed. Configure incoming Mnemory
+API JWT verification separately. `EMBED_DIMS` must match the selected global
+embedding model and stored vectors; changing embedding spaces requires reindexing.
+
 All configuration is via environment variables. Defaults are optimized for local development — just set `OPENAI_API_KEY` and run.
 
 Data is stored in `~/.mnemory/` by default. Override with `DATA_DIR` env var. In Docker, `DATA_DIR` is set to `/data` for volume mounting.

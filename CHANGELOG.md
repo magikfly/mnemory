@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.15.0] — 2026-10-04
+
+### Added
+
+- **Managed inference** — Added Cognis-managed model routing and service JWT authentication for inference requests.
+- **Memory browser** — Added creation-time sorting and date-range filters for browsing memories.
+
+### Bug Fixes
+
+- **Inference defaults** — Preserved explicitly configured reasoning effort and inherited managed inference defaults when no override is set.
+
 ## [1.14.0] — 2026-09-07
 
 ### Added

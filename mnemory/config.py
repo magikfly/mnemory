@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("mnemory")
@@ -20,6 +21,12 @@ logger = logging.getLogger("mnemory")
 
 def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
+
+
+def _reasoning_effort(key: str, standalone_default: str = "") -> str | None:
+    """Managed mode inherits Cognis effort unless explicitly configured."""
+    default = "" if _env("COGNIS_INFERENCE_URL") else standalone_default
+    return _env(key, default) or None
 
 
 def _env_int(key: str, default: int) -> int:
@@ -118,11 +125,19 @@ class LLMConfig:
 
     model: str = field(default_factory=lambda: _env("LLM_MODEL", "gpt-5.4-mini"))
     base_url: str = field(default_factory=_llm_base_url)
-    api_key: str = field(default_factory=_llm_api_key)
+    api_key: str | Callable[[], str] = field(default_factory=_llm_api_key)
     temperature: float = 0.1
     reasoning_effort: str | None = field(
         default_factory=lambda: _env("LLM_REASONING_EFFORT") or None
     )
+
+    def __post_init__(self) -> None:
+        from mnemory.inference import managed_endpoint, token_supplier
+
+        endpoint = managed_endpoint()
+        if endpoint:
+            self.base_url = endpoint
+            self.api_key = token_supplier()
 
 
 @dataclass
@@ -135,8 +150,16 @@ class EmbedConfig:
     base_url: str = field(
         default_factory=lambda: _env("EMBED_BASE_URL") or _llm_base_url()
     )
-    api_key: str = field(default_factory=_embed_api_key)
+    api_key: str | Callable[[], str] = field(default_factory=_embed_api_key)
     dims: int = field(default_factory=lambda: _env_int("EMBED_DIMS", 1536))
+
+    def __post_init__(self) -> None:
+        from mnemory.inference import managed_endpoint, token_supplier
+
+        endpoint = managed_endpoint()
+        if endpoint:
+            self.base_url = endpoint
+            self.api_key = token_supplier()
 
 
 @dataclass
@@ -453,7 +476,7 @@ class MemoryConfig:
     # need deep reasoning. Defaults to main LLM_MODEL with "low" reasoning.
     find_model: str = field(default_factory=lambda: _env("FIND_LLM_MODEL", ""))
     find_reasoning_effort: str | None = field(
-        default_factory=lambda: _env("FIND_REASONING_EFFORT", "low") or None
+        default_factory=lambda: _reasoning_effort("FIND_REASONING_EFFORT", "low")
     )
 
     # Default timezone for naive event_date values (no timezone info).
@@ -543,7 +566,7 @@ class MemoryConfig:
     # Defaults to "medium" because fsck is a batch operation where accuracy
     # matters more than latency.
     fsck_reasoning_effort: str | None = field(
-        default_factory=lambda: _env("FSCK_REASONING_EFFORT", "medium") or None
+        default_factory=lambda: _reasoning_effort("FSCK_REASONING_EFFORT", "medium")
     )
 
     # Auto-fsck: periodic background maintenance (0 = disabled)
@@ -589,7 +612,9 @@ class MemoryConfig:
     # consolidation processes pre-extracted content (not raw user input)
     # and benefits more from throughput than deep reasoning.
     consolidation_reasoning_effort: str | None = field(
-        default_factory=lambda: _env("CONSOLIDATION_REASONING_EFFORT", "low") or None
+        default_factory=lambda: _reasoning_effort(
+            "CONSOLIDATION_REASONING_EFFORT", "low"
+        )
     )
 
     # Minimum idle time (seconds) before a session is eligible for
@@ -679,6 +704,14 @@ class Config:
 
     def validate(self) -> None:
         """Validate that required configuration is present."""
+        from mnemory.inference import managed_endpoint
+
+        if managed_endpoint():
+            self.llm.model = "routes/mnemory_extraction"
+            self.embed.model = "routes/mnemory_embedding"
+            self.memory.find_model = "routes/mnemory_retrieval"
+            self.memory.fsck_model = "routes/mnemory_maintenance"
+            self.memory.consolidation_model = "routes/mnemory_consolidation"
         if not self.llm.api_key:
             raise ValueError("API key is required. Set LLM_API_KEY or OPENAI_API_KEY.")
         if self.artifact.backend not in ("s3", "filesystem"):
