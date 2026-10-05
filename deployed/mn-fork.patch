@@ -1,0 +1,119 @@
+--- deployed/mnemory_filter.v0.4.2.baseline.py
++++ deployed/mnemory_filter.v0.4.2.mn-fork.py
+@@ -65,6 +65,16 @@
+                 "Minimum relevance score (0.0-1.0) for recalled memories. "
+                 "Higher = fewer but more relevant memories injected. "
+                 "Prevents context bloat from weak matches on follow-up messages."
++            ),
++        )
++        # FORK-PATCH(1/4): currency labels on recalled memories.
++        recall_currency_labels: bool = Field(
++            default=True,
++            description=(
++                "Tag each recalled memory with its type and as-of date "
++                "(plus age in days) so the model can tell a dated plan "
++                "from a standing fact. Set False to restore the bare "
++                "upstream text-only rendering."
+             ),
+         )
+         recall_carry_max: int = Field(
+@@ -591,6 +601,54 @@
+         except Exception as exc:
+             _log.debug("mnemory: laya refine pass skipped (fail-open): %s", exc)
+ 
++    # ── FORK-PATCH(2/4): carry provenance into the recall block ───────
++    def _memory_line(self, item: dict) -> str:
++        """Render one search result as `text [type: … | as of: … (Nd ago)]`.
++
++        Upstream injects m["memory"] alone, so a plan recorded months ago
++        arrives as a bare present-tense assertion with nothing indicating
++        it is stale — that is exactly the shape a model reads as "now".
++        Items with no usable metadata are labelled `type: untyped` so the
++        absence of provenance is at least visible to the reader.
++        """
++        text = (item.get("memory") or "").strip()
++        if not text:
++            return ""
++        if not self.valves.recall_currency_labels:
++            return text
++        meta = item.get("metadata") or {}
++        bits: list[str] = []
++        mtype = meta.get("memory_type") or meta.get("type")
++        if mtype:
++            bits.append(f"type: {mtype}")
++        stamp = meta.get("event_date") or meta.get("created_at") or meta.get("created")
++        age = self._age_days(stamp)
++        if age is not None:
++            if isinstance(stamp, (int, float)):
++                day = time.strftime("%Y-%m-%d", time.localtime(float(stamp)))
++            else:
++                day = str(stamp)[:10]
++            bits.append(f"as of: {day} ({age}d ago)")
++        if not bits:
++            return f"{text} [type: untyped]"
++        return f"{text} [{' | '.join(bits)}]"
++
++    @staticmethod
++    def _age_days(stamp) -> int | None:
++        """Whole days between a memory timestamp and today; None if unusable."""
++        if not stamp:
++            return None
++        if isinstance(stamp, (int, float)):
++            return max(0, int((time.time() - float(stamp)) // 86400))
++        s = str(stamp)
++        for fmt, cut in (("%Y-%m-%dT%H:%M:%S", 19), ("%Y-%m-%d", 10)):
++            try:
++                parsed = time.strptime(s[:cut], fmt)
++            except ValueError:
++                continue
++            return max(0, int((time.time() - time.mktime(parsed)) // 86400))
++        return None
++
+     def _carry_recalled(
+         self, session_id: str, search_results: list | None
+     ) -> list[str]:
+@@ -613,7 +671,8 @@
+                     "mnemory: not carrying hygiene-violating recall: %.80s", text
+                 )
+                 continue
+-            bucket.append(text)
++            # FORK-PATCH(3/4): metadata rides with the text into the bucket
++            bucket.append(self._memory_line(m))
+ 
+         # Re-clean the whole bucket: catches pre-patch accumulation
+         # (historical near-dups) and replaces shorter cluster members
+@@ -890,7 +949,12 @@
+             # Carry-forward disabled — upstream behaviour: this turn only.
+             self._inject_recalled(
+                 body,
+-                [m["memory"] for m in result["search_results"] if m.get("memory")],
++                # FORK-PATCH(4a): same rendering as the carry path
++                [
++                    self._memory_line(m)
++                    for m in result["search_results"]
++                    if m.get("memory")
++                ],
+             )
+ 
+         # Show detailed status with stats
+@@ -984,7 +1048,19 @@
+         memories = [m for m in memories if not self._hygiene_violation(m)]
+         if not memories:
+             return
+-        block = "\n\n## Recalled Memories\n" + "\n".join(f"- {m}" for m in memories)
++        # FORK-PATCH(4b): header states the semantics of the tags.
++        if self.valves.recall_currency_labels:
++            head = (
++                "\n\n## Recalled Memories — every line is tagged `type:` and "
++                "`as of:` (date, age in days). These are records of past "
++                "sessions and of past states of the system. A plan carrying "
++                "an old date is history, not a live commitment; a config or "
++                "path detail may already be superseded. Do not state any of "
++                "them as current without verifying current state.\n"
++            )
++        else:
++            head = "\n\n## Recalled Memories\n"
++        block = head + "\n".join(f"- {m}" for m in memories)
+         messages = body.setdefault("messages", [])
+         for msg in reversed(messages):
+             if msg.get("role") == "user":
