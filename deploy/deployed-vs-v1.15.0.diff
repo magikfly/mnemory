@@ -1,7 +1,126 @@
+diff --git a/mnemory/api/fsck.py b/mnemory/api/fsck.py
+index 48365a0..6566e06 100644
+--- a/mnemory/api/fsck.py
++++ b/mnemory/api/fsck.py
+@@ -340,6 +340,10 @@ def apply_fsck(
+     return FsckApplyResponse(
+         applied=result.get("applied", 0),
+         skipped=result.get("skipped", 0),
++        # LOCAL-PATCH: forward the superseded count. FsckService.apply_check reports it
++        # and the schema has the field, but this handler built the response without it,
++        # so the summary read 0 while the per-issue details listed 73 superseded rows.
++        superseded=result.get("superseded", 0),
+         failed=result.get("failed", 0),
+         details=details,
+     )
+@@ -370,3 +374,4 @@ def re_evaluate_fsck_operation(
+     except RuntimeError as exc:
+         raise HTTPException(status_code=503, detail=str(exc)) from exc
+     return FsckReEvaluateResponse(**result)
++
+diff --git a/mnemory/api/schemas.py b/mnemory/api/schemas.py
+index 2d558bc..092aab5 100644
+--- a/mnemory/api/schemas.py
++++ b/mnemory/api/schemas.py
+@@ -880,7 +880,14 @@ class FsckApplyDetail(BaseModel):
+     """Result of applying a single issue."""
+ 
+     issue_id: str
+-    status: str = Field(..., description="Status: applied, skipped, failed")
++    # LOCAL-PATCH: 'superseded' = every target of this issue is gone from the store
++    # (a delete in an earlier apply already merged that row away), so the finding is
++    # resolved and there is nothing left to fix. Reported so the UI can drop the row
++    # instead of showing a fix that can never apply.
++    status: str = Field(
++        ...,
++        description="Status: applied, skipped, superseded, failed",
++    )
+     actions_executed: int = 0
+     actions_skipped: int = 0
+     error: str | None = None
+@@ -891,6 +898,9 @@ class FsckApplyResponse(BaseModel):
+ 
+     applied: int = 0
+     skipped: int = 0
++    # LOCAL-PATCH: surface the superseded count; without it these issues are counted
++    # as plain skips and give the operator no explanation for the stuck rows.
++    superseded: int = 0
+     failed: int = 0
+     details: list[FsckApplyDetail] = Field(default_factory=list)
+ 
+@@ -991,3 +1001,4 @@ def format_memory_item(item: dict) -> MemoryItem:
+         metadata=metadata if metadata else None,
+         has_artifacts=has_artifacts,
+     )
++
+diff --git a/mnemory/categories.py b/mnemory/categories.py
+index 6675b56..db46047 100644
+--- a/mnemory/categories.py
++++ b/mnemory/categories.py
+@@ -11,8 +11,12 @@ requiring configuration changes.
+ 
+ from __future__ import annotations
+ 
++import logging
++
+ from mnemory.sanitize import validate_category_name
+ 
++logger = logging.getLogger("mnemory.categories")
++
+ # Predefined categories with descriptions.
+ # These are always available and returned by list_categories even if empty.
+ PREDEFINED_CATEGORIES: dict[str, str] = {
+@@ -94,6 +98,32 @@ def validate_categories(categories: list[str]) -> list[str]:
+     return validated
+ 
+ 
++def sanitize_categories(categories: list[str] | None) -> list[str]:
++    """Coerce LLM-produced categories into the valid taxonomy.
++
++    LOCAL-PATCH: model output is not a validated API input. The extractor
++    invents tokens outside the taxonomy (observed: 'fact'), and the strict
++    validate_categories() raise in add_memory() aborts an ENTIRE consolidation
++    batch over one bad token. Drop unknown entries with a warning and keep the
++    rest. User-supplied API categories keep going through validate_categories()
++    unchanged, so API strictness is untouched.
++    """
++    if not categories:
++        return []
++
++    valid: list[str] = []
++    for cat in categories:
++        try:
++            valid.extend(validate_categories([cat]))
++        except ValueError:
++            logger.warning(
++                "Dropping invalid category %r (valid: %s)",
++                cat,
++                ", ".join(sorted(PREDEFINED_CATEGORIES)),
++            )
++    return valid
++
++
+ def validate_memory_type(memory_type: str) -> str:
+     """Validate a memory type string."""
+     memory_type = memory_type.strip().lower()
+@@ -157,3 +187,4 @@ def count_categories(memories: list[dict]) -> dict[str, int]:
+                 cat = cat.lower()
+                 counts[cat] = counts.get(cat, 0) + 1
+     return counts
++
 diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
+index 6776c15..dc07eb5 100644
 --- a/mnemory/consolidation.py
 +++ b/mnemory/consolidation.py
-@@ -900,7 +900,7 @@
+@@ -18,6 +18,7 @@ from collections.abc import Callable
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any
+ 
++from mnemory.categories import sanitize_categories
+ from mnemory.revisions import RevisionService, canonical_fingerprint
+ 
+ if TYPE_CHECKING:
+@@ -900,7 +901,7 @@ class ConsolidationService:
              - all_facts: list of consolidated fact dicts (with 'role' set)
              - raw_ids_map: list of (batch_facts, batch_raw_ids) tuples
          """
@@ -10,7 +129,7 @@ diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
          from mnemory.prompts import build_consolidation_prompt
  
          batch_size = self._config.memory.consolidation_batch_size
-@@ -926,7 +926,22 @@
+@@ -926,7 +927,22 @@ class ConsolidationService:
          # Accumulated context from prior batches (prevents cross-batch duplication)
          accumulated: list[dict] = []
  
@@ -34,13 +153,11 @@ diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
              if len(batches) > 1:
                  logger.info(
                      "Consolidation session %s [%s]: batch %d/%d (%d memories)",
-@@ -961,18 +976,39 @@
+@@ -961,18 +977,39 @@ class ConsolidationService:
                  operation="consolidation",
              )
  
 -            parsed = parse_json_response(response_text)
--
--            if not parsed or not isinstance(parsed.get("memories"), list):
 +            try:
 +                parsed = parse_json_response(response_text)
 +                batch_facts = parsed.get("memories") if parsed else None
@@ -59,7 +176,8 @@ diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
 +                        batch_idx + 1,
 +                        len(batch_facts),
 +                    )
-+
+ 
+-            if not parsed or not isinstance(parsed.get("memories"), list):
 +            if not batch_facts:
                  logger.warning(
                      "Consolidation session %s [%s] batch %d: invalid LLM output",
@@ -79,7 +197,7 @@ diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
              batch_raw_ids = [m["id"] for m in batch]
              source_aliases = {
                  f"S{index}": memory_id for index, memory_id in enumerate(batch_raw_ids)
-@@ -1011,6 +1047,17 @@
+@@ -1011,6 +1048,17 @@ class ConsolidationService:
                          batch_idx + 1,
                      )
                      continue
@@ -97,11 +215,10 @@ diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
                  f["derived_from"] = list(
                      dict.fromkeys(source_aliases[alias] for alias in aliases)
                  )
-@@ -1044,6 +1091,24 @@
-                         },
+@@ -1045,6 +1093,24 @@ class ConsolidationService:
                      }
                  )
-+
+ 
 +            # Coverage check: raw memories that no accepted fact references
 +            # are re-queued (bounded), so truncation degrades to smaller
 +            # batches instead of an unconsolidated remainder.
@@ -119,13 +236,43 @@ diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
 +                    len(leftover),
 +                )
 +                queue.append((batch_idx, leftover, attempts + 1))
- 
++
          return all_facts, raw_ids_map
  
+     def _validate_output(self, facts: list[dict], raw_count: int) -> str | None:
+@@ -1110,7 +1176,14 @@ class ConsolidationService:
+ 
+                 # Use LLM-assigned categories, fall back to raw memory
+                 # categories if the LLM returned an empty list
+-                categories = fact.get("categories") or fallback_categories
++                # LOCAL-PATCH: sanitize first. The extractor emits categories
++                # outside the taxonomy (observed: 'fact'); add_memory() validates
++                # strictly and raises, and this loop re-raises, so ONE bad token
++                # aborted the whole session recovery. Unknown tokens are now
++                # dropped with a warning and the rest of the batch survives.
++                categories = sanitize_categories(
++                    fact.get("categories") or fallback_categories
++                )
+ 
+                 memory_id = fact["memory_id"]
+                 revision_metadata = RevisionService.initial_metadata(
+@@ -1173,3 +1246,4 @@ class ConsolidationService:
+                 )
+                 raise
+         return stored_ids
++
 diff --git a/mnemory/fsck.py b/mnemory/fsck.py
+index 2dfd3c6..9c82525 100644
 --- a/mnemory/fsck.py
 +++ b/mnemory/fsck.py
-@@ -35,7 +35,7 @@
+@@ -29,13 +29,14 @@ from qdrant_client.models import PointStruct
+ 
+ from mnemory.categories import (
+     PREDEFINED_CATEGORIES,
++    sanitize_categories,
+     validate_categories,
+     validate_importance,
+     validate_memory_type,
  )
  from mnemory.config import Config
  from mnemory.embeddings import EmbeddingClient
@@ -134,7 +281,7 @@ diff --git a/mnemory/fsck.py b/mnemory/fsck.py
  from mnemory.prompts import (
      build_fsck_content_quality_prompt,
      build_fsck_duplicate_prompt,
-@@ -63,6 +63,9 @@
+@@ -63,6 +64,9 @@ _DUPLICATE_SIMILARITY_THRESHOLD = 0.75
  
  # Maximum memories per LLM quality-check batch.
  _QUALITY_BATCH_SIZE = 20
@@ -144,7 +291,220 @@ diff --git a/mnemory/fsck.py b/mnemory/fsck.py
  
  # Maximum memories per duplicate cluster sent to LLM.
  _MAX_CLUSTER_SIZE = 15
-@@ -2009,6 +2012,7 @@
+@@ -70,6 +74,20 @@ _MAX_CLUSTER_SIZE = 15
+ # Maximum similar neighbors to check per memory during duplicate detection.
+ _DUPLICATE_NEIGHBORS = 5
+ 
++# LOCAL-PATCH: action classes used to order apply (see _apply_priority).
++_DESTRUCTIVE_ACTIONS = frozenset({"delete"})
++
++
++def _apply_priority(issue: "FsckIssue") -> int:
++    """Order issues for apply: 0 = writes only, 1 = contains a delete.
++
++    All phases are computed against one corpus snapshot. Duplicate findings delete
++    rows that reclassify/contradiction findings also reference, so running them in
++    scan order makes those later issues unapplicable - permanently. Writes first
++    keeps their targets alive.
++    """
++    return 1 if any((a.action in _DESTRUCTIVE_ACTIONS) for a in issue.actions) else 0
++
+ 
+ # ── Data structures ──────────────────────────────────────────────────
+ 
+@@ -1051,6 +1069,50 @@ class FsckService:
+             session_agent_id + ":"
+         )
+ 
++    def _finding_is_stale(self, issue: FsckIssue) -> bool:
++        """True when no target is in the state the scan described any more.
++
++        A finding is obsolete (not pending) when every target has either been
++        deleted, or has a revision different from the one recorded at scan time -
++        the memory was rewritten by consolidation/chat writes after the plan was
++        built. The apply journal already encodes this: those operations are stored
++        as 'superseded', and apply_check refuses to replay a superseded operation.
++        That is correct behaviour, but it left the row on the review list with no
++        explanation. Staleness is what 'nothing left to fix' means here.
++        """
++        expected = {
++            memory.id: (memory.metadata or {}).get("revision")
++            for memory in issue.affected_memories
++        }
++        ids = {a.memory_id for a in issue.actions if a.memory_id} or set(expected)
++        if not ids:
++            return False
++        id_list = list(ids)
++        live = {m["id"]: m for m in self._vector.get_by_ids_strict(id_list) if m}
++        for memory_id in ids:
++            memory = live.get(memory_id)
++            if memory is None:
++                continue  # gone counts as moved on
++            exp = expected.get(memory_id)
++            current = (memory.get("metadata") or {}).get("revision")
++            if exp is None or current == exp:
++                return False  # this target is exactly as scanned - fix is live
++        return True
++
++    def _targets_all_absent(self, issue: FsckIssue) -> bool:
++        """True when every memory this issue targets is gone from the store.
++
++        LOCAL-PATCH companion to the superseded status in apply_check: such an
++        issue cannot ever apply, because the row it referred to has already been
++        merged away by a delete.
++        """
++        ids = {a.memory_id for a in issue.actions if a.memory_id}
++        if not ids:
++            ids = {m.id for m in issue.affected_memories if m.id}
++        if not ids:
++            return False
++        return all(self._vector.get_by_id(memory_id) is None for memory_id in ids)
++
+     def apply_check(
+         self,
+         check_id: str,
+@@ -1102,9 +1164,20 @@ class FsckService:
+         else:
+             issues = list(check.issues)
+ 
++        # LOCAL-PATCH: apply non-destructive fixes before deletes.
++        # Every phase is computed against one corpus snapshot, and duplicate issues
++        # delete rows that reclassify/contradiction issues also reference. In scan
++        # order the deletes run first, so those later issues find their target gone,
++        # execute zero actions, and stay on the review list forever (observed: 76 of
++        # 646 stuck, 71 of them pointing at deleted memories). Doing the writes
++        # first means a reclassify lands while its target still exists. Python's
++        # sort is stable, so scan order is preserved within each class.
++        issues.sort(key=_apply_priority)
++
+         applied = 0
+         skipped = 0
+         failed = 0
++        superseded = 0
+         details: list[dict] = []
+ 
+         for issue in issues:
+@@ -1138,6 +1211,30 @@ class FsckService:
+                         for memory in issue.affected_memories
+                     }
+                     for index, action in enumerate(issue.actions):
++                        # LOCAL-PATCH: the LLM proposes categories, and it invents
++                        # tokens outside the taxonomy (observed: 'news_briefing_flashcard',
++                        # 'weather'). Strict validation then aborts the write, so the
++                        # issue never applies and the row is stuck. Sanitize the
++                        # proposal here - before the plan and its fingerprints are
++                        # computed - so _apply_issue writes validated categories.
++                        if (
++                            isinstance(action.new_metadata, dict)
++                            and action.new_metadata.get("categories")
++                        ):
++                            proposed = action.new_metadata["categories"]
++                            cleaned = sanitize_categories(proposed)
++                            if cleaned != proposed:
++                                logger.info(
++                                    "Fsck apply: reclassifying with sanitized categories "
++                                    "%s -> %s (issue %s)",
++                                    proposed,
++                                    cleaned,
++                                    issue.issue_id,
++                                )
++                                action.new_metadata = {
++                                    **action.new_metadata,
++                                    "categories": cleaned,
++                                }
+                         source = (
+                             self._vector.get_by_id(action.memory_id)
+                             if action.memory_id
+@@ -1193,6 +1290,55 @@ class FsckService:
+                         "skipped",
+                         "superseded",
+                     }:
++                        # LOCAL-PATCH: this journal short-circuit is the reason an
++                        # "apply fix" row never disappears. The first apply recorded a
++                        # terminal 'skipped' operation for every issue whose targets were
++                        # gone, so every later click re-skips it here and the row stays
++                        # on the review list for the life of the check. When every target
++                        # is absent the finding is already resolved - the row was deleted
++                        # and merged into a survivor - so record it as superseded and let
++                        # it leave the list. Issues that still have a live target stay
++                        # visible and retryable through the normal path below (their
++                        # journal checkpoints are terminal, so re-executing them needs
++                        # the re-evaluate/terminalize flow, not a silent bypass).
++                        journal_status = existing_operation.get("status")
++                        # A journal entry of 'superseded' means the revision system
++                        # closed this operation - a newer operation on the same lineage
++                        # replaced it, and replaying it is refused by design. The finding
++                        # is therefore closed, not pending, so it must leave the review
++                        # list; the next scheduled scan re-raises it from current data if
++                        # the problem is still real. 'skipped' stays retryable (upstream
++                        # treats those as transient).
++                        if self._targets_all_absent(issue) or (
++                            journal_status == "superseded"
++                            or self._finding_is_stale(issue)
++                        ):
++                            check.applied_issue_ids.add(issue.issue_id)
++                            superseded += 1
++                            logger.info(
++                                "Fsck apply: issue %s (%s) marked superseded - journal=%s "
++                                "and no target is in the scanned state any more",
++                                issue.issue_id,
++                                issue.type,
++                                journal_status,
++                            )
++                            details.append(
++                                {
++                                    "issue_id": issue.issue_id,
++                                    "status": "superseded",
++                                    "actions_executed": 0,
++                                    "actions_skipped": len(plan),
++                                }
++                            )
++                            continue
++                        if journal_status != "committed":
++                            logger.info(
++                                "Fsck apply: issue %s (%s) journal=%s with live targets "
++                                "remaining - left for re-evaluate/terminalize",
++                                issue.issue_id,
++                                issue.type,
++                                journal_status,
++                            )
+                         skipped += 1
+                         details.append(
+                             {
+@@ -1506,6 +1652,24 @@ class FsckService:
+                     check.applied_issue_ids.add(issue.issue_id)
+                     applied += 1
+                     status = "applied"
++                elif self._targets_all_absent(issue):
++                    # LOCAL-PATCH: every target of this issue is gone from the store.
++                    # A delete in this run (or an earlier apply) already resolved the
++                    # finding by merging the row into a survivor, so there is nothing
++                    # left to fix - yet the original code deliberately left such issues
++                    # retryable "so transient misses don't permanently block fixes".
++                    # For a deleted target it is not transient, so the row sat on the
++                    # dashboard permanently. Mark it superseded so it leaves the list.
++                    check.applied_issue_ids.add(issue.issue_id)
++                    superseded += 1
++                    status = "superseded"
++                    logger.info(
++                        "Fsck apply: issue %s (%s) superseded - all %d target(s) are "
++                        "no longer in the store",
++                        issue.issue_id,
++                        issue.type,
++                        len({a.memory_id for a in issue.actions if a.memory_id}),
++                    )
+                 else:
+                     skipped += 1
+                     status = "skipped"
+@@ -1594,6 +1758,7 @@ class FsckService:
+         return {
+             "applied": applied,
+             "skipped": skipped,
++            "superseded": superseded,
+             "failed": failed,
+             "details": details,
+         }
+@@ -2009,6 +2174,7 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_security",
@@ -152,7 +512,7 @@ diff --git a/mnemory/fsck.py b/mnemory/fsck.py
          )
  
          try:
-@@ -2277,9 +2281,10 @@
+@@ -2277,9 +2443,10 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_dedup",
@@ -164,7 +524,7 @@ diff --git a/mnemory/fsck.py b/mnemory/fsck.py
          if not parsed or "issues" not in parsed:
              return []
  
-@@ -2456,6 +2461,7 @@
+@@ -2456,6 +2623,7 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_content_quality",
@@ -172,7 +532,7 @@ diff --git a/mnemory/fsck.py b/mnemory/fsck.py
          )
  
          return self._parse_quality_response(
-@@ -2479,11 +2485,39 @@
+@@ -2479,12 +2647,40 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_metadata_normalization",
@@ -182,7 +542,7 @@ diff --git a/mnemory/fsck.py b/mnemory/fsck.py
          return self._parse_quality_response(
              response, id_mapping, batch, default_type="reclassify"
          )
-+
+ 
 +    def _parse_llm_json(self, response: str, context: str) -> dict[str, Any] | None:
 +        """Parse an fsck reply, salvaging the issues that closed before a cut.
 +
@@ -209,10 +569,11 @@ diff --git a/mnemory/fsck.py b/mnemory/fsck.py
 +                context,
 +            )
 +            return None
- 
++
      def _parse_quality_response(
          self,
-@@ -2494,7 +2528,7 @@
+         response: str,
+@@ -2494,7 +2690,7 @@ class FsckService:
          default_type: str = "quality",
      ) -> list[FsckIssue]:
          """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
@@ -221,10 +582,16 @@ diff --git a/mnemory/fsck.py b/mnemory/fsck.py
          if not parsed or "issues" not in parsed:
              return []
  
+@@ -3134,3 +3330,4 @@ class FsckService:
+                 summary.security += 1
+             summary.total += 1
+         return summary
++
 diff --git a/mnemory/llm.py b/mnemory/llm.py
+index 3840ea2..3813c2d 100644
 --- a/mnemory/llm.py
 +++ b/mnemory/llm.py
-@@ -361,3 +361,52 @@
+@@ -361,3 +361,52 @@ def parse_json_response(text: str) -> dict[str, Any]:
              pass
  
      raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}")
@@ -278,9 +645,10 @@ diff --git a/mnemory/llm.py b/mnemory/llm.py
 +
 +    return objects or None
 diff --git a/mnemory/maintenance.py b/mnemory/maintenance.py
+index 0fdf054..b170677 100644
 --- a/mnemory/maintenance.py
 +++ b/mnemory/maintenance.py
-@@ -181,10 +181,11 @@
+@@ -181,10 +181,11 @@ class MaintenanceService:
          min_confidence = self._config.memory.fsck_auto_min_confidence
          min_severity = self._config.memory.fsck_auto_min_severity
  
@@ -296,7 +664,25 @@ diff --git a/mnemory/maintenance.py b/mnemory/maintenance.py
  
          check = self._fsck.get_check(check_id)
          if check is None or check.status != "completed":
-@@ -425,10 +426,11 @@
+@@ -221,11 +222,16 @@ class MaintenanceService:
+             result = self._fsck.apply_check(check_id, qualifying_ids)
+             fixes_applied = result.get("applied", 0)
+             fixes_failed = result.get("failed", 0)
++            # LOCAL-PATCH: log the two counts the old line swallowed. apply_check
++            # returns applied/skipped/superseded/failed, and skips were invisible -
++            # 635 queued with applied=559, failed=5 meant 71 silently stuck rows.
+             logger.info(
+-                "Auto-fsck (manual): user %s — applied=%d, failed=%d",
++                "Auto-fsck (manual): user %s — applied=%d, failed=%d, skipped=%d, superseded=%d",
+                 user_id,
+                 fixes_applied,
+                 fixes_failed,
++                result.get("skipped", 0),
++                result.get("superseded", 0),
+             )
+         else:
+             logger.debug(
+@@ -425,10 +431,11 @@ class MaintenanceService:
  
          # run_check() is synchronous and CPU/IO-bound (LLM calls via requests).
          # Run in a thread pool to avoid blocking the event loop.
@@ -311,10 +697,32 @@ diff --git a/mnemory/maintenance.py b/mnemory/maintenance.py
          )
  
          check = self._fsck.get_check(check_id)
+@@ -470,11 +477,14 @@ class MaintenanceService:
+                 )
+                 fixes_applied = result.get("applied", 0)
+                 fixes_failed = result.get("failed", 0)
++                # LOCAL-PATCH: see the manual-run site above.
+                 logger.info(
+-                    "Auto-fsck: user %s — applied=%d, failed=%d",
++                    "Auto-fsck: user %s — applied=%d, failed=%d, skipped=%d, superseded=%d",
+                     user_id,
+                     fixes_applied,
+                     fixes_failed,
++                    result.get("skipped", 0),
++                    result.get("superseded", 0),
+                 )
+             else:
+                 logger.debug(
+@@ -522,3 +532,4 @@ class MaintenanceService:
+         issue_sev_order = _SEVERITY_ORDER.get(severity.lower(), 0)
+         min_sev_order = _SEVERITY_ORDER.get(min_severity.lower(), 0)
+         return issue_sev_order >= min_sev_order
++
 diff --git a/mnemory/memory.py b/mnemory/memory.py
+index 095af66..2396e4d 100644
 --- a/mnemory/memory.py
 +++ b/mnemory/memory.py
-@@ -1344,13 +1344,15 @@
+@@ -1344,13 +1344,15 @@ class MemoryService:
              # shared memories, so both user and assistant facts are deduped
              # against the full visible set (agent-scoped + shared).
              # Exclude consolidated memories — remember dedup only touches raw layer.
@@ -331,7 +739,7 @@ diff --git a/mnemory/memory.py b/mnemory/memory.py
                  exclude_layers=["consolidated"],
              )
              # Dual-scope: also check shared memories when agent_id is set
-@@ -1366,7 +1368,7 @@
+@@ -1366,7 +1368,7 @@ class MemoryService:
                          owner_id=owner_id,
                          agent_id=None,
                          shared_only=True,
@@ -340,7 +748,7 @@ diff --git a/mnemory/memory.py b/mnemory/memory.py
                          exclude_layers=["consolidated"],
                      )
                  seen_ids: set[str] = set()
-@@ -1380,7 +1382,7 @@
+@@ -1380,7 +1382,7 @@ class MemoryService:
                      if mid and mid not in seen_ids:
                          seen_ids.add(mid)
                          merged.append(mem)
@@ -350,9 +758,10 @@ diff --git a/mnemory/memory.py b/mnemory/memory.py
              # Filter by dedup threshold
              candidates = [
 diff --git a/mnemory/prompts.py b/mnemory/prompts.py
+index 2c3d037..2b0c785 100644
 --- a/mnemory/prompts.py
 +++ b/mnemory/prompts.py
-@@ -513,12 +513,34 @@
+@@ -513,13 +513,35 @@ When an existing memory captures the same information, use CONFIRM only for new
  - "User moved to Berlin" CAN update "User lives in Prague"
    — same subject (user's location).
  - When in doubt between ADD and UPDATE, prefer ADD.
@@ -369,7 +778,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
  When updating, keep the same meaning but incorporate new
  information. When facts overlap, merge them into a single
  updated memory.
-+
+ 
 +### Content hygiene (SKIP regardless of newness)
 +
 +- SKIP facts containing unresolved template placeholders
@@ -386,10 +795,11 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
 +  own tool-use in the current conversation (e.g. "Assistant used
 +  tool X to do Y") unless they record a durable user preference or
 +  decision.
- 
++
  ### Dedup examples
  
-@@ -774,12 +796,34 @@
+ Existing: [{{"id": "0", "text": "User's email is john@example.com"}}]
+@@ -774,13 +796,35 @@ Assistant evidence cannot create independent validation. Use SKIP for unchanged
  - "Assistant now prefers brief responses" CAN update
    "Assistant prefers verbose responses" — same subject.
  - When in doubt between ADD and UPDATE, prefer ADD.
@@ -406,7 +816,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
  When updating, keep the same meaning but incorporate new
  information. When facts overlap, merge them into a single
  updated memory.
-+
+ 
 +### Content hygiene (SKIP regardless of newness)
 +
 +- SKIP facts containing unresolved template placeholders
@@ -423,10 +833,11 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
 +  own tool-use in the current conversation (e.g. "Assistant used
 +  tool X to do Y") unless they record a durable user preference or
 +  decision.
- 
++
  ### Dedup examples
  
-@@ -3620,7 +3664,13 @@
+ Existing: [{{"id": "0", "text": "Assistant's name is Bob"}}]
+@@ -3620,7 +3664,13 @@ def parse_dedup_response(
          raw_action = entry.get("action")
          fact_index = entry.get("fact_index")
          raw_text = entry.get("text")
@@ -441,7 +852,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
              if not silent:
                  logger.warning("Invalid field type in dedup response")
              return [], set()
-@@ -3633,7 +3683,7 @@
+@@ -3633,7 +3683,7 @@ def parse_dedup_response(
              "CONFIRMED": "CONFIRM",
          }
          action = aliases.get(raw_action.upper(), raw_action.upper())
@@ -450,7 +861,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
  
          if (
              not isinstance(fact_index, int)
-@@ -3644,10 +3694,27 @@
+@@ -3644,10 +3694,27 @@ def parse_dedup_response(
                  logger.warning("Invalid or duplicate fact_index in dedup response")
              return [], set()
  
@@ -479,7 +890,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
  
          raw_target = entry.get("target_id")
          if action in ("ADD", "SKIP") and raw_target is not None:
-@@ -4000,7 +4067,13 @@
+@@ -4000,7 +4067,13 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -494,7 +905,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
                              "description": "IDs of all memories involved",
                          },
                          "actions": {
-@@ -4019,7 +4092,12 @@
+@@ -4019,7 +4092,12 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
                                          "type": "string",
                                          "enum": ["update", "delete"],
                                      },
@@ -508,7 +919,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
                                      "new_content": {
                                          "type": ["string", "null"],
                                          "description": (
-@@ -4224,7 +4302,13 @@
+@@ -4224,7 +4302,13 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -523,7 +934,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
                              "description": "IDs of memories with this issue",
                          },
                          "actions": {
-@@ -4244,6 +4328,9 @@
+@@ -4244,6 +4328,9 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
                                      },
                                      "memory_id": {
                                          "type": "string",
@@ -533,7 +944,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
                                      },
                                      "new_content": {
                                          "type": ["string", "null"],
-@@ -4484,7 +4571,13 @@
+@@ -4484,7 +4571,13 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -548,7 +959,7 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
                              "description": "IDs of memories with this issue",
                          },
                          "actions": {
-@@ -4504,6 +4597,9 @@
+@@ -4504,6 +4597,9 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
                                      },
                                      "memory_id": {
                                          "type": "string",
@@ -559,9 +970,111 @@ diff --git a/mnemory/prompts.py b/mnemory/prompts.py
                                      "new_metadata": {
                                          "type": "object",
 diff --git a/mnemory/storage/vector.py b/mnemory/storage/vector.py
+index a341899..25f3afe 100644
 --- a/mnemory/storage/vector.py
 +++ b/mnemory/storage/vector.py
-@@ -2609,7 +2609,9 @@
+@@ -7,6 +7,7 @@ Supports both remote Qdrant (production) and local/embedded Qdrant
+ 
+ from __future__ import annotations
+ 
++import functools
+ import hashlib
+ import logging
+ import threading
+@@ -44,6 +45,63 @@ logger = logging.getLogger(__name__)
+ # but avoids MD5 deprecation warnings from security scanners).
+ _hash = hashlib.sha256
+ 
++# ---------------------------------------------------------------------------
++# LOCAL-PATCH: qdrant local-mode serialization
++# ---------------------------------------------------------------------------
++# qdrant-client's embedded (path=) mode is not thread-safe. In
++# LocalCollection._insert_points the payload list is appended
++# (local_collection.py:2618) BEFORE the per-vector deleted masks are extended
++# via np.append (lines 2640-2706). calculate_payload_mask sizes its mask from
++# len(payloads) and then indexes deleted[i] for every i, so any reader landing
++# in that window walks one past the end of the mask array:
++#   IndexError: index 5904 is out of bounds for axis 0 with size 5904
++# That is what killed fsck phase 1 (duplicate detection) - a 2299-memory scan
++# reading the collection while a live chat write was appending to it.
++# mnemory only guarded write-vs-write (_write_guard), never read-vs-write.
++# One RLock per storage path, held around every client call, closes the window.
++# RLock because write paths call read paths on the same thread.
++_LOCAL_LOCKS: dict[str, threading.RLock] = {}
++_LOCAL_LOCKS_GUARD = threading.Lock()
++
++
++def _local_lock_for(path: str) -> threading.RLock:
++    """Shared lock for one local Qdrant storage path (keyed, not per-instance).
++
++    qdrant-client reuses the same in-process LocalCollection for the same path,
++    so VectorStore and SessionSummaryStore must share one lock.
++    """
++    with _LOCAL_LOCKS_GUARD:
++        lock = _LOCAL_LOCKS.get(path)
++        if lock is None:
++            lock = threading.RLock()
++            _LOCAL_LOCKS[path] = lock
++        return lock
++
++
++class _LockedLocalClient:
++    """Thread-safe wrapper for a local-mode QdrantClient (see note above).
++
++    Every callable attribute is invoked under the shared lock; attribute and
++    property access passes through untouched. Remote mode is unaffected - the
++    server handles concurrency, so no wrapper is created for it.
++    """
++
++    def __init__(self, client: QdrantClient, lock: threading.RLock) -> None:
++        self._inner = client
++        self._lock = lock
++
++    def __getattr__(self, name: str):  # noqa: ANN401
++        attr = getattr(self._inner, name)
++        if callable(attr):
++
++            @functools.wraps(attr)
++            def _locked(*args, **kwargs):  # noqa: ANN002, ANN003
++                with self._lock:
++                    return attr(*args, **kwargs)
++
++            return _locked
++        return attr
++
+ 
+ def _build_labels_conditions(labels_filter: dict) -> list[FieldCondition]:
+     """Build Qdrant filter conditions from a labels dict.
+@@ -163,8 +221,14 @@ class VectorStore:
+         # concurrent writes. A lock serializes write operations in local
+         # mode. Remote Qdrant handles concurrency server-side, so no
+         # lock is needed.
+-        self._write_lock: threading.Lock | None = (
+-            threading.Lock() if not config.vector.is_remote else None
++        # LOCAL-PATCH: one shared RLock per local storage path, so writes AND
++        # reads serialize against each other (see _LockedLocalClient). Writes
++        # alone were never enough - fsck phase 1 crashed reading a collection
++        # that a live chat write was mid-append on.
++        self._write_lock: threading.RLock | None = (
++            None
++            if config.vector.is_remote
++            else _local_lock_for(config.vector.qdrant_path)
+         )
+ 
+     @contextmanager
+@@ -193,7 +257,10 @@ class VectorStore:
+             return QdrantClient(**kwargs)
+         else:
+             logger.info("Using local Qdrant at %s", vc.qdrant_path)
+-            return QdrantClient(path=vc.qdrant_path)
++            return _LockedLocalClient(
++                QdrantClient(path=vc.qdrant_path),
++                _local_lock_for(vc.qdrant_path),
++            )
+ 
+     def _ensure_collection(self) -> None:
+         """Create the collection if it doesn't exist, then ensure indexes.
+@@ -2609,7 +2676,9 @@ class SessionSummaryStore:
              must=[
                  FieldCondition(
                      key="consolidation_state",
@@ -572,7 +1085,7 @@ diff --git a/mnemory/storage/vector.py b/mnemory/storage/vector.py
                  ),
                  IsEmptyCondition(is_empty=PayloadField(key="retry_operation_token")),
              ]
-@@ -2756,7 +2758,9 @@
+@@ -2756,7 +2825,9 @@ class SessionSummaryStore:
                      ),
                      FieldCondition(
                          key="consolidation_state",
@@ -583,3 +1096,8 @@ diff --git a/mnemory/storage/vector.py b/mnemory/storage/vector.py
                      ),
                      FieldCondition(
                          key="session_revision",
+@@ -3246,3 +3317,4 @@ class SessionSummaryStore:
+             }
+ 
+         return page
++
