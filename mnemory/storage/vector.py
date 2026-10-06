@@ -2609,7 +2609,9 @@ class SessionSummaryStore:
             must=[
                 FieldCondition(
                     key="consolidation_state",
-                    match=MatchAny(any=["idle", "consolidating"]),
+                    # "failed" is re-queued: a session that failed once is
+                    # not terminal, it gets retried on the next sweep.
+                    match=MatchAny(any=["idle", "consolidating", "failed"]),
                 ),
                 IsEmptyCondition(is_empty=PayloadField(key="retry_operation_token")),
             ]
@@ -2756,7 +2758,9 @@ class SessionSummaryStore:
                     ),
                     FieldCondition(
                         key="consolidation_state",
-                        match=MatchValue(value="idle"),
+                        # A failed session is claimable: the scan filter
+                        # re-queues it, the claim must accept that state.
+                        match=MatchAny(any=["idle", "failed"]),
                     ),
                     FieldCondition(
                         key="session_revision",

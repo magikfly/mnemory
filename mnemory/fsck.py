@@ -35,7 +35,7 @@ from mnemory.categories import (
 )
 from mnemory.config import Config
 from mnemory.embeddings import EmbeddingClient
-from mnemory.llm import LLMClient, parse_json_response
+from mnemory.llm import LLMClient, parse_json_response, salvage_json_objects
 from mnemory.prompts import (
     build_fsck_content_quality_prompt,
     build_fsck_duplicate_prompt,
@@ -63,6 +63,9 @@ _DUPLICATE_SIMILARITY_THRESHOLD = 0.75
 
 # Maximum memories per LLM quality-check batch.
 _QUALITY_BATCH_SIZE = 20
+# fsck batches are 20 memories and the reply is a short issue list. The 16384
+# default let a looping model burn 74s and 16k tokens before the parse failed.
+_FSCK_MAX_TOKENS = 4096
 
 # Maximum memories per duplicate cluster sent to LLM.
 _MAX_CLUSTER_SIZE = 15
@@ -2009,6 +2012,7 @@ class FsckService:
             temperature=0.1,
             reasoning_effort=self._reasoning_effort,
             operation="fsck_security",
+            max_tokens=_FSCK_MAX_TOKENS,
         )
 
         try:
@@ -2277,9 +2281,10 @@ class FsckService:
             temperature=0.1,
             reasoning_effort=self._reasoning_effort,
             operation="fsck_dedup",
+            max_tokens=_FSCK_MAX_TOKENS,
         )
 
-        parsed = parse_json_response(response)
+        parsed = self._parse_llm_json(response, "duplicate check")
         if not parsed or "issues" not in parsed:
             return []
 
@@ -2456,6 +2461,7 @@ class FsckService:
             temperature=0.1,
             reasoning_effort=self._reasoning_effort,
             operation="fsck_content_quality",
+            max_tokens=_FSCK_MAX_TOKENS,
         )
 
         return self._parse_quality_response(
@@ -2479,11 +2485,39 @@ class FsckService:
             temperature=0.1,
             reasoning_effort=self._reasoning_effort,
             operation="fsck_metadata_normalization",
+            max_tokens=_FSCK_MAX_TOKENS,
         )
 
         return self._parse_quality_response(
             response, id_mapping, batch, default_type="reclassify"
         )
+
+    def _parse_llm_json(self, response: str, context: str) -> dict[str, Any] | None:
+        """Parse an fsck reply, salvaging the issues that closed before a cut.
+
+        Truncation must not raise: the batch is skipped and the run continues.
+        Salvaged objects still pass the alias/ID validation downstream, so a
+        whitespace or unknown memory_id cannot reach an UPDATE.
+        """
+        try:
+            parsed = parse_json_response(response)
+            if isinstance(parsed, dict) and isinstance(parsed.get("issues"), list):
+                return parsed
+            return None
+        except ValueError:
+            salvaged = salvage_json_objects(response, "issues")
+            if salvaged:
+                logger.warning(
+                    "Fsck %s: truncated response, salvaged %d complete issues",
+                    context,
+                    len(salvaged.get("issues", [])),
+                )
+                return salvaged
+            logger.warning(
+                "Fsck %s: unparseable response after salvage, skipping batch",
+                context,
+            )
+            return None
 
     def _parse_quality_response(
         self,
@@ -2494,7 +2528,7 @@ class FsckService:
         default_type: str = "quality",
     ) -> list[FsckIssue]:
         """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
-        parsed = parse_json_response(response)
+        parsed = self._parse_llm_json(response, "quality check")
         if not parsed or "issues" not in parsed:
             return []
 

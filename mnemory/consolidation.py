@@ -900,7 +900,7 @@ class ConsolidationService:
             - all_facts: list of consolidated fact dicts (with 'role' set)
             - raw_ids_map: list of (batch_facts, batch_raw_ids) tuples
         """
-        from mnemory.llm import parse_json_response
+        from mnemory.llm import parse_json_response, salvage_json_objects
         from mnemory.prompts import build_consolidation_prompt
 
         batch_size = self._config.memory.consolidation_batch_size
@@ -926,7 +926,22 @@ class ConsolidationService:
         # Accumulated context from prior batches (prevents cross-batch duplication)
         accumulated: list[dict] = []
 
-        for batch_idx, batch in enumerate(batches):
+        # Normalized texts already consolidated in prior runs. The small
+        # model re-emits the same fact on every re-queued pass, so equality
+        # is checked before any durable write.
+        def _norm(text: str) -> str:
+            return " ".join(text.split()).lower()
+
+        seen_norms = {_norm(m.get("memory", "")) for m in previous_consolidated}
+
+        # Queue-based batches. A truncated LLM answer is salvaged and the
+        # raw memories no fact references are re-queued, so a bad tail can
+        # no longer abort the session and strand everything as raw.
+        queue: list[tuple[int, list[dict], int]] = [
+            (idx, b, 0) for idx, b in enumerate(batches)
+        ]
+        while queue:
+            batch_idx, batch, attempts = queue.pop(0)
             if len(batches) > 1:
                 logger.info(
                     "Consolidation session %s [%s]: batch %d/%d (%d memories)",
@@ -961,18 +976,39 @@ class ConsolidationService:
                 operation="consolidation",
             )
 
-            parsed = parse_json_response(response_text)
+            try:
+                parsed = parse_json_response(response_text)
+                batch_facts = parsed.get("memories") if parsed else None
+                if not isinstance(batch_facts, list):
+                    batch_facts = None
+            except ValueError:
+                # Output hit max_tokens (finish_reason=length). Keep the
+                # objects that closed before the cut instead of raising.
+                batch_facts = salvage_json_objects(response_text)
+                if batch_facts:
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: truncated "
+                        "output, salvaged %d complete facts",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                        len(batch_facts),
+                    )
 
-            if not parsed or not isinstance(parsed.get("memories"), list):
+            if not batch_facts:
                 logger.warning(
                     "Consolidation session %s [%s] batch %d: invalid LLM output",
                     session_id,
                     role,
                     batch_idx + 1,
                 )
+                # Nothing closed before the cut: halve the batch and retry,
+                # a smaller prompt fits inside the output cap.
+                if attempts < 2 and len(batch) > 4:
+                    mid = len(batch) // 2
+                    queue.insert(0, (batch_idx, batch[mid:], attempts + 1))
+                    queue.insert(0, (batch_idx, batch[:mid], attempts + 1))
                 continue
-
-            batch_facts = parsed["memories"]
             batch_raw_ids = [m["id"] for m in batch]
             source_aliases = {
                 f"S{index}": memory_id for index, memory_id in enumerate(batch_raw_ids)
@@ -1011,6 +1047,17 @@ class ConsolidationService:
                         batch_idx + 1,
                     )
                     continue
+                norm = _norm(f.get("text", ""))
+                if norm in seen_norms:
+                    logger.info(
+                        "Consolidation session %s [%s] batch %d: "
+                        "duplicate fact skipped",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                    )
+                    continue
+                seen_norms.add(norm)
                 f["derived_from"] = list(
                     dict.fromkeys(source_aliases[alias] for alias in aliases)
                 )
@@ -1044,6 +1091,24 @@ class ConsolidationService:
                         },
                     }
                 )
+
+            # Coverage check: raw memories that no accepted fact references
+            # are re-queued (bounded), so truncation degrades to smaller
+            # batches instead of an unconsolidated remainder.
+            covered = {
+                rid for fact in batch_facts for rid in fact.get("derived_from", [])
+            }
+            leftover = [m for m in batch if m["id"] not in covered]
+            if leftover and len(leftover) < len(batch) and attempts < 2:
+                logger.info(
+                    "Consolidation session %s [%s] batch %d: %d raw uncovered, "
+                    "re-queueing",
+                    session_id,
+                    role,
+                    batch_idx + 1,
+                    len(leftover),
+                )
+                queue.append((batch_idx, leftover, attempts + 1))
 
         return all_facts, raw_ids_map
 

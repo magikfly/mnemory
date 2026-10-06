@@ -1344,13 +1344,15 @@ class MemoryService:
             # shared memories, so both user and assistant facts are deduped
             # against the full visible set (agent-scoped + shared).
             # Exclude consolidated memories — remember dedup only touches raw layer.
+            # Candidate pool widened 5 -> 10: rephrased near-duplicates
+            # were ranking below the top-5 and slipping through as ADDs.
             existing_raw = self.vector.search_similar(
                 vector,
                 user_id=user_id,
                 owner_id=owner_id,
                 subject_user_id=user_id,
                 agent_id=agent_id,
-                limit=5,
+                limit=10,
                 exclude_layers=["consolidated"],
             )
             # Dual-scope: also check shared memories when agent_id is set
@@ -1366,7 +1368,7 @@ class MemoryService:
                         owner_id=owner_id,
                         agent_id=None,
                         shared_only=True,
-                        limit=5,
+                        limit=10,
                         exclude_layers=["consolidated"],
                     )
                 seen_ids: set[str] = set()
@@ -1380,7 +1382,7 @@ class MemoryService:
                     if mid and mid not in seen_ids:
                         seen_ids.add(mid)
                         merged.append(mem)
-                existing_raw = merged[:5]
+                existing_raw = merged[:10]
 
             # Filter by dedup threshold
             candidates = [

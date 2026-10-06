@@ -1,0 +1,585 @@
+diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
+--- a/mnemory/consolidation.py
++++ b/mnemory/consolidation.py
+@@ -900,7 +900,7 @@
+             - all_facts: list of consolidated fact dicts (with 'role' set)
+             - raw_ids_map: list of (batch_facts, batch_raw_ids) tuples
+         """
+-        from mnemory.llm import parse_json_response
++        from mnemory.llm import parse_json_response, salvage_json_objects
+         from mnemory.prompts import build_consolidation_prompt
+ 
+         batch_size = self._config.memory.consolidation_batch_size
+@@ -926,7 +926,22 @@
+         # Accumulated context from prior batches (prevents cross-batch duplication)
+         accumulated: list[dict] = []
+ 
+-        for batch_idx, batch in enumerate(batches):
++        # Normalized texts already consolidated in prior runs. The small
++        # model re-emits the same fact on every re-queued pass, so equality
++        # is checked before any durable write.
++        def _norm(text: str) -> str:
++            return " ".join(text.split()).lower()
++
++        seen_norms = {_norm(m.get("memory", "")) for m in previous_consolidated}
++
++        # Queue-based batches. A truncated LLM answer is salvaged and the
++        # raw memories no fact references are re-queued, so a bad tail can
++        # no longer abort the session and strand everything as raw.
++        queue: list[tuple[int, list[dict], int]] = [
++            (idx, b, 0) for idx, b in enumerate(batches)
++        ]
++        while queue:
++            batch_idx, batch, attempts = queue.pop(0)
+             if len(batches) > 1:
+                 logger.info(
+                     "Consolidation session %s [%s]: batch %d/%d (%d memories)",
+@@ -961,18 +976,39 @@
+                 operation="consolidation",
+             )
+ 
+-            parsed = parse_json_response(response_text)
+-
+-            if not parsed or not isinstance(parsed.get("memories"), list):
++            try:
++                parsed = parse_json_response(response_text)
++                batch_facts = parsed.get("memories") if parsed else None
++                if not isinstance(batch_facts, list):
++                    batch_facts = None
++            except ValueError:
++                # Output hit max_tokens (finish_reason=length). Keep the
++                # objects that closed before the cut instead of raising.
++                batch_facts = salvage_json_objects(response_text)
++                if batch_facts:
++                    logger.warning(
++                        "Consolidation session %s [%s] batch %d: truncated "
++                        "output, salvaged %d complete facts",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                        len(batch_facts),
++                    )
++
++            if not batch_facts:
+                 logger.warning(
+                     "Consolidation session %s [%s] batch %d: invalid LLM output",
+                     session_id,
+                     role,
+                     batch_idx + 1,
+                 )
++                # Nothing closed before the cut: halve the batch and retry,
++                # a smaller prompt fits inside the output cap.
++                if attempts < 2 and len(batch) > 4:
++                    mid = len(batch) // 2
++                    queue.insert(0, (batch_idx, batch[mid:], attempts + 1))
++                    queue.insert(0, (batch_idx, batch[:mid], attempts + 1))
+                 continue
+-
+-            batch_facts = parsed["memories"]
+             batch_raw_ids = [m["id"] for m in batch]
+             source_aliases = {
+                 f"S{index}": memory_id for index, memory_id in enumerate(batch_raw_ids)
+@@ -1011,6 +1047,17 @@
+                         batch_idx + 1,
+                     )
+                     continue
++                norm = _norm(f.get("text", ""))
++                if norm in seen_norms:
++                    logger.info(
++                        "Consolidation session %s [%s] batch %d: "
++                        "duplicate fact skipped",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                    )
++                    continue
++                seen_norms.add(norm)
+                 f["derived_from"] = list(
+                     dict.fromkeys(source_aliases[alias] for alias in aliases)
+                 )
+@@ -1044,6 +1091,24 @@
+                         },
+                     }
+                 )
++
++            # Coverage check: raw memories that no accepted fact references
++            # are re-queued (bounded), so truncation degrades to smaller
++            # batches instead of an unconsolidated remainder.
++            covered = {
++                rid for fact in batch_facts for rid in fact.get("derived_from", [])
++            }
++            leftover = [m for m in batch if m["id"] not in covered]
++            if leftover and len(leftover) < len(batch) and attempts < 2:
++                logger.info(
++                    "Consolidation session %s [%s] batch %d: %d raw uncovered, "
++                    "re-queueing",
++                    session_id,
++                    role,
++                    batch_idx + 1,
++                    len(leftover),
++                )
++                queue.append((batch_idx, leftover, attempts + 1))
+ 
+         return all_facts, raw_ids_map
+ 
+diff --git a/mnemory/fsck.py b/mnemory/fsck.py
+--- a/mnemory/fsck.py
++++ b/mnemory/fsck.py
+@@ -35,7 +35,7 @@
+ )
+ from mnemory.config import Config
+ from mnemory.embeddings import EmbeddingClient
+-from mnemory.llm import LLMClient, parse_json_response
++from mnemory.llm import LLMClient, parse_json_response, salvage_json_objects
+ from mnemory.prompts import (
+     build_fsck_content_quality_prompt,
+     build_fsck_duplicate_prompt,
+@@ -63,6 +63,9 @@
+ 
+ # Maximum memories per LLM quality-check batch.
+ _QUALITY_BATCH_SIZE = 20
++# fsck batches are 20 memories and the reply is a short issue list. The 16384
++# default let a looping model burn 74s and 16k tokens before the parse failed.
++_FSCK_MAX_TOKENS = 4096
+ 
+ # Maximum memories per duplicate cluster sent to LLM.
+ _MAX_CLUSTER_SIZE = 15
+@@ -2009,6 +2012,7 @@
+             temperature=0.1,
+             reasoning_effort=self._reasoning_effort,
+             operation="fsck_security",
++            max_tokens=_FSCK_MAX_TOKENS,
+         )
+ 
+         try:
+@@ -2277,9 +2281,10 @@
+             temperature=0.1,
+             reasoning_effort=self._reasoning_effort,
+             operation="fsck_dedup",
++            max_tokens=_FSCK_MAX_TOKENS,
+         )
+ 
+-        parsed = parse_json_response(response)
++        parsed = self._parse_llm_json(response, "duplicate check")
+         if not parsed or "issues" not in parsed:
+             return []
+ 
+@@ -2456,6 +2461,7 @@
+             temperature=0.1,
+             reasoning_effort=self._reasoning_effort,
+             operation="fsck_content_quality",
++            max_tokens=_FSCK_MAX_TOKENS,
+         )
+ 
+         return self._parse_quality_response(
+@@ -2479,11 +2485,39 @@
+             temperature=0.1,
+             reasoning_effort=self._reasoning_effort,
+             operation="fsck_metadata_normalization",
++            max_tokens=_FSCK_MAX_TOKENS,
+         )
+ 
+         return self._parse_quality_response(
+             response, id_mapping, batch, default_type="reclassify"
+         )
++
++    def _parse_llm_json(self, response: str, context: str) -> dict[str, Any] | None:
++        """Parse an fsck reply, salvaging the issues that closed before a cut.
++
++        Truncation must not raise: the batch is skipped and the run continues.
++        Salvaged objects still pass the alias/ID validation downstream, so a
++        whitespace or unknown memory_id cannot reach an UPDATE.
++        """
++        try:
++            parsed = parse_json_response(response)
++            if isinstance(parsed, dict) and isinstance(parsed.get("issues"), list):
++                return parsed
++            return None
++        except ValueError:
++            salvaged = salvage_json_objects(response, "issues")
++            if salvaged:
++                logger.warning(
++                    "Fsck %s: truncated response, salvaged %d complete issues",
++                    context,
++                    len(salvaged.get("issues", [])),
++                )
++                return salvaged
++            logger.warning(
++                "Fsck %s: unparseable response after salvage, skipping batch",
++                context,
++            )
++            return None
+ 
+     def _parse_quality_response(
+         self,
+@@ -2494,7 +2528,7 @@
+         default_type: str = "quality",
+     ) -> list[FsckIssue]:
+         """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
+-        parsed = parse_json_response(response)
++        parsed = self._parse_llm_json(response, "quality check")
+         if not parsed or "issues" not in parsed:
+             return []
+ 
+diff --git a/mnemory/llm.py b/mnemory/llm.py
+--- a/mnemory/llm.py
++++ b/mnemory/llm.py
+@@ -361,3 +361,52 @@
+             pass
+ 
+     raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}")
++
++
++def salvage_json_objects(text: str, key: str = "memories") -> list[dict[str, Any]] | None:
++    """Recover complete objects from a truncated JSON array in an LLM reply.
++
++    A response cut off by the token cap keeps every fully closed object
++    before the cut. Walk the array, collect complete objects, ignore the
++    trailing fragment. Returns None when nothing is recoverable.
++    """
++    cleaned = _clean_response(text)
++    anchor = cleaned.find(f'"{key}"')
++    start = cleaned.find("[", anchor + 1) if anchor != -1 else -1
++    if start == -1:
++        return None
++
++    objects: list[dict[str, Any]] = []
++    depth = 0
++    obj_start = None
++    in_str = False
++    escaped = False
++
++    for i in range(start, len(cleaned)):
++        char = cleaned[i]
++        if in_str:
++            if escaped:
++                escaped = False
++            elif char == "\\":
++                escaped = True
++            elif char == '"':
++                in_str = False
++            continue
++        if char == '"':
++            in_str = True
++        elif char == "{":
++            if depth == 0:
++                obj_start = i
++            depth += 1
++        elif char == "}":
++            depth -= 1
++            if depth == 0 and obj_start is not None:
++                try:
++                    obj = json.loads(cleaned[obj_start : i + 1])
++                    if isinstance(obj, dict) and obj.get("text"):
++                        objects.append(obj)
++                except json.JSONDecodeError:
++                    pass
++                obj_start = None
++
++    return objects or None
+diff --git a/mnemory/maintenance.py b/mnemory/maintenance.py
+--- a/mnemory/maintenance.py
++++ b/mnemory/maintenance.py
+@@ -181,10 +181,11 @@
+         min_confidence = self._config.memory.fsck_auto_min_confidence
+         min_severity = self._config.memory.fsck_auto_min_severity
+ 
+-        # Auto-fsck is durable-only by design. Raw memories are handled by the
+-        # separate session/consolidation lifecycle.
+-        # Manual run-now is always a full scan (incremental=False).
+-        self._fsck.run_check(check_id, include_raw=False, incremental=False)
++        # LOCAL-PATCH: raws are included. The session/consolidation lifecycle
++        # writes raw notes that fsck never saw in durable-only mode, so
++        # duplicate/garbled raws accumulated un-checked. Manual run-now stays
++        # a full scan (incremental=False).
++        self._fsck.run_check(check_id, include_raw=True, incremental=False)
+ 
+         check = self._fsck.get_check(check_id)
+         if check is None or check.status != "completed":
+@@ -425,10 +426,11 @@
+ 
+         # run_check() is synchronous and CPU/IO-bound (LLM calls via requests).
+         # Run in a thread pool to avoid blocking the event loop.
+-        # Auto-fsck is durable-only by design. Raw memories are handled by the
+-        # separate session/consolidation lifecycle.
++        # LOCAL-PATCH: raws included. incremental=True keeps the cost bounded —
++        # only memories changed since their checked_at stamp are re-examined,
++        # so a cycle pays for new raw notes, not the whole store.
+         await asyncio.to_thread(
+-            self._fsck.run_check, check_id, include_raw=False, incremental=True
++            self._fsck.run_check, check_id, include_raw=True, incremental=True
+         )
+ 
+         check = self._fsck.get_check(check_id)
+diff --git a/mnemory/memory.py b/mnemory/memory.py
+--- a/mnemory/memory.py
++++ b/mnemory/memory.py
+@@ -1344,13 +1344,15 @@
+             # shared memories, so both user and assistant facts are deduped
+             # against the full visible set (agent-scoped + shared).
+             # Exclude consolidated memories — remember dedup only touches raw layer.
++            # Candidate pool widened 5 -> 10: rephrased near-duplicates
++            # were ranking below the top-5 and slipping through as ADDs.
+             existing_raw = self.vector.search_similar(
+                 vector,
+                 user_id=user_id,
+                 owner_id=owner_id,
+                 subject_user_id=user_id,
+                 agent_id=agent_id,
+-                limit=5,
++                limit=10,
+                 exclude_layers=["consolidated"],
+             )
+             # Dual-scope: also check shared memories when agent_id is set
+@@ -1366,7 +1368,7 @@
+                         owner_id=owner_id,
+                         agent_id=None,
+                         shared_only=True,
+-                        limit=5,
++                        limit=10,
+                         exclude_layers=["consolidated"],
+                     )
+                 seen_ids: set[str] = set()
+@@ -1380,7 +1382,7 @@
+                     if mid and mid not in seen_ids:
+                         seen_ids.add(mid)
+                         merged.append(mem)
+-                existing_raw = merged[:5]
++                existing_raw = merged[:10]
+ 
+             # Filter by dedup threshold
+             candidates = [
+diff --git a/mnemory/prompts.py b/mnemory/prompts.py
+--- a/mnemory/prompts.py
++++ b/mnemory/prompts.py
+@@ -513,12 +513,34 @@
+ - "User moved to Berlin" CAN update "User lives in Prague"
+   — same subject (user's location).
+ - When in doubt between ADD and UPDATE, prefer ADD.
+-- When in doubt between ADD and SKIP, prefer ADD if the new fact
+-  adds any specific detail not present in the existing memory.
++- When in doubt between ADD and SKIP, prefer SKIP if the existing
++  memory already captures the same core information — same subject,
++  same event, or same user request — including paraphrases,
++  restatements, and near-identical request echoes (e.g. "User
++  requested X" vs "User requested to call X"). Only ADD when the fact
++  introduces a NEW subject, event, value, quantity, or date not
++  present in ANY existing memory.
+ 
+ When updating, keep the same meaning but incorporate new
+ information. When facts overlap, merge them into a single
+ updated memory.
++
++### Content hygiene (SKIP regardless of newness)
++
++- SKIP facts containing unresolved template placeholders
++  (e.g. [child_name], [date], [TODO]) or literal markup/tag leaks
++  (e.g. boundary tags, raw code blocks, "⟨...⟩" fragments).
++- SKIP facts that ask for more information to complete themselves
++  (e.g. "Please provide X to complete this detail") — these are
++  process noise, not facts.
++- SKIP facts that make claims about the assistant's own identity or
++  origin (e.g. "Assistant is a Google-built model", "Assistant is a
++  Transformer model built by ...") — these are unverified
++  self-references and must not be stored.
++- SKIP facts that are pure process commentary about the assistant's
++  own tool-use in the current conversation (e.g. "Assistant used
++  tool X to do Y") unless they record a durable user preference or
++  decision.
+ 
+ ### Dedup examples
+ 
+@@ -774,12 +796,34 @@
+ - "Assistant now prefers brief responses" CAN update
+   "Assistant prefers verbose responses" — same subject.
+ - When in doubt between ADD and UPDATE, prefer ADD.
+-- When in doubt between ADD and SKIP, prefer ADD if the new fact
+-  adds any specific detail not present in the existing memory.
++- When in doubt between ADD and SKIP, prefer SKIP if the existing
++  memory already captures the same core information — same subject,
++  same event, or same user request — including paraphrases,
++  restatements, and near-identical request echoes (e.g. "User
++  requested X" vs "User requested to call X"). Only ADD when the fact
++  introduces a NEW subject, event, value, quantity, or date not
++  present in ANY existing memory.
+ 
+ When updating, keep the same meaning but incorporate new
+ information. When facts overlap, merge them into a single
+ updated memory.
++
++### Content hygiene (SKIP regardless of newness)
++
++- SKIP facts containing unresolved template placeholders
++  (e.g. [child_name], [date], [TODO]) or literal markup/tag leaks
++  (e.g. boundary tags, raw code blocks, "⟨...⟩" fragments).
++- SKIP facts that ask for more information to complete themselves
++  (e.g. "Please provide X to complete this detail") — these are
++  process noise, not facts.
++- SKIP facts that make claims about the assistant's own identity or
++  origin (e.g. "Assistant is a Google-built model", "Assistant is a
++  Transformer model built by ...") — these are unverified
++  self-references and must not be stored.
++- SKIP facts that are pure process commentary about the assistant's
++  own tool-use in the current conversation (e.g. "Assistant used
++  tool X to do Y") unless they record a durable user preference or
++  decision.
+ 
+ ### Dedup examples
+ 
+@@ -3620,7 +3664,13 @@
+         raw_action = entry.get("action")
+         fact_index = entry.get("fact_index")
+         raw_text = entry.get("text")
+-        if not isinstance(raw_action, str) or not isinstance(raw_text, str):
++        # LOCAL-PATCH: tolerate missing/None text (local LLMs often omit it
++        # for SKIP/CONFIRM entries); it is backfilled below from the Stage-1 fact.
++        if not isinstance(raw_action, str):
++            if not silent:
++                logger.warning("Invalid field type in dedup response")
++            return [], set()
++        if raw_text is not None and not isinstance(raw_text, str):
+             if not silent:
+                 logger.warning("Invalid field type in dedup response")
+             return [], set()
+@@ -3633,7 +3683,7 @@
+             "CONFIRMED": "CONFIRM",
+         }
+         action = aliases.get(raw_action.upper(), raw_action.upper())
+-        text = raw_text.strip()
++        text = (raw_text or "").strip()
+ 
+         if (
+             not isinstance(fact_index, int)
+@@ -3644,10 +3694,27 @@
+                 logger.warning("Invalid or duplicate fact_index in dedup response")
+             return [], set()
+ 
+-        if not text or action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
++        if action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
+             if not silent:
+                 logger.warning("Invalid dedup decision for fact %d", fact_index)
+             return [], set()
++        # LOCAL-PATCH: backfill empty/missing text from the Stage-1 fact.
++        # ADD: spec says text = the extracted fact. UPDATE: fact text keeps the
++        # new information even without a merge. SKIP/CONFIRM: text is never
++        # stored (only reported/fingerprinted), so the fact text is safe.
++        if not text:
++            _fact = fact_by_index.get(fact_index, {})
++            text = str(_fact.get("text", "")).strip()
++            if not text:
++                if not silent:
++                    logger.warning("Invalid dedup decision for fact %d", fact_index)
++                return [], set()
++            if not silent:
++                logger.debug(
++                    "Backfilled empty dedup text for fact %d (%s)",
++                    fact_index,
++                    action,
++                )
+ 
+         raw_target = entry.get("target_id")
+         if action in ("ADD", "SKIP") and raw_target is not None:
+@@ -4000,7 +4067,13 @@
+                         },
+                         "affected_memory_ids": {
+                             "type": "array",
+-                            "items": {"type": "string"},
++                            "items": {
++                                "type": "string",
++                                "pattern": "^[0-9]+$",
++                                "maxLength": 2,
++                            },
++                            "minItems": 1,
++                            "maxItems": 20,
+                             "description": "IDs of all memories involved",
+                         },
+                         "actions": {
+@@ -4019,7 +4092,12 @@
+                                         "type": "string",
+                                         "enum": ["update", "delete"],
+                                     },
+-                                    "memory_id": {"type": "string"},
++                                    "memory_id": {
++                                        "type": "string",
++                                        "pattern": "^[0-9]+$",
++                                        "maxLength": 2,
++                                        "description": "Numeric alias of the memory",
++                                    },
+                                     "new_content": {
+                                         "type": ["string", "null"],
+                                         "description": (
+@@ -4224,7 +4302,13 @@
+                         },
+                         "affected_memory_ids": {
+                             "type": "array",
+-                            "items": {"type": "string"},
++                            "items": {
++                                "type": "string",
++                                "pattern": "^[0-9]+$",
++                                "maxLength": 2,
++                            },
++                            "minItems": 1,
++                            "maxItems": 20,
+                             "description": "IDs of memories with this issue",
+                         },
+                         "actions": {
+@@ -4244,6 +4328,9 @@
+                                     },
+                                     "memory_id": {
+                                         "type": "string",
++                                        "pattern": "^[0-9]+$",
++                                        "maxLength": 2,
++                                        "description": "Numeric alias of the memory",
+                                     },
+                                     "new_content": {
+                                         "type": ["string", "null"],
+@@ -4484,7 +4571,13 @@
+                         },
+                         "affected_memory_ids": {
+                             "type": "array",
+-                            "items": {"type": "string"},
++                            "items": {
++                                "type": "string",
++                                "pattern": "^[0-9]+$",
++                                "maxLength": 2,
++                            },
++                            "minItems": 1,
++                            "maxItems": 20,
+                             "description": "IDs of memories with this issue",
+                         },
+                         "actions": {
+@@ -4504,6 +4597,9 @@
+                                     },
+                                     "memory_id": {
+                                         "type": "string",
++                                        "pattern": "^[0-9]+$",
++                                        "maxLength": 2,
++                                        "description": "Numeric alias of the memory",
+                                     },
+                                     "new_metadata": {
+                                         "type": "object",
+diff --git a/mnemory/storage/vector.py b/mnemory/storage/vector.py
+--- a/mnemory/storage/vector.py
++++ b/mnemory/storage/vector.py
+@@ -2609,7 +2609,9 @@
+             must=[
+                 FieldCondition(
+                     key="consolidation_state",
+-                    match=MatchAny(any=["idle", "consolidating"]),
++                    # "failed" is re-queued: a session that failed once is
++                    # not terminal, it gets retried on the next sweep.
++                    match=MatchAny(any=["idle", "consolidating", "failed"]),
+                 ),
+                 IsEmptyCondition(is_empty=PayloadField(key="retry_operation_token")),
+             ]
+@@ -2756,7 +2758,9 @@
+                     ),
+                     FieldCondition(
+                         key="consolidation_state",
+-                        match=MatchValue(value="idle"),
++                        # A failed session is claimable: the scan filter
++                        # re-queues it, the claim must accept that state.
++                        match=MatchAny(any=["idle", "failed"]),
+                     ),
+                     FieldCondition(
+                         key="session_revision",

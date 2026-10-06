@@ -361,3 +361,52 @@ def parse_json_response(text: str) -> dict[str, Any]:
             pass
 
     raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}")
+
+
+def salvage_json_objects(text: str, key: str = "memories") -> list[dict[str, Any]] | None:
+    """Recover complete objects from a truncated JSON array in an LLM reply.
+
+    A response cut off by the token cap keeps every fully closed object
+    before the cut. Walk the array, collect complete objects, ignore the
+    trailing fragment. Returns None when nothing is recoverable.
+    """
+    cleaned = _clean_response(text)
+    anchor = cleaned.find(f'"{key}"')
+    start = cleaned.find("[", anchor + 1) if anchor != -1 else -1
+    if start == -1:
+        return None
+
+    objects: list[dict[str, Any]] = []
+    depth = 0
+    obj_start = None
+    in_str = False
+    escaped = False
+
+    for i in range(start, len(cleaned)):
+        char = cleaned[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_str = False
+            continue
+        if char == '"':
+            in_str = True
+        elif char == "{":
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and obj_start is not None:
+                try:
+                    obj = json.loads(cleaned[obj_start : i + 1])
+                    if isinstance(obj, dict) and obj.get("text"):
+                        objects.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                obj_start = None
+
+    return objects or None

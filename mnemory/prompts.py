@@ -513,12 +513,34 @@ When an existing memory captures the same information, use CONFIRM only for new 
 - "User moved to Berlin" CAN update "User lives in Prague"
   — same subject (user's location).
 - When in doubt between ADD and UPDATE, prefer ADD.
-- When in doubt between ADD and SKIP, prefer ADD if the new fact
-  adds any specific detail not present in the existing memory.
+- When in doubt between ADD and SKIP, prefer SKIP if the existing
+  memory already captures the same core information — same subject,
+  same event, or same user request — including paraphrases,
+  restatements, and near-identical request echoes (e.g. "User
+  requested X" vs "User requested to call X"). Only ADD when the fact
+  introduces a NEW subject, event, value, quantity, or date not
+  present in ANY existing memory.
 
 When updating, keep the same meaning but incorporate new
 information. When facts overlap, merge them into a single
 updated memory.
+
+### Content hygiene (SKIP regardless of newness)
+
+- SKIP facts containing unresolved template placeholders
+  (e.g. [child_name], [date], [TODO]) or literal markup/tag leaks
+  (e.g. boundary tags, raw code blocks, "⟨...⟩" fragments).
+- SKIP facts that ask for more information to complete themselves
+  (e.g. "Please provide X to complete this detail") — these are
+  process noise, not facts.
+- SKIP facts that make claims about the assistant's own identity or
+  origin (e.g. "Assistant is a Google-built model", "Assistant is a
+  Transformer model built by ...") — these are unverified
+  self-references and must not be stored.
+- SKIP facts that are pure process commentary about the assistant's
+  own tool-use in the current conversation (e.g. "Assistant used
+  tool X to do Y") unless they record a durable user preference or
+  decision.
 
 ### Dedup examples
 
@@ -774,12 +796,34 @@ Assistant evidence cannot create independent validation. Use SKIP for unchanged 
 - "Assistant now prefers brief responses" CAN update
   "Assistant prefers verbose responses" — same subject.
 - When in doubt between ADD and UPDATE, prefer ADD.
-- When in doubt between ADD and SKIP, prefer ADD if the new fact
-  adds any specific detail not present in the existing memory.
+- When in doubt between ADD and SKIP, prefer SKIP if the existing
+  memory already captures the same core information — same subject,
+  same event, or same user request — including paraphrases,
+  restatements, and near-identical request echoes (e.g. "User
+  requested X" vs "User requested to call X"). Only ADD when the fact
+  introduces a NEW subject, event, value, quantity, or date not
+  present in ANY existing memory.
 
 When updating, keep the same meaning but incorporate new
 information. When facts overlap, merge them into a single
 updated memory.
+
+### Content hygiene (SKIP regardless of newness)
+
+- SKIP facts containing unresolved template placeholders
+  (e.g. [child_name], [date], [TODO]) or literal markup/tag leaks
+  (e.g. boundary tags, raw code blocks, "⟨...⟩" fragments).
+- SKIP facts that ask for more information to complete themselves
+  (e.g. "Please provide X to complete this detail") — these are
+  process noise, not facts.
+- SKIP facts that make claims about the assistant's own identity or
+  origin (e.g. "Assistant is a Google-built model", "Assistant is a
+  Transformer model built by ...") — these are unverified
+  self-references and must not be stored.
+- SKIP facts that are pure process commentary about the assistant's
+  own tool-use in the current conversation (e.g. "Assistant used
+  tool X to do Y") unless they record a durable user preference or
+  decision.
 
 ### Dedup examples
 
@@ -3620,7 +3664,13 @@ def parse_dedup_response(
         raw_action = entry.get("action")
         fact_index = entry.get("fact_index")
         raw_text = entry.get("text")
-        if not isinstance(raw_action, str) or not isinstance(raw_text, str):
+        # LOCAL-PATCH: tolerate missing/None text (local LLMs often omit it
+        # for SKIP/CONFIRM entries); it is backfilled below from the Stage-1 fact.
+        if not isinstance(raw_action, str):
+            if not silent:
+                logger.warning("Invalid field type in dedup response")
+            return [], set()
+        if raw_text is not None and not isinstance(raw_text, str):
             if not silent:
                 logger.warning("Invalid field type in dedup response")
             return [], set()
@@ -3633,7 +3683,7 @@ def parse_dedup_response(
             "CONFIRMED": "CONFIRM",
         }
         action = aliases.get(raw_action.upper(), raw_action.upper())
-        text = raw_text.strip()
+        text = (raw_text or "").strip()
 
         if (
             not isinstance(fact_index, int)
@@ -3644,10 +3694,27 @@ def parse_dedup_response(
                 logger.warning("Invalid or duplicate fact_index in dedup response")
             return [], set()
 
-        if not text or action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
+        if action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
             if not silent:
                 logger.warning("Invalid dedup decision for fact %d", fact_index)
             return [], set()
+        # LOCAL-PATCH: backfill empty/missing text from the Stage-1 fact.
+        # ADD: spec says text = the extracted fact. UPDATE: fact text keeps the
+        # new information even without a merge. SKIP/CONFIRM: text is never
+        # stored (only reported/fingerprinted), so the fact text is safe.
+        if not text:
+            _fact = fact_by_index.get(fact_index, {})
+            text = str(_fact.get("text", "")).strip()
+            if not text:
+                if not silent:
+                    logger.warning("Invalid dedup decision for fact %d", fact_index)
+                return [], set()
+            if not silent:
+                logger.debug(
+                    "Backfilled empty dedup text for fact %d (%s)",
+                    fact_index,
+                    action,
+                )
 
         raw_target = entry.get("target_id")
         if action in ("ADD", "SKIP") and raw_target is not None:
@@ -4000,7 +4067,13 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
                         },
                         "affected_memory_ids": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {
+                                "type": "string",
+                                "pattern": "^[0-9]+$",
+                                "maxLength": 2,
+                            },
+                            "minItems": 1,
+                            "maxItems": 20,
                             "description": "IDs of all memories involved",
                         },
                         "actions": {
@@ -4019,7 +4092,12 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
                                         "type": "string",
                                         "enum": ["update", "delete"],
                                     },
-                                    "memory_id": {"type": "string"},
+                                    "memory_id": {
+                                        "type": "string",
+                                        "pattern": "^[0-9]+$",
+                                        "maxLength": 2,
+                                        "description": "Numeric alias of the memory",
+                                    },
                                     "new_content": {
                                         "type": ["string", "null"],
                                         "description": (
@@ -4224,7 +4302,13 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
                         },
                         "affected_memory_ids": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {
+                                "type": "string",
+                                "pattern": "^[0-9]+$",
+                                "maxLength": 2,
+                            },
+                            "minItems": 1,
+                            "maxItems": 20,
                             "description": "IDs of memories with this issue",
                         },
                         "actions": {
@@ -4244,6 +4328,9 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
                                     },
                                     "memory_id": {
                                         "type": "string",
+                                        "pattern": "^[0-9]+$",
+                                        "maxLength": 2,
+                                        "description": "Numeric alias of the memory",
                                     },
                                     "new_content": {
                                         "type": ["string", "null"],
@@ -4484,7 +4571,13 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
                         },
                         "affected_memory_ids": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "items": {
+                                "type": "string",
+                                "pattern": "^[0-9]+$",
+                                "maxLength": 2,
+                            },
+                            "minItems": 1,
+                            "maxItems": 20,
                             "description": "IDs of memories with this issue",
                         },
                         "actions": {
@@ -4504,6 +4597,9 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
                                     },
                                     "memory_id": {
                                         "type": "string",
+                                        "pattern": "^[0-9]+$",
+                                        "maxLength": 2,
+                                        "description": "Numeric alias of the memory",
                                     },
                                     "new_metadata": {
                                         "type": "object",

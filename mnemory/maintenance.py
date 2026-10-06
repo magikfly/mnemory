@@ -181,10 +181,11 @@ class MaintenanceService:
         min_confidence = self._config.memory.fsck_auto_min_confidence
         min_severity = self._config.memory.fsck_auto_min_severity
 
-        # Auto-fsck is durable-only by design. Raw memories are handled by the
-        # separate session/consolidation lifecycle.
-        # Manual run-now is always a full scan (incremental=False).
-        self._fsck.run_check(check_id, include_raw=False, incremental=False)
+        # LOCAL-PATCH: raws are included. The session/consolidation lifecycle
+        # writes raw notes that fsck never saw in durable-only mode, so
+        # duplicate/garbled raws accumulated un-checked. Manual run-now stays
+        # a full scan (incremental=False).
+        self._fsck.run_check(check_id, include_raw=True, incremental=False)
 
         check = self._fsck.get_check(check_id)
         if check is None or check.status != "completed":
@@ -425,10 +426,11 @@ class MaintenanceService:
 
         # run_check() is synchronous and CPU/IO-bound (LLM calls via requests).
         # Run in a thread pool to avoid blocking the event loop.
-        # Auto-fsck is durable-only by design. Raw memories are handled by the
-        # separate session/consolidation lifecycle.
+        # LOCAL-PATCH: raws included. incremental=True keeps the cost bounded —
+        # only memories changed since their checked_at stamp are re-examined,
+        # so a cycle pays for new raw notes, not the whole store.
         await asyncio.to_thread(
-            self._fsck.run_check, check_id, include_raw=False, incremental=True
+            self._fsck.run_check, check_id, include_raw=True, incremental=True
         )
 
         check = self._fsck.get_check(check_id)

@@ -1,0 +1,374 @@
+diff -urN -x __pycache__ -x '*.pyc' mnemory-1.14/mnemory/consolidation.py mnemory-src/mnemory/consolidation.py
+--- mnemory-1.14/mnemory/consolidation.py	2026-10-05 00:31:41.975715718 +0200
++++ mnemory-src/mnemory/consolidation.py	2026-10-04 23:59:52.717664769 +0200
+@@ -900,7 +900,7 @@
+             - all_facts: list of consolidated fact dicts (with 'role' set)
+             - raw_ids_map: list of (batch_facts, batch_raw_ids) tuples
+         """
+-        from mnemory.llm import parse_json_response
++        from mnemory.llm import parse_json_response, salvage_json_objects
+         from mnemory.prompts import build_consolidation_prompt
+ 
+         batch_size = self._config.memory.consolidation_batch_size
+@@ -926,7 +926,22 @@
+         # Accumulated context from prior batches (prevents cross-batch duplication)
+         accumulated: list[dict] = []
+ 
+-        for batch_idx, batch in enumerate(batches):
++        # Normalized texts already consolidated in prior runs. The small
++        # model re-emits the same fact on every re-queued pass, so equality
++        # is checked before any durable write.
++        def _norm(text: str) -> str:
++            return " ".join(text.split()).lower()
++
++        seen_norms = {_norm(m.get("memory", "")) for m in previous_consolidated}
++
++        # Queue-based batches. A truncated LLM answer is salvaged and the
++        # raw memories no fact references are re-queued, so a bad tail can
++        # no longer abort the session and strand everything as raw.
++        queue: list[tuple[int, list[dict], int]] = [
++            (idx, b, 0) for idx, b in enumerate(batches)
++        ]
++        while queue:
++            batch_idx, batch, attempts = queue.pop(0)
+             if len(batches) > 1:
+                 logger.info(
+                     "Consolidation session %s [%s]: batch %d/%d (%d memories)",
+@@ -961,18 +976,39 @@
+                 operation="consolidation",
+             )
+ 
+-            parsed = parse_json_response(response_text)
++            try:
++                parsed = parse_json_response(response_text)
++                batch_facts = parsed.get("memories") if parsed else None
++                if not isinstance(batch_facts, list):
++                    batch_facts = None
++            except ValueError:
++                # Output hit max_tokens (finish_reason=length). Keep the
++                # objects that closed before the cut instead of raising.
++                batch_facts = salvage_json_objects(response_text)
++                if batch_facts:
++                    logger.warning(
++                        "Consolidation session %s [%s] batch %d: truncated "
++                        "output, salvaged %d complete facts",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                        len(batch_facts),
++                    )
+ 
+-            if not parsed or not isinstance(parsed.get("memories"), list):
++            if not batch_facts:
+                 logger.warning(
+                     "Consolidation session %s [%s] batch %d: invalid LLM output",
+                     session_id,
+                     role,
+                     batch_idx + 1,
+                 )
++                # Nothing closed before the cut: halve the batch and retry,
++                # a smaller prompt fits inside the output cap.
++                if attempts < 2 and len(batch) > 4:
++                    mid = len(batch) // 2
++                    queue.insert(0, (batch_idx, batch[mid:], attempts + 1))
++                    queue.insert(0, (batch_idx, batch[:mid], attempts + 1))
+                 continue
+-
+-            batch_facts = parsed["memories"]
+             batch_raw_ids = [m["id"] for m in batch]
+             source_aliases = {
+                 f"S{index}": memory_id for index, memory_id in enumerate(batch_raw_ids)
+@@ -1011,6 +1047,17 @@
+                         batch_idx + 1,
+                     )
+                     continue
++                norm = _norm(f.get("text", ""))
++                if norm in seen_norms:
++                    logger.info(
++                        "Consolidation session %s [%s] batch %d: "
++                        "duplicate fact skipped",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                    )
++                    continue
++                seen_norms.add(norm)
+                 f["derived_from"] = list(
+                     dict.fromkeys(source_aliases[alias] for alias in aliases)
+                 )
+@@ -1045,6 +1092,24 @@
+                     }
+                 )
+ 
++            # Coverage check: raw memories that no accepted fact references
++            # are re-queued (bounded), so truncation degrades to smaller
++            # batches instead of an unconsolidated remainder.
++            covered = {
++                rid for fact in batch_facts for rid in fact.get("derived_from", [])
++            }
++            leftover = [m for m in batch if m["id"] not in covered]
++            if leftover and len(leftover) < len(batch) and attempts < 2:
++                logger.info(
++                    "Consolidation session %s [%s] batch %d: %d raw uncovered, "
++                    "re-queueing",
++                    session_id,
++                    role,
++                    batch_idx + 1,
++                    len(leftover),
++                )
++                queue.append((batch_idx, leftover, attempts + 1))
++
+         return all_facts, raw_ids_map
+ 
+     def _validate_output(self, facts: list[dict], raw_count: int) -> str | None:
+diff -urN -x __pycache__ -x '*.pyc' mnemory-1.14/mnemory/llm.py mnemory-src/mnemory/llm.py
+--- mnemory-1.14/mnemory/llm.py	2026-10-05 00:31:41.976715717 +0200
++++ mnemory-src/mnemory/llm.py	2026-10-04 23:53:31.530819522 +0200
+@@ -361,3 +361,52 @@
+             pass
+ 
+     raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}")
++
++
++def salvage_json_objects(text: str, key: str = "memories") -> list[dict[str, Any]] | None:
++    """Recover complete objects from a truncated JSON array in an LLM reply.
++
++    A response cut off by the token cap keeps every fully closed object
++    before the cut. Walk the array, collect complete objects, ignore the
++    trailing fragment. Returns None when nothing is recoverable.
++    """
++    cleaned = _clean_response(text)
++    anchor = cleaned.find(f'"{key}"')
++    start = cleaned.find("[", anchor + 1) if anchor != -1 else -1
++    if start == -1:
++        return None
++
++    objects: list[dict[str, Any]] = []
++    depth = 0
++    obj_start = None
++    in_str = False
++    escaped = False
++
++    for i in range(start, len(cleaned)):
++        char = cleaned[i]
++        if in_str:
++            if escaped:
++                escaped = False
++            elif char == "\\":
++                escaped = True
++            elif char == '"':
++                in_str = False
++            continue
++        if char == '"':
++            in_str = True
++        elif char == "{":
++            if depth == 0:
++                obj_start = i
++            depth += 1
++        elif char == "}":
++            depth -= 1
++            if depth == 0 and obj_start is not None:
++                try:
++                    obj = json.loads(cleaned[obj_start : i + 1])
++                    if isinstance(obj, dict) and obj.get("text"):
++                        objects.append(obj)
++                except json.JSONDecodeError:
++                    pass
++                obj_start = None
++
++    return objects or None
+diff -urN -x __pycache__ -x '*.pyc' mnemory-1.14/mnemory/memory.py mnemory-src/mnemory/memory.py
+--- mnemory-1.14/mnemory/memory.py	2026-10-05 00:31:41.978715715 +0200
++++ mnemory-src/mnemory/memory.py	2026-09-25 13:49:39.000000000 +0200
+@@ -1344,13 +1344,15 @@
+             # shared memories, so both user and assistant facts are deduped
+             # against the full visible set (agent-scoped + shared).
+             # Exclude consolidated memories — remember dedup only touches raw layer.
++            # Candidate pool widened 5 -> 10: rephrased near-duplicates
++            # were ranking below the top-5 and slipping through as ADDs.
+             existing_raw = self.vector.search_similar(
+                 vector,
+                 user_id=user_id,
+                 owner_id=owner_id,
+                 subject_user_id=user_id,
+                 agent_id=agent_id,
+-                limit=5,
++                limit=10,
+                 exclude_layers=["consolidated"],
+             )
+             # Dual-scope: also check shared memories when agent_id is set
+@@ -1366,7 +1368,7 @@
+                         owner_id=owner_id,
+                         agent_id=None,
+                         shared_only=True,
+-                        limit=5,
++                        limit=10,
+                         exclude_layers=["consolidated"],
+                     )
+                 seen_ids: set[str] = set()
+@@ -1380,7 +1382,7 @@
+                     if mid and mid not in seen_ids:
+                         seen_ids.add(mid)
+                         merged.append(mem)
+-                existing_raw = merged[:5]
++                existing_raw = merged[:10]
+ 
+             # Filter by dedup threshold
+             candidates = [
+diff -urN -x __pycache__ -x '*.pyc' mnemory-1.14/mnemory/prompts.py mnemory-src/mnemory/prompts.py
+--- mnemory-1.14/mnemory/prompts.py	2026-10-05 00:31:41.980715713 +0200
++++ mnemory-src/mnemory/prompts.py	2026-09-25 13:49:39.000000000 +0200
+@@ -513,13 +513,35 @@
+ - "User moved to Berlin" CAN update "User lives in Prague"
+   — same subject (user's location).
+ - When in doubt between ADD and UPDATE, prefer ADD.
+-- When in doubt between ADD and SKIP, prefer ADD if the new fact
+-  adds any specific detail not present in the existing memory.
++- When in doubt between ADD and SKIP, prefer SKIP if the existing
++  memory already captures the same core information — same subject,
++  same event, or same user request — including paraphrases,
++  restatements, and near-identical request echoes (e.g. "User
++  requested X" vs "User requested to call X"). Only ADD when the fact
++  introduces a NEW subject, event, value, quantity, or date not
++  present in ANY existing memory.
+ 
+ When updating, keep the same meaning but incorporate new
+ information. When facts overlap, merge them into a single
+ updated memory.
+ 
++### Content hygiene (SKIP regardless of newness)
++
++- SKIP facts containing unresolved template placeholders
++  (e.g. [child_name], [date], [TODO]) or literal markup/tag leaks
++  (e.g. boundary tags, raw code blocks, "⟨...⟩" fragments).
++- SKIP facts that ask for more information to complete themselves
++  (e.g. "Please provide X to complete this detail") — these are
++  process noise, not facts.
++- SKIP facts that make claims about the assistant's own identity or
++  origin (e.g. "Assistant is a Google-built model", "Assistant is a
++  Transformer model built by ...") — these are unverified
++  self-references and must not be stored.
++- SKIP facts that are pure process commentary about the assistant's
++  own tool-use in the current conversation (e.g. "Assistant used
++  tool X to do Y") unless they record a durable user preference or
++  decision.
++
+ ### Dedup examples
+ 
+ Existing: [{{"id": "0", "text": "User's email is john@example.com"}}]
+@@ -774,13 +796,35 @@
+ - "Assistant now prefers brief responses" CAN update
+   "Assistant prefers verbose responses" — same subject.
+ - When in doubt between ADD and UPDATE, prefer ADD.
+-- When in doubt between ADD and SKIP, prefer ADD if the new fact
+-  adds any specific detail not present in the existing memory.
++- When in doubt between ADD and SKIP, prefer SKIP if the existing
++  memory already captures the same core information — same subject,
++  same event, or same user request — including paraphrases,
++  restatements, and near-identical request echoes (e.g. "User
++  requested X" vs "User requested to call X"). Only ADD when the fact
++  introduces a NEW subject, event, value, quantity, or date not
++  present in ANY existing memory.
+ 
+ When updating, keep the same meaning but incorporate new
+ information. When facts overlap, merge them into a single
+ updated memory.
+ 
++### Content hygiene (SKIP regardless of newness)
++
++- SKIP facts containing unresolved template placeholders
++  (e.g. [child_name], [date], [TODO]) or literal markup/tag leaks
++  (e.g. boundary tags, raw code blocks, "⟨...⟩" fragments).
++- SKIP facts that ask for more information to complete themselves
++  (e.g. "Please provide X to complete this detail") — these are
++  process noise, not facts.
++- SKIP facts that make claims about the assistant's own identity or
++  origin (e.g. "Assistant is a Google-built model", "Assistant is a
++  Transformer model built by ...") — these are unverified
++  self-references and must not be stored.
++- SKIP facts that are pure process commentary about the assistant's
++  own tool-use in the current conversation (e.g. "Assistant used
++  tool X to do Y") unless they record a durable user preference or
++  decision.
++
+ ### Dedup examples
+ 
+ Existing: [{{"id": "0", "text": "Assistant's name is Bob"}}]
+@@ -3620,7 +3664,13 @@
+         raw_action = entry.get("action")
+         fact_index = entry.get("fact_index")
+         raw_text = entry.get("text")
+-        if not isinstance(raw_action, str) or not isinstance(raw_text, str):
++        # LOCAL-PATCH: tolerate missing/None text (local LLMs often omit it
++        # for SKIP/CONFIRM entries); it is backfilled below from the Stage-1 fact.
++        if not isinstance(raw_action, str):
++            if not silent:
++                logger.warning("Invalid field type in dedup response")
++            return [], set()
++        if raw_text is not None and not isinstance(raw_text, str):
+             if not silent:
+                 logger.warning("Invalid field type in dedup response")
+             return [], set()
+@@ -3633,7 +3683,7 @@
+             "CONFIRMED": "CONFIRM",
+         }
+         action = aliases.get(raw_action.upper(), raw_action.upper())
+-        text = raw_text.strip()
++        text = (raw_text or "").strip()
+ 
+         if (
+             not isinstance(fact_index, int)
+@@ -3644,10 +3694,27 @@
+                 logger.warning("Invalid or duplicate fact_index in dedup response")
+             return [], set()
+ 
+-        if not text or action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
++        if action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
+             if not silent:
+                 logger.warning("Invalid dedup decision for fact %d", fact_index)
+             return [], set()
++        # LOCAL-PATCH: backfill empty/missing text from the Stage-1 fact.
++        # ADD: spec says text = the extracted fact. UPDATE: fact text keeps the
++        # new information even without a merge. SKIP/CONFIRM: text is never
++        # stored (only reported/fingerprinted), so the fact text is safe.
++        if not text:
++            _fact = fact_by_index.get(fact_index, {})
++            text = str(_fact.get("text", "")).strip()
++            if not text:
++                if not silent:
++                    logger.warning("Invalid dedup decision for fact %d", fact_index)
++                return [], set()
++            if not silent:
++                logger.debug(
++                    "Backfilled empty dedup text for fact %d (%s)",
++                    fact_index,
++                    action,
++                )
+ 
+         raw_target = entry.get("target_id")
+         if action in ("ADD", "SKIP") and raw_target is not None:
+diff -urN -x __pycache__ -x '*.pyc' mnemory-1.14/mnemory/storage/vector.py mnemory-src/mnemory/storage/vector.py
+--- mnemory-1.14/mnemory/storage/vector.py	2026-10-05 00:31:41.983715709 +0200
++++ mnemory-src/mnemory/storage/vector.py	2026-10-05 00:09:02.586338984 +0200
+@@ -2405,7 +2405,9 @@
+             must=[
+                 FieldCondition(
+                     key="consolidation_state",
+-                    match=MatchAny(any=["idle", "consolidating"]),
++                    # "failed" is re-queued: a session that failed once is
++                    # not terminal, it gets retried on the next sweep.
++                    match=MatchAny(any=["idle", "consolidating", "failed"]),
+                 ),
+                 IsEmptyCondition(is_empty=PayloadField(key="retry_operation_token")),
+             ]
+@@ -2552,7 +2554,9 @@
+                     ),
+                     FieldCondition(
+                         key="consolidation_state",
+-                        match=MatchValue(value="idle"),
++                        # A failed session is claimable: the scan filter
++                        # re-queues it, the claim must accept that state.
++                        match=MatchAny(any=["idle", "failed"]),
+                     ),
+                     FieldCondition(
+                         key="session_revision",
