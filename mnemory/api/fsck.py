@@ -340,6 +340,10 @@ def apply_fsck(
     return FsckApplyResponse(
         applied=result.get("applied", 0),
         skipped=result.get("skipped", 0),
+        # LOCAL-PATCH: forward the superseded count. FsckService.apply_check reports it
+        # and the schema has the field, but this handler built the response without it,
+        # so the summary read 0 while the per-issue details listed 73 superseded rows.
+        superseded=result.get("superseded", 0),
         failed=result.get("failed", 0),
         details=details,
     )
@@ -370,3 +374,4 @@ def re_evaluate_fsck_operation(
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return FsckReEvaluateResponse(**result)
+

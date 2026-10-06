@@ -29,6 +29,7 @@ from qdrant_client.models import PointStruct
 
 from mnemory.categories import (
     PREDEFINED_CATEGORIES,
+    sanitize_categories,
     validate_categories,
     validate_importance,
     validate_memory_type,
@@ -72,6 +73,20 @@ _MAX_CLUSTER_SIZE = 15
 
 # Maximum similar neighbors to check per memory during duplicate detection.
 _DUPLICATE_NEIGHBORS = 5
+
+# LOCAL-PATCH: action classes used to order apply (see _apply_priority).
+_DESTRUCTIVE_ACTIONS = frozenset({"delete"})
+
+
+def _apply_priority(issue: "FsckIssue") -> int:
+    """Order issues for apply: 0 = writes only, 1 = contains a delete.
+
+    All phases are computed against one corpus snapshot. Duplicate findings delete
+    rows that reclassify/contradiction findings also reference, so running them in
+    scan order makes those later issues unapplicable - permanently. Writes first
+    keeps their targets alive.
+    """
+    return 1 if any((a.action in _DESTRUCTIVE_ACTIONS) for a in issue.actions) else 0
 
 
 # ── Data structures ──────────────────────────────────────────────────
@@ -1054,6 +1069,50 @@ class FsckService:
             session_agent_id + ":"
         )
 
+    def _finding_is_stale(self, issue: FsckIssue) -> bool:
+        """True when no target is in the state the scan described any more.
+
+        A finding is obsolete (not pending) when every target has either been
+        deleted, or has a revision different from the one recorded at scan time -
+        the memory was rewritten by consolidation/chat writes after the plan was
+        built. The apply journal already encodes this: those operations are stored
+        as 'superseded', and apply_check refuses to replay a superseded operation.
+        That is correct behaviour, but it left the row on the review list with no
+        explanation. Staleness is what 'nothing left to fix' means here.
+        """
+        expected = {
+            memory.id: (memory.metadata or {}).get("revision")
+            for memory in issue.affected_memories
+        }
+        ids = {a.memory_id for a in issue.actions if a.memory_id} or set(expected)
+        if not ids:
+            return False
+        id_list = list(ids)
+        live = {m["id"]: m for m in self._vector.get_by_ids_strict(id_list) if m}
+        for memory_id in ids:
+            memory = live.get(memory_id)
+            if memory is None:
+                continue  # gone counts as moved on
+            exp = expected.get(memory_id)
+            current = (memory.get("metadata") or {}).get("revision")
+            if exp is None or current == exp:
+                return False  # this target is exactly as scanned - fix is live
+        return True
+
+    def _targets_all_absent(self, issue: FsckIssue) -> bool:
+        """True when every memory this issue targets is gone from the store.
+
+        LOCAL-PATCH companion to the superseded status in apply_check: such an
+        issue cannot ever apply, because the row it referred to has already been
+        merged away by a delete.
+        """
+        ids = {a.memory_id for a in issue.actions if a.memory_id}
+        if not ids:
+            ids = {m.id for m in issue.affected_memories if m.id}
+        if not ids:
+            return False
+        return all(self._vector.get_by_id(memory_id) is None for memory_id in ids)
+
     def apply_check(
         self,
         check_id: str,
@@ -1105,9 +1164,20 @@ class FsckService:
         else:
             issues = list(check.issues)
 
+        # LOCAL-PATCH: apply non-destructive fixes before deletes.
+        # Every phase is computed against one corpus snapshot, and duplicate issues
+        # delete rows that reclassify/contradiction issues also reference. In scan
+        # order the deletes run first, so those later issues find their target gone,
+        # execute zero actions, and stay on the review list forever (observed: 76 of
+        # 646 stuck, 71 of them pointing at deleted memories). Doing the writes
+        # first means a reclassify lands while its target still exists. Python's
+        # sort is stable, so scan order is preserved within each class.
+        issues.sort(key=_apply_priority)
+
         applied = 0
         skipped = 0
         failed = 0
+        superseded = 0
         details: list[dict] = []
 
         for issue in issues:
@@ -1141,6 +1211,30 @@ class FsckService:
                         for memory in issue.affected_memories
                     }
                     for index, action in enumerate(issue.actions):
+                        # LOCAL-PATCH: the LLM proposes categories, and it invents
+                        # tokens outside the taxonomy (observed: 'news_briefing_flashcard',
+                        # 'weather'). Strict validation then aborts the write, so the
+                        # issue never applies and the row is stuck. Sanitize the
+                        # proposal here - before the plan and its fingerprints are
+                        # computed - so _apply_issue writes validated categories.
+                        if (
+                            isinstance(action.new_metadata, dict)
+                            and action.new_metadata.get("categories")
+                        ):
+                            proposed = action.new_metadata["categories"]
+                            cleaned = sanitize_categories(proposed)
+                            if cleaned != proposed:
+                                logger.info(
+                                    "Fsck apply: reclassifying with sanitized categories "
+                                    "%s -> %s (issue %s)",
+                                    proposed,
+                                    cleaned,
+                                    issue.issue_id,
+                                )
+                                action.new_metadata = {
+                                    **action.new_metadata,
+                                    "categories": cleaned,
+                                }
                         source = (
                             self._vector.get_by_id(action.memory_id)
                             if action.memory_id
@@ -1196,6 +1290,55 @@ class FsckService:
                         "skipped",
                         "superseded",
                     }:
+                        # LOCAL-PATCH: this journal short-circuit is the reason an
+                        # "apply fix" row never disappears. The first apply recorded a
+                        # terminal 'skipped' operation for every issue whose targets were
+                        # gone, so every later click re-skips it here and the row stays
+                        # on the review list for the life of the check. When every target
+                        # is absent the finding is already resolved - the row was deleted
+                        # and merged into a survivor - so record it as superseded and let
+                        # it leave the list. Issues that still have a live target stay
+                        # visible and retryable through the normal path below (their
+                        # journal checkpoints are terminal, so re-executing them needs
+                        # the re-evaluate/terminalize flow, not a silent bypass).
+                        journal_status = existing_operation.get("status")
+                        # A journal entry of 'superseded' means the revision system
+                        # closed this operation - a newer operation on the same lineage
+                        # replaced it, and replaying it is refused by design. The finding
+                        # is therefore closed, not pending, so it must leave the review
+                        # list; the next scheduled scan re-raises it from current data if
+                        # the problem is still real. 'skipped' stays retryable (upstream
+                        # treats those as transient).
+                        if self._targets_all_absent(issue) or (
+                            journal_status == "superseded"
+                            or self._finding_is_stale(issue)
+                        ):
+                            check.applied_issue_ids.add(issue.issue_id)
+                            superseded += 1
+                            logger.info(
+                                "Fsck apply: issue %s (%s) marked superseded - journal=%s "
+                                "and no target is in the scanned state any more",
+                                issue.issue_id,
+                                issue.type,
+                                journal_status,
+                            )
+                            details.append(
+                                {
+                                    "issue_id": issue.issue_id,
+                                    "status": "superseded",
+                                    "actions_executed": 0,
+                                    "actions_skipped": len(plan),
+                                }
+                            )
+                            continue
+                        if journal_status != "committed":
+                            logger.info(
+                                "Fsck apply: issue %s (%s) journal=%s with live targets "
+                                "remaining - left for re-evaluate/terminalize",
+                                issue.issue_id,
+                                issue.type,
+                                journal_status,
+                            )
                         skipped += 1
                         details.append(
                             {
@@ -1509,6 +1652,24 @@ class FsckService:
                     check.applied_issue_ids.add(issue.issue_id)
                     applied += 1
                     status = "applied"
+                elif self._targets_all_absent(issue):
+                    # LOCAL-PATCH: every target of this issue is gone from the store.
+                    # A delete in this run (or an earlier apply) already resolved the
+                    # finding by merging the row into a survivor, so there is nothing
+                    # left to fix - yet the original code deliberately left such issues
+                    # retryable "so transient misses don't permanently block fixes".
+                    # For a deleted target it is not transient, so the row sat on the
+                    # dashboard permanently. Mark it superseded so it leaves the list.
+                    check.applied_issue_ids.add(issue.issue_id)
+                    superseded += 1
+                    status = "superseded"
+                    logger.info(
+                        "Fsck apply: issue %s (%s) superseded - all %d target(s) are "
+                        "no longer in the store",
+                        issue.issue_id,
+                        issue.type,
+                        len({a.memory_id for a in issue.actions if a.memory_id}),
+                    )
                 else:
                     skipped += 1
                     status = "skipped"
@@ -1597,6 +1758,7 @@ class FsckService:
         return {
             "applied": applied,
             "skipped": skipped,
+            "superseded": superseded,
             "failed": failed,
             "details": details,
         }
@@ -3168,3 +3330,4 @@ class FsckService:
                 summary.security += 1
             summary.total += 1
         return summary
+

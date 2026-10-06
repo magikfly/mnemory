@@ -11,7 +11,11 @@ requiring configuration changes.
 
 from __future__ import annotations
 
+import logging
+
 from mnemory.sanitize import validate_category_name
+
+logger = logging.getLogger("mnemory.categories")
 
 # Predefined categories with descriptions.
 # These are always available and returned by list_categories even if empty.
@@ -94,6 +98,32 @@ def validate_categories(categories: list[str]) -> list[str]:
     return validated
 
 
+def sanitize_categories(categories: list[str] | None) -> list[str]:
+    """Coerce LLM-produced categories into the valid taxonomy.
+
+    LOCAL-PATCH: model output is not a validated API input. The extractor
+    invents tokens outside the taxonomy (observed: 'fact'), and the strict
+    validate_categories() raise in add_memory() aborts an ENTIRE consolidation
+    batch over one bad token. Drop unknown entries with a warning and keep the
+    rest. User-supplied API categories keep going through validate_categories()
+    unchanged, so API strictness is untouched.
+    """
+    if not categories:
+        return []
+
+    valid: list[str] = []
+    for cat in categories:
+        try:
+            valid.extend(validate_categories([cat]))
+        except ValueError:
+            logger.warning(
+                "Dropping invalid category %r (valid: %s)",
+                cat,
+                ", ".join(sorted(PREDEFINED_CATEGORIES)),
+            )
+    return valid
+
+
 def validate_memory_type(memory_type: str) -> str:
     """Validate a memory type string."""
     memory_type = memory_type.strip().lower()
@@ -157,3 +187,4 @@ def count_categories(memories: list[dict]) -> dict[str, int]:
                 cat = cat.lower()
                 counts[cat] = counts.get(cat, 0) + 1
     return counts
+

@@ -880,7 +880,14 @@ class FsckApplyDetail(BaseModel):
     """Result of applying a single issue."""
 
     issue_id: str
-    status: str = Field(..., description="Status: applied, skipped, failed")
+    # LOCAL-PATCH: 'superseded' = every target of this issue is gone from the store
+    # (a delete in an earlier apply already merged that row away), so the finding is
+    # resolved and there is nothing left to fix. Reported so the UI can drop the row
+    # instead of showing a fix that can never apply.
+    status: str = Field(
+        ...,
+        description="Status: applied, skipped, superseded, failed",
+    )
     actions_executed: int = 0
     actions_skipped: int = 0
     error: str | None = None
@@ -891,6 +898,9 @@ class FsckApplyResponse(BaseModel):
 
     applied: int = 0
     skipped: int = 0
+    # LOCAL-PATCH: surface the superseded count; without it these issues are counted
+    # as plain skips and give the operator no explanation for the stuck rows.
+    superseded: int = 0
     failed: int = 0
     details: list[FsckApplyDetail] = Field(default_factory=list)
 
@@ -991,3 +1001,4 @@ def format_memory_item(item: dict) -> MemoryItem:
         metadata=metadata if metadata else None,
         has_artifacts=has_artifacts,
     )
+

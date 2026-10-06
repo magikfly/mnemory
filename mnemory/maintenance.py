@@ -222,11 +222,16 @@ class MaintenanceService:
             result = self._fsck.apply_check(check_id, qualifying_ids)
             fixes_applied = result.get("applied", 0)
             fixes_failed = result.get("failed", 0)
+            # LOCAL-PATCH: log the two counts the old line swallowed. apply_check
+            # returns applied/skipped/superseded/failed, and skips were invisible -
+            # 635 queued with applied=559, failed=5 meant 71 silently stuck rows.
             logger.info(
-                "Auto-fsck (manual): user %s — applied=%d, failed=%d",
+                "Auto-fsck (manual): user %s — applied=%d, failed=%d, skipped=%d, superseded=%d",
                 user_id,
                 fixes_applied,
                 fixes_failed,
+                result.get("skipped", 0),
+                result.get("superseded", 0),
             )
         else:
             logger.debug(
@@ -472,11 +477,14 @@ class MaintenanceService:
                 )
                 fixes_applied = result.get("applied", 0)
                 fixes_failed = result.get("failed", 0)
+                # LOCAL-PATCH: see the manual-run site above.
                 logger.info(
-                    "Auto-fsck: user %s — applied=%d, failed=%d",
+                    "Auto-fsck: user %s — applied=%d, failed=%d, skipped=%d, superseded=%d",
                     user_id,
                     fixes_applied,
                     fixes_failed,
+                    result.get("skipped", 0),
+                    result.get("superseded", 0),
                 )
             else:
                 logger.debug(
@@ -524,3 +532,4 @@ class MaintenanceService:
         issue_sev_order = _SEVERITY_ORDER.get(severity.lower(), 0)
         min_sev_order = _SEVERITY_ORDER.get(min_severity.lower(), 0)
         return issue_sev_order >= min_sev_order
+

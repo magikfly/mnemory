@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from mnemory.categories import sanitize_categories
 from mnemory.revisions import RevisionService, canonical_fingerprint
 
 if TYPE_CHECKING:
@@ -1175,7 +1176,14 @@ class ConsolidationService:
 
                 # Use LLM-assigned categories, fall back to raw memory
                 # categories if the LLM returned an empty list
-                categories = fact.get("categories") or fallback_categories
+                # LOCAL-PATCH: sanitize first. The extractor emits categories
+                # outside the taxonomy (observed: 'fact'); add_memory() validates
+                # strictly and raises, and this loop re-raises, so ONE bad token
+                # aborted the whole session recovery. Unknown tokens are now
+                # dropped with a warning and the rest of the batch survives.
+                categories = sanitize_categories(
+                    fact.get("categories") or fallback_categories
+                )
 
                 memory_id = fact["memory_id"]
                 revision_metadata = RevisionService.initial_metadata(
@@ -1238,3 +1246,4 @@ class ConsolidationService:
                 )
                 raise
         return stored_ids
+

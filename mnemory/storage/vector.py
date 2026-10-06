@@ -7,6 +7,7 @@ Supports both remote Qdrant (production) and local/embedded Qdrant
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import threading
@@ -43,6 +44,63 @@ logger = logging.getLogger(__name__)
 # Use SHA-256 for content hashing (dedup, not security-critical,
 # but avoids MD5 deprecation warnings from security scanners).
 _hash = hashlib.sha256
+
+# ---------------------------------------------------------------------------
+# LOCAL-PATCH: qdrant local-mode serialization
+# ---------------------------------------------------------------------------
+# qdrant-client's embedded (path=) mode is not thread-safe. In
+# LocalCollection._insert_points the payload list is appended
+# (local_collection.py:2618) BEFORE the per-vector deleted masks are extended
+# via np.append (lines 2640-2706). calculate_payload_mask sizes its mask from
+# len(payloads) and then indexes deleted[i] for every i, so any reader landing
+# in that window walks one past the end of the mask array:
+#   IndexError: index 5904 is out of bounds for axis 0 with size 5904
+# That is what killed fsck phase 1 (duplicate detection) - a 2299-memory scan
+# reading the collection while a live chat write was appending to it.
+# mnemory only guarded write-vs-write (_write_guard), never read-vs-write.
+# One RLock per storage path, held around every client call, closes the window.
+# RLock because write paths call read paths on the same thread.
+_LOCAL_LOCKS: dict[str, threading.RLock] = {}
+_LOCAL_LOCKS_GUARD = threading.Lock()
+
+
+def _local_lock_for(path: str) -> threading.RLock:
+    """Shared lock for one local Qdrant storage path (keyed, not per-instance).
+
+    qdrant-client reuses the same in-process LocalCollection for the same path,
+    so VectorStore and SessionSummaryStore must share one lock.
+    """
+    with _LOCAL_LOCKS_GUARD:
+        lock = _LOCAL_LOCKS.get(path)
+        if lock is None:
+            lock = threading.RLock()
+            _LOCAL_LOCKS[path] = lock
+        return lock
+
+
+class _LockedLocalClient:
+    """Thread-safe wrapper for a local-mode QdrantClient (see note above).
+
+    Every callable attribute is invoked under the shared lock; attribute and
+    property access passes through untouched. Remote mode is unaffected - the
+    server handles concurrency, so no wrapper is created for it.
+    """
+
+    def __init__(self, client: QdrantClient, lock: threading.RLock) -> None:
+        self._inner = client
+        self._lock = lock
+
+    def __getattr__(self, name: str):  # noqa: ANN401
+        attr = getattr(self._inner, name)
+        if callable(attr):
+
+            @functools.wraps(attr)
+            def _locked(*args, **kwargs):  # noqa: ANN002, ANN003
+                with self._lock:
+                    return attr(*args, **kwargs)
+
+            return _locked
+        return attr
 
 
 def _build_labels_conditions(labels_filter: dict) -> list[FieldCondition]:
@@ -163,8 +221,14 @@ class VectorStore:
         # concurrent writes. A lock serializes write operations in local
         # mode. Remote Qdrant handles concurrency server-side, so no
         # lock is needed.
-        self._write_lock: threading.Lock | None = (
-            threading.Lock() if not config.vector.is_remote else None
+        # LOCAL-PATCH: one shared RLock per local storage path, so writes AND
+        # reads serialize against each other (see _LockedLocalClient). Writes
+        # alone were never enough - fsck phase 1 crashed reading a collection
+        # that a live chat write was mid-append on.
+        self._write_lock: threading.RLock | None = (
+            None
+            if config.vector.is_remote
+            else _local_lock_for(config.vector.qdrant_path)
         )
 
     @contextmanager
@@ -193,7 +257,10 @@ class VectorStore:
             return QdrantClient(**kwargs)
         else:
             logger.info("Using local Qdrant at %s", vc.qdrant_path)
-            return QdrantClient(path=vc.qdrant_path)
+            return _LockedLocalClient(
+                QdrantClient(path=vc.qdrant_path),
+                _local_lock_for(vc.qdrant_path),
+            )
 
     def _ensure_collection(self) -> None:
         """Create the collection if it doesn't exist, then ensure indexes.
@@ -3250,3 +3317,4 @@ class SessionSummaryStore:
             }
 
         return page
+
