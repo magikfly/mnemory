@@ -109,18 +109,66 @@ index 6675b56..db46047 100644
      return counts
 +
 diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
-index 6776c15..dc07eb5 100644
+index 6776c15..a179324 100644
 --- a/mnemory/consolidation.py
 +++ b/mnemory/consolidation.py
-@@ -18,6 +18,7 @@ from collections.abc import Callable
+@@ -18,7 +18,12 @@ from collections.abc import Callable
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Any
  
+-from mnemory.revisions import RevisionService, canonical_fingerprint
 +from mnemory.categories import sanitize_categories
- from mnemory.revisions import RevisionService, canonical_fingerprint
++from mnemory.revisions import (
++    RevisionConflictError,
++    RevisionService,
++    canonical_fingerprint,
++)
  
  if TYPE_CHECKING:
-@@ -900,7 +901,7 @@ class ConsolidationService:
+     from mnemory.config import Config
+@@ -733,14 +738,33 @@ class ConsolidationService:
+                 )
+             )
+             guard_mutation()
+-            self._memory.revisions.mark_source(
+-                source_ids,
+-                operation_id=operation_id,
+-                user_id=user_id,
+-                owner_id=owner_id,
+-                session_agent_id=session.get("agent_id"),
+-                mutation_guard=mutation_guard,
+-            )
++            try:
++                self._memory.revisions.mark_source(
++                    source_ids,
++                    operation_id=operation_id,
++                    user_id=user_id,
++                    owner_id=owner_id,
++                    session_agent_id=session.get("agent_id"),
++                    mutation_guard=mutation_guard,
++                )
++            except RevisionConflictError as exc:
++                # LOCAL-PATCH: the raw evidence this plan consumed moved underneath us -
++                # a fsck apply (or a chat write) merged/deleted those exact revisions
++                # while this recovery was in flight. The consolidated facts are already
++                # stored at this point, so letting the exception fail the whole session
++                # only produced an endless retry loop: the same session re-queued every
++                # 300s cycle, re-stored, and conflicted again (observed on session
++                # c4753181 for hours). Defer the bookkeeping, keep the facts, and let
++                # finalize_consolidation close the session out. The next scan sees the
++                # raws as unmarked and can re-derive them; the normalized-text dedup
++                # guard in _store_consolidated keeps that from duplicating.
++                logger.warning(
++                    "Consolidation: source marking deferred for session %s "
++                    "(revision moved: %s); keeping %d consolidated memories",
++                    sid,
++                    exc,
++                    len(stored_ids),
++                )
+             previous_ids = session.get("consolidated_memory_ids") or []
+             merged_ids = list(dict.fromkeys([*previous_ids, *stored_ids]))
+             guard_mutation()
+@@ -900,7 +924,7 @@ class ConsolidationService:
              - all_facts: list of consolidated fact dicts (with 'role' set)
              - raw_ids_map: list of (batch_facts, batch_raw_ids) tuples
          """
@@ -129,7 +177,7 @@ index 6776c15..dc07eb5 100644
          from mnemory.prompts import build_consolidation_prompt
  
          batch_size = self._config.memory.consolidation_batch_size
-@@ -926,7 +927,22 @@ class ConsolidationService:
+@@ -926,7 +950,22 @@ class ConsolidationService:
          # Accumulated context from prior batches (prevents cross-batch duplication)
          accumulated: list[dict] = []
  
@@ -153,7 +201,7 @@ index 6776c15..dc07eb5 100644
              if len(batches) > 1:
                  logger.info(
                      "Consolidation session %s [%s]: batch %d/%d (%d memories)",
-@@ -961,18 +977,39 @@ class ConsolidationService:
+@@ -961,18 +1000,39 @@ class ConsolidationService:
                  operation="consolidation",
              )
  
@@ -197,7 +245,7 @@ index 6776c15..dc07eb5 100644
              batch_raw_ids = [m["id"] for m in batch]
              source_aliases = {
                  f"S{index}": memory_id for index, memory_id in enumerate(batch_raw_ids)
-@@ -1011,6 +1048,17 @@ class ConsolidationService:
+@@ -1011,6 +1071,17 @@ class ConsolidationService:
                          batch_idx + 1,
                      )
                      continue
@@ -215,7 +263,7 @@ index 6776c15..dc07eb5 100644
                  f["derived_from"] = list(
                      dict.fromkeys(source_aliases[alias] for alias in aliases)
                  )
-@@ -1045,6 +1093,24 @@ class ConsolidationService:
+@@ -1045,6 +1116,24 @@ class ConsolidationService:
                      }
                  )
  
@@ -240,7 +288,7 @@ index 6776c15..dc07eb5 100644
          return all_facts, raw_ids_map
  
      def _validate_output(self, facts: list[dict], raw_count: int) -> str | None:
-@@ -1110,7 +1176,14 @@ class ConsolidationService:
+@@ -1110,7 +1199,14 @@ class ConsolidationService:
  
                  # Use LLM-assigned categories, fall back to raw memory
                  # categories if the LLM returned an empty list
@@ -256,7 +304,7 @@ index 6776c15..dc07eb5 100644
  
                  memory_id = fact["memory_id"]
                  revision_metadata = RevisionService.initial_metadata(
-@@ -1173,3 +1246,4 @@ class ConsolidationService:
+@@ -1173,3 +1269,4 @@ class ConsolidationService:
                  )
                  raise
          return stored_ids
