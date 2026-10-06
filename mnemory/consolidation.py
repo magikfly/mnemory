@@ -19,7 +19,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from mnemory.categories import sanitize_categories
-from mnemory.revisions import RevisionService, canonical_fingerprint
+from mnemory.revisions import (
+    RevisionConflictError,
+    RevisionService,
+    canonical_fingerprint,
+)
 
 if TYPE_CHECKING:
     from mnemory.config import Config
@@ -734,14 +738,33 @@ class ConsolidationService:
                 )
             )
             guard_mutation()
-            self._memory.revisions.mark_source(
-                source_ids,
-                operation_id=operation_id,
-                user_id=user_id,
-                owner_id=owner_id,
-                session_agent_id=session.get("agent_id"),
-                mutation_guard=mutation_guard,
-            )
+            try:
+                self._memory.revisions.mark_source(
+                    source_ids,
+                    operation_id=operation_id,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                    session_agent_id=session.get("agent_id"),
+                    mutation_guard=mutation_guard,
+                )
+            except RevisionConflictError as exc:
+                # LOCAL-PATCH: the raw evidence this plan consumed moved underneath us -
+                # a fsck apply (or a chat write) merged/deleted those exact revisions
+                # while this recovery was in flight. The consolidated facts are already
+                # stored at this point, so letting the exception fail the whole session
+                # only produced an endless retry loop: the same session re-queued every
+                # 300s cycle, re-stored, and conflicted again (observed on session
+                # c4753181 for hours). Defer the bookkeeping, keep the facts, and let
+                # finalize_consolidation close the session out. The next scan sees the
+                # raws as unmarked and can re-derive them; the normalized-text dedup
+                # guard in _store_consolidated keeps that from duplicating.
+                logger.warning(
+                    "Consolidation: source marking deferred for session %s "
+                    "(revision moved: %s); keeping %d consolidated memories",
+                    sid,
+                    exc,
+                    len(stored_ids),
+                )
             previous_ids = session.get("consolidated_memory_ids") or []
             merged_ids = list(dict.fromkeys([*previous_ids, *stored_ids]))
             guard_mutation()
