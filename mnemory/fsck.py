@@ -85,6 +85,12 @@ _FSCK_MAX_TOKENS = 6144
 # size; Pass A emits only the issues it found. 12288 tokens ~ 46k chars covers a
 # 30-memory echo (prompt ~6k + 12288 gen ~ 18k of the 65536 pool per slot).
 _FSCK_METADATA_MAX_TOKENS = 12288
+# LOCAL-PATCH 2026-10-07: same asymmetry in phase 1. Check 3710afac: fsck_dedup
+# truncated at 18,480 chars = 6144 tokens (3.0 chars/token - it echoes the cluster
+# content it is merging) and the cluster's decision was skipped. Dedup is the only
+# phase whose reply scales with cluster size, so it gets the metadata ceiling too.
+# Pool: 15-memory cluster prompt ~5k + 12288 gen ~ 18k per slot.
+_FSCK_DEDUP_MAX_TOKENS = 12288
 # Floor for the Pass B recovery split: a batch at least this big is halved once
 # when its reply is unparseable after salvage. Bounded - sub-batches never split
 # again - so the cost is 2 extra calls on a failure that happened ~1x/week.
@@ -2465,7 +2471,7 @@ class FsckService:
             temperature=0.1,
             reasoning_effort=self._reasoning_effort,
             operation="fsck_dedup",
-            max_tokens=_FSCK_MAX_TOKENS,
+            max_tokens=_FSCK_DEDUP_MAX_TOKENS,
         )
 
         parsed = self._parse_llm_json(response, "duplicate check")
