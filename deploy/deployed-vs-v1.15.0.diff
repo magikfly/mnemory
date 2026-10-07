@@ -310,7 +310,7 @@ index 6776c15..a179324 100644
          return stored_ids
 +
 diff --git a/mnemory/fsck.py b/mnemory/fsck.py
-index 2dfd3c6..760923d 100644
+index 2dfd3c6..789bdd2 100644
 --- a/mnemory/fsck.py
 +++ b/mnemory/fsck.py
 @@ -29,13 +29,14 @@ from qdrant_client.models import PointStruct
@@ -329,7 +329,7 @@ index 2dfd3c6..760923d 100644
  from mnemory.prompts import (
      build_fsck_content_quality_prompt,
      build_fsck_duplicate_prompt,
-@@ -62,7 +63,32 @@ logger = logging.getLogger(__name__)
+@@ -62,7 +63,38 @@ logger = logging.getLogger(__name__)
  _DUPLICATE_SIMILARITY_THRESHOLD = 0.75
  
  # Maximum memories per LLM quality-check batch.
@@ -356,6 +356,12 @@ index 2dfd3c6..760923d 100644
 +# size; Pass A emits only the issues it found. 12288 tokens ~ 46k chars covers a
 +# 30-memory echo (prompt ~6k + 12288 gen ~ 18k of the 65536 pool per slot).
 +_FSCK_METADATA_MAX_TOKENS = 12288
++# LOCAL-PATCH 2026-10-07: same asymmetry in phase 1. Check 3710afac: fsck_dedup
++# truncated at 18,480 chars = 6144 tokens (3.0 chars/token - it echoes the cluster
++# content it is merging) and the cluster's decision was skipped. Dedup is the only
++# phase whose reply scales with cluster size, so it gets the metadata ceiling too.
++# Pool: 15-memory cluster prompt ~5k + 12288 gen ~ 18k per slot.
++_FSCK_DEDUP_MAX_TOKENS = 12288
 +# Floor for the Pass B recovery split: a batch at least this big is halved once
 +# when its reply is unparseable after salvage. Bounded - sub-batches never split
 +# again - so the cost is 2 extra calls on a failure that happened ~1x/week.
@@ -363,7 +369,7 @@ index 2dfd3c6..760923d 100644
  
  # Maximum memories per duplicate cluster sent to LLM.
  _MAX_CLUSTER_SIZE = 15
-@@ -70,6 +96,20 @@ _MAX_CLUSTER_SIZE = 15
+@@ -70,6 +102,20 @@ _MAX_CLUSTER_SIZE = 15
  # Maximum similar neighbors to check per memory during duplicate detection.
  _DUPLICATE_NEIGHBORS = 5
  
@@ -384,7 +390,7 @@ index 2dfd3c6..760923d 100644
  
  # ── Data structures ──────────────────────────────────────────────────
  
-@@ -1051,6 +1091,50 @@ class FsckService:
+@@ -1051,6 +1097,50 @@ class FsckService:
              session_agent_id + ":"
          )
  
@@ -435,7 +441,7 @@ index 2dfd3c6..760923d 100644
      def apply_check(
          self,
          check_id: str,
-@@ -1102,9 +1186,20 @@ class FsckService:
+@@ -1102,9 +1192,20 @@ class FsckService:
          else:
              issues = list(check.issues)
  
@@ -456,7 +462,7 @@ index 2dfd3c6..760923d 100644
          details: list[dict] = []
  
          for issue in issues:
-@@ -1138,6 +1233,30 @@ class FsckService:
+@@ -1138,6 +1239,30 @@ class FsckService:
                          for memory in issue.affected_memories
                      }
                      for index, action in enumerate(issue.actions):
@@ -487,7 +493,7 @@ index 2dfd3c6..760923d 100644
                          source = (
                              self._vector.get_by_id(action.memory_id)
                              if action.memory_id
-@@ -1193,6 +1312,55 @@ class FsckService:
+@@ -1193,6 +1318,55 @@ class FsckService:
                          "skipped",
                          "superseded",
                      }:
@@ -543,7 +549,7 @@ index 2dfd3c6..760923d 100644
                          skipped += 1
                          details.append(
                              {
-@@ -1506,6 +1674,24 @@ class FsckService:
+@@ -1506,6 +1680,24 @@ class FsckService:
                      check.applied_issue_ids.add(issue.issue_id)
                      applied += 1
                      status = "applied"
@@ -568,7 +574,7 @@ index 2dfd3c6..760923d 100644
                  else:
                      skipped += 1
                      status = "skipped"
-@@ -1594,6 +1780,7 @@ class FsckService:
+@@ -1594,6 +1786,7 @@ class FsckService:
          return {
              "applied": applied,
              "skipped": skipped,
@@ -576,7 +582,7 @@ index 2dfd3c6..760923d 100644
              "failed": failed,
              "details": details,
          }
-@@ -2009,6 +2196,7 @@ class FsckService:
+@@ -2009,6 +2202,7 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_security",
@@ -584,11 +590,11 @@ index 2dfd3c6..760923d 100644
          )
  
          try:
-@@ -2277,9 +2465,10 @@ class FsckService:
+@@ -2277,9 +2471,10 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_dedup",
-+            max_tokens=_FSCK_MAX_TOKENS,
++            max_tokens=_FSCK_DEDUP_MAX_TOKENS,
          )
  
 -        parsed = parse_json_response(response)
@@ -596,7 +602,7 @@ index 2dfd3c6..760923d 100644
          if not parsed or "issues" not in parsed:
              return []
  
-@@ -2456,6 +2645,7 @@ class FsckService:
+@@ -2456,6 +2651,7 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_content_quality",
@@ -604,7 +610,7 @@ index 2dfd3c6..760923d 100644
          )
  
          return self._parse_quality_response(
-@@ -2467,6 +2657,7 @@ class FsckService:
+@@ -2467,6 +2663,7 @@ class FsckService:
          batch: list[dict],
          *,
          available_categories: list[str] | None = None,
@@ -612,7 +618,7 @@ index 2dfd3c6..760923d 100644
      ) -> list[FsckIssue]:
          """Pass B: check a batch of memories for metadata issues."""
          messages, schema, id_mapping = build_fsck_metadata_normalization_prompt(
-@@ -2479,12 +2670,65 @@ class FsckService:
+@@ -2479,12 +2676,65 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_metadata_normalization",
@@ -680,7 +686,7 @@ index 2dfd3c6..760923d 100644
      def _parse_quality_response(
          self,
          response: str,
-@@ -2494,7 +2738,24 @@ class FsckService:
+@@ -2494,7 +2744,24 @@ class FsckService:
          default_type: str = "quality",
      ) -> list[FsckIssue]:
          """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
@@ -706,7 +712,7 @@ index 2dfd3c6..760923d 100644
          if not parsed or "issues" not in parsed:
              return []
  
-@@ -3134,3 +3395,4 @@ class FsckService:
+@@ -3134,3 +3401,4 @@ class FsckService:
                  summary.security += 1
              summary.total += 1
          return summary
