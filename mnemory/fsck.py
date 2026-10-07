@@ -77,6 +77,18 @@ _QUALITY_BATCH_SIZE = 30
 # the 30-memory reply ~50% headroom. Pool cost: ~5k prompt + 6144 gen = ~11k of
 # the 65536-token kv-unified pool per slot.
 _FSCK_MAX_TOKENS = 6144
+# LOCAL-PATCH 2026-10-07: Pass B (metadata normalization) needs its own ceiling.
+# Measured on check b8c5df58 with batch 30: Pass A (content quality) returned in
+# 2.7-5.1s inside 6144, while Pass B truncated at 23,040 chars = exactly 6144
+# tokens, salvage found no closed objects, and the whole 30-memory batch was
+# skipped. Pass B echoes per-memory metadata, so its output scales with batch
+# size; Pass A emits only the issues it found. 12288 tokens ~ 46k chars covers a
+# 30-memory echo (prompt ~6k + 12288 gen ~ 18k of the 65536 pool per slot).
+_FSCK_METADATA_MAX_TOKENS = 12288
+# Floor for the Pass B recovery split: a batch at least this big is halved once
+# when its reply is unparseable after salvage. Bounded - sub-batches never split
+# again - so the cost is 2 extra calls on a failure that happened ~1x/week.
+_METADATA_RETRY_MIN_BATCH = 16
 
 # Maximum memories per duplicate cluster sent to LLM.
 _MAX_CLUSTER_SIZE = 15
@@ -2645,6 +2657,7 @@ class FsckService:
         batch: list[dict],
         *,
         available_categories: list[str] | None = None,
+        allow_split: bool = True,
     ) -> list[FsckIssue]:
         """Pass B: check a batch of memories for metadata issues."""
         messages, schema, id_mapping = build_fsck_metadata_normalization_prompt(
@@ -2657,11 +2670,36 @@ class FsckService:
             temperature=0.1,
             reasoning_effort=self._reasoning_effort,
             operation="fsck_metadata_normalization",
-            max_tokens=_FSCK_MAX_TOKENS,
+            max_tokens=_FSCK_METADATA_MAX_TOKENS,
         )
 
-        return self._parse_quality_response(
-            response, id_mapping, batch, default_type="reclassify"
+        parsed = self._parse_llm_json(response, "metadata normalization")
+        if parsed is None and allow_split and len(batch) >= _METADATA_RETRY_MIN_BATCH:
+            # LOCAL-PATCH: see the constant block - at batch 30 this pass truncated and
+            # salvage recovered nothing, so 30 memories silently lost their metadata
+            # pass. Halving halves the echoed output. One level only (sub-batches pass
+            # allow_split=False), and it fires solely on an unparseable reply.
+            mid = len(batch) // 2
+            logger.info(
+                "Fsck metadata normalization: batch of %d unparseable after salvage - "
+                "retrying as %d + %d",
+                len(batch),
+                mid,
+                len(batch) - mid,
+            )
+            issues: list[FsckIssue] = []
+            for sub in (batch[:mid], batch[mid:]):
+                issues.extend(
+                    self._evaluate_metadata_normalization_batch(
+                        sub,
+                        available_categories=available_categories,
+                        allow_split=False,
+                    )
+                )
+            return issues
+
+        return self._issues_from_parsed(
+            parsed, id_mapping, batch, default_type="reclassify"
         )
 
     def _parse_llm_json(self, response: str, context: str) -> dict[str, Any] | None:
@@ -2701,6 +2739,23 @@ class FsckService:
     ) -> list[FsckIssue]:
         """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
         parsed = self._parse_llm_json(response, "quality check")
+        return self._issues_from_parsed(
+            parsed, id_mapping, batch, default_type=default_type
+        )
+
+    def _issues_from_parsed(
+        self,
+        parsed: dict[str, Any] | None,
+        id_mapping: dict[str, str],
+        batch: list[dict],
+        *,
+        default_type: str = "quality",
+    ) -> list[FsckIssue]:
+        """Build ``FsckIssue`` objects from an already-parsed reply.
+
+        LOCAL-PATCH: split out of _parse_quality_response so Pass B can parse once,
+        decide on a recovery split, and then build issues without a second parse.
+        """
         if not parsed or "issues" not in parsed:
             return []
 
