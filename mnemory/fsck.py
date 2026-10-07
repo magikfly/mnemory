@@ -63,19 +63,23 @@ logger = logging.getLogger(__name__)
 _DUPLICATE_SIMILARITY_THRESHOLD = 0.75
 
 # Maximum memories per LLM quality-check batch.
-# LOCAL-PATCH 2026-10-07: 20 -> 30. Batch size sets the number of LLM calls
-# (total/30 vs total/20 => 1/3 fewer calls on the same corpus), so this is the
-# quality-per-call lever, not a throughput trick: 2124 memories is 71 calls at 20
-# and 71 -> 71*20/30 = ~48 at 30.
-_QUALITY_BATCH_SIZE = 30
-# Ceiling for every fsck LLM call (quality, duplicate cluster, contradiction).
-# LOCAL-PATCH 2026-10-07: 4096 -> 6144. Measured on 168h of logs: truncations
-# (finish_reason=length) bottomed out at 14,226 chars = 4096 tokens at ~3.5
-# chars/token for this corpus, i.e. the batch output was hitting the ceiling. The
-# original 16384 default was the opposite failure - a looping model burned 74s and
-# 16k tokens before the parse failed - so this stays well below that while giving
-# the 30-memory reply ~50% headroom. Pool cost: ~5k prompt + 6144 gen = ~11k of
-# the 65536-token kv-unified pool per slot.
+# LOCAL-PATCH 2026-10-07: raised to 30, measured it, reverted to 20. Batch size *is*
+# the call count, so 30 cuts calls by a third - but Pass B (metadata normalization)
+# echoes per-memory metadata, so its reply scales with the batch. On check 09ddb66d
+# (1034 memories, batch 30, ceiling 12288) it truncated 10 times at 43,489-49,003
+# chars = exactly 12288 tokens, the split retry fired 8 times, and 10 batches ended
+# unparseable: ~300 memories lost their metadata pass. Measured ~15k chars per memory
+# = ~12,200 tokens for a 30-batch, right at the ceiling. At 20 the same pass needs
+# ~8,100 tokens, which the 12288 ceiling below clears with ~34% headroom. Cutting
+# calls is only a win when the reply survives.
+_QUALITY_BATCH_SIZE = 20
+# Ceiling for the content-quality pass (Pass A) and the security re-eval - both emit
+# only the issues they find, so replies stay small (measured clean even at batch 30).
+# LOCAL-PATCH 2026-10-07: 4096 -> 6144 after 168h of logs showed truncations
+# bottoming at 14,226 chars = 4096 tokens at ~3.5 chars/token, i.e. hitting the
+# ceiling. The original 16384 default was the opposite failure - a looping model
+# burned 74s and 16k tokens before the parse failed. Pool cost: ~5k prompt + 6144 gen
+# = ~11k of the 65536-token kv-unified pool per slot.
 _FSCK_MAX_TOKENS = 6144
 # LOCAL-PATCH 2026-10-07: Pass B (metadata normalization) needs its own ceiling.
 # Measured on check b8c5df58 with batch 30: Pass A (content quality) returned in
