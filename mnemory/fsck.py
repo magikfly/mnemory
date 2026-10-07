@@ -959,6 +959,34 @@ class FsckService:
 
             self._stamp_clean_memories(check, memories, check_id)
 
+            # LOCAL-PATCH: drop findings whose target memories vanished while this check was
+            # running. Every phase is computed against the snapshot taken at scan start, and
+            # the store keeps moving underneath it (dedup merges, consolidation, chat
+            # writes). Last night that produced 76 queued rows, 71 pointing at deleted
+            # memories; today check d91db252 reproduced the identical shape - it queued a
+            # reclassify of 81316e1d, which was gone from the store by the time the UI
+            # rendered it. Marking such rows superseded at apply time hides them inside one
+            # check, so the next scan shows them again. Dropping them when the check is built
+            # leaves a review list of findings that can actually be actioned.
+            kept_issues: list[FsckIssue] = []
+            stale_issues = 0
+            for issue in check.issues:
+                if self._targets_all_absent(issue):
+                    stale_issues += 1
+                    continue
+                kept_issues.append(issue)
+            if stale_issues:
+                check.issues = kept_issues
+                check.summary = self._build_summary(kept_issues)
+                check.progress.issues_found = len(kept_issues)
+                logger.info(
+                    "Fsck check %s: dropped %d finding(s) whose target memories are gone "
+                    "from the store (%d actionable left)",
+                    check_id,
+                    stale_issues,
+                    len(kept_issues),
+                )
+
             # Build summary
             check.progress.phase = "done"
             check.summary = self._build_summary(check.issues)
@@ -2773,10 +2801,27 @@ class FsckService:
         mem_lookup = {m["id"]: m for m in batch}
 
         issues: list[FsckIssue] = []
+        noop_dropped = 0
         for raw_issue in parsed["issues"]:
             actions, action_target_ids = self._parse_issue_actions(
                 raw_issue, id_mapping, mem_lookup
             )
+            # LOCAL-PATCH: drop actions that propose the state the memory already has, and
+            # drop the issue when that was its only action. The metadata pass is told the
+            # current type/categories/importance in the prompt and still prescribes them
+            # back unchanged - seen in the UI: a reclassify of an episodic/#technical memory
+            # proposing type=episodic, categories=#technical. Applying that changes nothing,
+            # so the memory never moves and the next scan flags it again: the permanent
+            # 59-row "misclassified" pile. A finding that changes nothing is not a finding.
+            live_actions = [
+                action
+                for action in actions
+                if not self._action_matches_stored_state(action, mem_lookup)
+            ]
+            if actions and not live_actions:
+                noop_dropped += 1
+                continue
+            actions = live_actions
             affected_mems = self._resolve_affected_memories(
                 raw_issue, id_mapping, mem_lookup, action_target_ids
             )
@@ -2819,7 +2864,53 @@ class FsckService:
                 )
             )
 
+        if noop_dropped:
+            logger.info(
+                "Fsck quality check: dropped %d no-op finding(s) - proposed metadata "
+                "already matches the stored memory",
+                noop_dropped,
+            )
         return issues
+
+    # Metadata fields a reclassify/normalization action can change.
+    _METADATA_NOOP_FIELDS = ("memory_type", "categories", "importance", "pinned", "role")
+
+    def _action_matches_stored_state(
+        self, action: FsckAction, mem_lookup: dict[str, dict[str, Any]]
+    ) -> bool:
+        """True when this update action would not change the stored memory at all."""
+        if action.action != "update":
+            return False
+        proposed = action.new_metadata or {}
+        if not proposed:
+            return False
+        memory = mem_lookup.get(action.memory_id or "")
+        if memory is None:
+            return False
+        current = memory.get("metadata") or {}
+        if action.new_content:
+            stored_text = memory.get("memory") or memory.get("content") or ""
+            if action.new_content.strip() != stored_text.strip():
+                return False
+        compared = 0
+        for field in self._METADATA_NOOP_FIELDS:
+            if field not in proposed:
+                continue
+            want = proposed[field]
+            have = current.get(field)
+            if field == "categories":
+                if sorted(str(x) for x in (want or [])) != sorted(
+                    str(x) for x in (have or [])
+                ):
+                    return False
+            elif field == "pinned":
+                if bool(want) != bool(have):
+                    return False
+            else:
+                if str(want).strip().lower() != str(have).strip().lower():
+                    return False
+            compared += 1
+        return compared > 0
 
     @staticmethod
     def _get_memory_agent_id(mem: dict[str, Any]) -> str | None:
