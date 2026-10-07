@@ -1027,7 +1027,7 @@ index 095af66..2396e4d 100644
              # Filter by dedup threshold
              candidates = [
 diff --git a/mnemory/prompts.py b/mnemory/prompts.py
-index 2c3d037..2b0c785 100644
+index 2c3d037..1efa8ff 100644
 --- a/mnemory/prompts.py
 +++ b/mnemory/prompts.py
 @@ -513,13 +513,35 @@ When an existing memory captures the same information, use CONFIRM only for new
@@ -1106,7 +1106,41 @@ index 2c3d037..2b0c785 100644
  ### Dedup examples
  
  Existing: [{{"id": "0", "text": "Assistant's name is Bob"}}]
-@@ -3620,7 +3664,13 @@ def parse_dedup_response(
+@@ -3289,16 +3333,29 @@ def parse_remember_extraction_response(
+         - summary: Turn summary string
+         - store_artifact: Whether to save original content as artifact
+     """
+-    from mnemory.llm import parse_json_response
++    from mnemory.llm import parse_json_response, salvage_json_objects
+ 
+     try:
+         data = parse_json_response(response_text)
+     except ValueError:
++        # LOCAL-PATCH 2026-10-07: a truncated reply is not an empty reply. This parser
++        # discarded everything on a parse failure, so a turn whose extraction hit the
++        # max_tokens ceiling lost all of its facts (observed: remember_extract truncated
++        # at 42,796 chars = the 12288-token ceiling). salvage_json_objects() recovers the
++        # objects that closed before the cut - the same recovery fsck already uses. Zero
++        # extra LLM calls; the discarded-fact path disappears.
++        data = salvage_json_objects(response_text, "memories") or {}
++        if not data.get("memories"):
++            if not silent:
++                logger.warning(
++                    "Failed to parse remember extraction response, returning empty"
++                )
++            return [], "", False
+         if not silent:
+-            logger.warning(
+-                "Failed to parse remember extraction response, returning empty"
++            logger.info(
++                "Remember extraction: salvaged %d memories from a truncated response",
++                len(data["memories"]),
+             )
+-        return [], "", False
+ 
+     summary = str(data.get("summary", "")).strip()
+     store_artifact = bool(data.get("store_artifact", False))
+@@ -3620,7 +3677,13 @@ def parse_dedup_response(
          raw_action = entry.get("action")
          fact_index = entry.get("fact_index")
          raw_text = entry.get("text")
@@ -1121,7 +1155,7 @@ index 2c3d037..2b0c785 100644
              if not silent:
                  logger.warning("Invalid field type in dedup response")
              return [], set()
-@@ -3633,7 +3683,7 @@ def parse_dedup_response(
+@@ -3633,7 +3696,7 @@ def parse_dedup_response(
              "CONFIRMED": "CONFIRM",
          }
          action = aliases.get(raw_action.upper(), raw_action.upper())
@@ -1130,7 +1164,7 @@ index 2c3d037..2b0c785 100644
  
          if (
              not isinstance(fact_index, int)
-@@ -3644,10 +3694,27 @@ def parse_dedup_response(
+@@ -3644,10 +3707,27 @@ def parse_dedup_response(
                  logger.warning("Invalid or duplicate fact_index in dedup response")
              return [], set()
  
@@ -1159,7 +1193,7 @@ index 2c3d037..2b0c785 100644
  
          raw_target = entry.get("target_id")
          if action in ("ADD", "SKIP") and raw_target is not None:
-@@ -4000,7 +4067,13 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
+@@ -4000,7 +4080,13 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -1174,7 +1208,7 @@ index 2c3d037..2b0c785 100644
                              "description": "IDs of all memories involved",
                          },
                          "actions": {
-@@ -4019,7 +4092,12 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
+@@ -4019,7 +4105,12 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
                                          "type": "string",
                                          "enum": ["update", "delete"],
                                      },
@@ -1188,7 +1222,7 @@ index 2c3d037..2b0c785 100644
                                      "new_content": {
                                          "type": ["string", "null"],
                                          "description": (
-@@ -4224,7 +4302,13 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
+@@ -4224,7 +4315,13 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -1203,7 +1237,7 @@ index 2c3d037..2b0c785 100644
                              "description": "IDs of memories with this issue",
                          },
                          "actions": {
-@@ -4244,6 +4328,9 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
+@@ -4244,6 +4341,9 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
                                      },
                                      "memory_id": {
                                          "type": "string",
@@ -1213,7 +1247,7 @@ index 2c3d037..2b0c785 100644
                                      },
                                      "new_content": {
                                          "type": ["string", "null"],
-@@ -4484,7 +4571,13 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
+@@ -4484,7 +4584,13 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -1228,7 +1262,7 @@ index 2c3d037..2b0c785 100644
                              "description": "IDs of memories with this issue",
                          },
                          "actions": {
-@@ -4504,6 +4597,9 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
+@@ -4504,6 +4610,9 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
                                      },
                                      "memory_id": {
                                          "type": "string",
@@ -1238,6 +1272,11 @@ index 2c3d037..2b0c785 100644
                                      },
                                      "new_metadata": {
                                          "type": "object",
+@@ -5377,3 +5486,4 @@ def build_cross_session_prompt(
+     ]
+ 
+     return messages, CROSS_SESSION_OUTPUT_SCHEMA
++
 diff --git a/mnemory/storage/vector.py b/mnemory/storage/vector.py
 index a341899..25f3afe 100644
 --- a/mnemory/storage/vector.py
