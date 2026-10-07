@@ -310,7 +310,7 @@ index 6776c15..a179324 100644
          return stored_ids
 +
 diff --git a/mnemory/fsck.py b/mnemory/fsck.py
-index 2dfd3c6..af415bc 100644
+index 2dfd3c6..bf47c62 100644
 --- a/mnemory/fsck.py
 +++ b/mnemory/fsck.py
 @@ -29,13 +29,14 @@ from qdrant_client.models import PointStruct
@@ -393,7 +393,42 @@ index 2dfd3c6..af415bc 100644
  
  # ── Data structures ──────────────────────────────────────────────────
  
-@@ -1051,6 +1101,50 @@ class FsckService:
+@@ -909,6 +959,34 @@ class FsckService:
+ 
+             self._stamp_clean_memories(check, memories, check_id)
+ 
++            # LOCAL-PATCH: drop findings whose target memories vanished while this check was
++            # running. Every phase is computed against the snapshot taken at scan start, and
++            # the store keeps moving underneath it (dedup merges, consolidation, chat
++            # writes). Last night that produced 76 queued rows, 71 pointing at deleted
++            # memories; today check d91db252 reproduced the identical shape - it queued a
++            # reclassify of 81316e1d, which was gone from the store by the time the UI
++            # rendered it. Marking such rows superseded at apply time hides them inside one
++            # check, so the next scan shows them again. Dropping them when the check is built
++            # leaves a review list of findings that can actually be actioned.
++            kept_issues: list[FsckIssue] = []
++            stale_issues = 0
++            for issue in check.issues:
++                if self._targets_all_absent(issue):
++                    stale_issues += 1
++                    continue
++                kept_issues.append(issue)
++            if stale_issues:
++                check.issues = kept_issues
++                check.summary = self._build_summary(kept_issues)
++                check.progress.issues_found = len(kept_issues)
++                logger.info(
++                    "Fsck check %s: dropped %d finding(s) whose target memories are gone "
++                    "from the store (%d actionable left)",
++                    check_id,
++                    stale_issues,
++                    len(kept_issues),
++                )
++
+             # Build summary
+             check.progress.phase = "done"
+             check.summary = self._build_summary(check.issues)
+@@ -1051,6 +1129,50 @@ class FsckService:
              session_agent_id + ":"
          )
  
@@ -444,7 +479,7 @@ index 2dfd3c6..af415bc 100644
      def apply_check(
          self,
          check_id: str,
-@@ -1102,9 +1196,20 @@ class FsckService:
+@@ -1102,9 +1224,20 @@ class FsckService:
          else:
              issues = list(check.issues)
  
@@ -465,7 +500,7 @@ index 2dfd3c6..af415bc 100644
          details: list[dict] = []
  
          for issue in issues:
-@@ -1138,6 +1243,30 @@ class FsckService:
+@@ -1138,6 +1271,30 @@ class FsckService:
                          for memory in issue.affected_memories
                      }
                      for index, action in enumerate(issue.actions):
@@ -496,7 +531,7 @@ index 2dfd3c6..af415bc 100644
                          source = (
                              self._vector.get_by_id(action.memory_id)
                              if action.memory_id
-@@ -1193,6 +1322,55 @@ class FsckService:
+@@ -1193,6 +1350,55 @@ class FsckService:
                          "skipped",
                          "superseded",
                      }:
@@ -552,7 +587,7 @@ index 2dfd3c6..af415bc 100644
                          skipped += 1
                          details.append(
                              {
-@@ -1506,6 +1684,24 @@ class FsckService:
+@@ -1506,6 +1712,24 @@ class FsckService:
                      check.applied_issue_ids.add(issue.issue_id)
                      applied += 1
                      status = "applied"
@@ -577,7 +612,7 @@ index 2dfd3c6..af415bc 100644
                  else:
                      skipped += 1
                      status = "skipped"
-@@ -1594,6 +1790,7 @@ class FsckService:
+@@ -1594,6 +1818,7 @@ class FsckService:
          return {
              "applied": applied,
              "skipped": skipped,
@@ -585,7 +620,7 @@ index 2dfd3c6..af415bc 100644
              "failed": failed,
              "details": details,
          }
-@@ -2009,6 +2206,7 @@ class FsckService:
+@@ -2009,6 +2234,7 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_security",
@@ -593,7 +628,7 @@ index 2dfd3c6..af415bc 100644
          )
  
          try:
-@@ -2277,9 +2475,10 @@ class FsckService:
+@@ -2277,9 +2503,10 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_dedup",
@@ -605,7 +640,7 @@ index 2dfd3c6..af415bc 100644
          if not parsed or "issues" not in parsed:
              return []
  
-@@ -2456,6 +2655,7 @@ class FsckService:
+@@ -2456,6 +2683,7 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_content_quality",
@@ -613,7 +648,7 @@ index 2dfd3c6..af415bc 100644
          )
  
          return self._parse_quality_response(
-@@ -2467,6 +2667,7 @@ class FsckService:
+@@ -2467,6 +2695,7 @@ class FsckService:
          batch: list[dict],
          *,
          available_categories: list[str] | None = None,
@@ -621,7 +656,7 @@ index 2dfd3c6..af415bc 100644
      ) -> list[FsckIssue]:
          """Pass B: check a batch of memories for metadata issues."""
          messages, schema, id_mapping = build_fsck_metadata_normalization_prompt(
-@@ -2479,12 +2680,65 @@ class FsckService:
+@@ -2479,12 +2708,65 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_metadata_normalization",
@@ -689,7 +724,7 @@ index 2dfd3c6..af415bc 100644
      def _parse_quality_response(
          self,
          response: str,
-@@ -2494,7 +2748,24 @@ class FsckService:
+@@ -2494,7 +2776,24 @@ class FsckService:
          default_type: str = "quality",
      ) -> list[FsckIssue]:
          """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
@@ -715,7 +750,90 @@ index 2dfd3c6..af415bc 100644
          if not parsed or "issues" not in parsed:
              return []
  
-@@ -3134,3 +3405,4 @@ class FsckService:
+@@ -2502,10 +2801,27 @@ class FsckService:
+         mem_lookup = {m["id"]: m for m in batch}
+ 
+         issues: list[FsckIssue] = []
++        noop_dropped = 0
+         for raw_issue in parsed["issues"]:
+             actions, action_target_ids = self._parse_issue_actions(
+                 raw_issue, id_mapping, mem_lookup
+             )
++            # LOCAL-PATCH: drop actions that propose the state the memory already has, and
++            # drop the issue when that was its only action. The metadata pass is told the
++            # current type/categories/importance in the prompt and still prescribes them
++            # back unchanged - seen in the UI: a reclassify of an episodic/#technical memory
++            # proposing type=episodic, categories=#technical. Applying that changes nothing,
++            # so the memory never moves and the next scan flags it again: the permanent
++            # 59-row "misclassified" pile. A finding that changes nothing is not a finding.
++            live_actions = [
++                action
++                for action in actions
++                if not self._action_matches_stored_state(action, mem_lookup)
++            ]
++            if actions and not live_actions:
++                noop_dropped += 1
++                continue
++            actions = live_actions
+             affected_mems = self._resolve_affected_memories(
+                 raw_issue, id_mapping, mem_lookup, action_target_ids
+             )
+@@ -2548,8 +2864,54 @@ class FsckService:
+                 )
+             )
+ 
++        if noop_dropped:
++            logger.info(
++                "Fsck quality check: dropped %d no-op finding(s) - proposed metadata "
++                "already matches the stored memory",
++                noop_dropped,
++            )
+         return issues
+ 
++    # Metadata fields a reclassify/normalization action can change.
++    _METADATA_NOOP_FIELDS = ("memory_type", "categories", "importance", "pinned", "role")
++
++    def _action_matches_stored_state(
++        self, action: FsckAction, mem_lookup: dict[str, dict[str, Any]]
++    ) -> bool:
++        """True when this update action would not change the stored memory at all."""
++        if action.action != "update":
++            return False
++        proposed = action.new_metadata or {}
++        if not proposed:
++            return False
++        memory = mem_lookup.get(action.memory_id or "")
++        if memory is None:
++            return False
++        current = memory.get("metadata") or {}
++        if action.new_content:
++            stored_text = memory.get("memory") or memory.get("content") or ""
++            if action.new_content.strip() != stored_text.strip():
++                return False
++        compared = 0
++        for field in self._METADATA_NOOP_FIELDS:
++            if field not in proposed:
++                continue
++            want = proposed[field]
++            have = current.get(field)
++            if field == "categories":
++                if sorted(str(x) for x in (want or [])) != sorted(
++                    str(x) for x in (have or [])
++                ):
++                    return False
++            elif field == "pinned":
++                if bool(want) != bool(have):
++                    return False
++            else:
++                if str(want).strip().lower() != str(have).strip().lower():
++                    return False
++            compared += 1
++        return compared > 0
++
+     @staticmethod
+     def _get_memory_agent_id(mem: dict[str, Any]) -> str | None:
+         """Return the memory agent ID from the normalized memory shape."""
+@@ -3134,3 +3496,4 @@ class FsckService:
                  summary.security += 1
              summary.total += 1
          return summary
