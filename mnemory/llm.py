@@ -46,7 +46,15 @@ class LLMClient:
         *,
         json_schema: dict[str, Any] | None = None,
         temperature: float | None = None,
-        max_tokens: int = 16384,
+        # LOCAL-PATCH 2026-10-07: 16384 -> 12288. The extractor profile is
+        # --ctx-size 65536 --parallel 2 --kv-unified, so 65536 tokens is the whole
+        # shared KV pool, not a per-slot allowance. A long-chat extraction request
+        # (20k-token history + 16384 generation = ~36k) means two slots need ~72k,
+        # which exceeds the pool and forces prompt-cache eviction. Measured: the
+        # 59,602-char truncation in the last week came from this ceiling. 12288
+        # keeps headroom for the big-prompt path; fsck and consolidation pass their
+        # own ceilings (6144 / 8192) and are unaffected.
+        max_tokens: int = 12288,
         reasoning_effort: str | None = None,
         operation: str = "unknown",
     ) -> str:
@@ -410,3 +418,4 @@ def salvage_json_objects(text: str, key: str = "memories") -> list[dict[str, Any
                 obj_start = None
 
     return objects or None
+
