@@ -3333,16 +3333,29 @@ def parse_remember_extraction_response(
         - summary: Turn summary string
         - store_artifact: Whether to save original content as artifact
     """
-    from mnemory.llm import parse_json_response
+    from mnemory.llm import parse_json_response, salvage_json_objects
 
     try:
         data = parse_json_response(response_text)
     except ValueError:
+        # LOCAL-PATCH 2026-10-07: a truncated reply is not an empty reply. This parser
+        # discarded everything on a parse failure, so a turn whose extraction hit the
+        # max_tokens ceiling lost all of its facts (observed: remember_extract truncated
+        # at 42,796 chars = the 12288-token ceiling). salvage_json_objects() recovers the
+        # objects that closed before the cut - the same recovery fsck already uses. Zero
+        # extra LLM calls; the discarded-fact path disappears.
+        data = salvage_json_objects(response_text, "memories") or {}
+        if not data.get("memories"):
+            if not silent:
+                logger.warning(
+                    "Failed to parse remember extraction response, returning empty"
+                )
+            return [], "", False
         if not silent:
-            logger.warning(
-                "Failed to parse remember extraction response, returning empty"
+            logger.info(
+                "Remember extraction: salvaged %d memories from a truncated response",
+                len(data["memories"]),
             )
-        return [], "", False
 
     summary = str(data.get("summary", "")).strip()
     store_artifact = bool(data.get("store_artifact", False))
@@ -5473,3 +5486,4 @@ def build_cross_session_prompt(
     ]
 
     return messages, CROSS_SESSION_OUTPUT_SCHEMA
+
