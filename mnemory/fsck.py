@@ -2755,12 +2755,16 @@ class FsckService:
         except ValueError:
             salvaged = salvage_json_objects(response, "issues")
             if salvaged:
+                # LOCAL-PATCH 2026-10-07: salvage_json_objects returns a flat list of the
+                # closed array items. The old code called .get("issues") on that list
+                # (AttributeError) and returned the bare list, which _issues_from_parsed
+                # then silently discarded. Wrap it in the envelope callers expect.
                 logger.warning(
                     "Fsck %s: truncated response, salvaged %d complete issues",
                     context,
-                    len(salvaged.get("issues", [])),
+                    len(salvaged),
                 )
-                return salvaged
+                return {"issues": salvaged}
             logger.warning(
                 "Fsck %s: unparseable response after salvage, skipping batch",
                 context,

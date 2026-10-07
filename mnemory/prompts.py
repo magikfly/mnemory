@@ -3344,7 +3344,12 @@ def parse_remember_extraction_response(
         # at 42,796 chars = the 12288-token ceiling). salvage_json_objects() recovers the
         # objects that closed before the cut - the same recovery fsck already uses. Zero
         # extra LLM calls; the discarded-fact path disappears.
-        data = salvage_json_objects(response_text, "memories") or {}
+        # salvage_json_objects returns a flat list of closed objects; wrap it in the
+        # envelope below. The previous revision called .get("memories") on the list,
+        # which raised AttributeError and took the whole Remember call down - worse
+        # than the empty-return it replaced.
+        salvaged = salvage_json_objects(response_text, "memories")
+        data = {"memories": salvaged} if salvaged else {}
         if not data.get("memories"):
             if not silent:
                 logger.warning(

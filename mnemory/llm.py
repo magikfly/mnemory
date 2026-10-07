@@ -411,7 +411,14 @@ def salvage_json_objects(text: str, key: str = "memories") -> list[dict[str, Any
             if depth == 0 and obj_start is not None:
                 try:
                     obj = json.loads(cleaned[obj_start : i + 1])
-                    if isinstance(obj, dict) and obj.get("text"):
+                    # LOCAL-PATCH 2026-10-07: was `obj.get("text")`, which hardcoded the
+                    # remember-extraction shape. fsck calls this with key="issues" and
+                    # issue objects carry type/severity/actions - no "text" - so the
+                    # filter rejected every object and fsck truncation recovery never
+                    # recovered anything (46 truncations in one run, 46 dead skips).
+                    # The walk only collects depth-0 items of the anchored array, i.e.
+                    # exactly the payload entries, so accept any object.
+                    if isinstance(obj, dict):
                         objects.append(obj)
                 except json.JSONDecodeError:
                     pass
