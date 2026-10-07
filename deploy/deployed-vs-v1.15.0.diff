@@ -310,7 +310,7 @@ index 6776c15..a179324 100644
          return stored_ids
 +
 diff --git a/mnemory/fsck.py b/mnemory/fsck.py
-index 2dfd3c6..1d9b63f 100644
+index 2dfd3c6..760923d 100644
 --- a/mnemory/fsck.py
 +++ b/mnemory/fsck.py
 @@ -29,13 +29,14 @@ from qdrant_client.models import PointStruct
@@ -329,7 +329,7 @@ index 2dfd3c6..1d9b63f 100644
  from mnemory.prompts import (
      build_fsck_content_quality_prompt,
      build_fsck_duplicate_prompt,
-@@ -62,7 +63,20 @@ logger = logging.getLogger(__name__)
+@@ -62,7 +63,32 @@ logger = logging.getLogger(__name__)
  _DUPLICATE_SIMILARITY_THRESHOLD = 0.75
  
  # Maximum memories per LLM quality-check batch.
@@ -348,10 +348,22 @@ index 2dfd3c6..1d9b63f 100644
 +# the 30-memory reply ~50% headroom. Pool cost: ~5k prompt + 6144 gen = ~11k of
 +# the 65536-token kv-unified pool per slot.
 +_FSCK_MAX_TOKENS = 6144
++# LOCAL-PATCH 2026-10-07: Pass B (metadata normalization) needs its own ceiling.
++# Measured on check b8c5df58 with batch 30: Pass A (content quality) returned in
++# 2.7-5.1s inside 6144, while Pass B truncated at 23,040 chars = exactly 6144
++# tokens, salvage found no closed objects, and the whole 30-memory batch was
++# skipped. Pass B echoes per-memory metadata, so its output scales with batch
++# size; Pass A emits only the issues it found. 12288 tokens ~ 46k chars covers a
++# 30-memory echo (prompt ~6k + 12288 gen ~ 18k of the 65536 pool per slot).
++_FSCK_METADATA_MAX_TOKENS = 12288
++# Floor for the Pass B recovery split: a batch at least this big is halved once
++# when its reply is unparseable after salvage. Bounded - sub-batches never split
++# again - so the cost is 2 extra calls on a failure that happened ~1x/week.
++_METADATA_RETRY_MIN_BATCH = 16
  
  # Maximum memories per duplicate cluster sent to LLM.
  _MAX_CLUSTER_SIZE = 15
-@@ -70,6 +84,20 @@ _MAX_CLUSTER_SIZE = 15
+@@ -70,6 +96,20 @@ _MAX_CLUSTER_SIZE = 15
  # Maximum similar neighbors to check per memory during duplicate detection.
  _DUPLICATE_NEIGHBORS = 5
  
@@ -372,7 +384,7 @@ index 2dfd3c6..1d9b63f 100644
  
  # ── Data structures ──────────────────────────────────────────────────
  
-@@ -1051,6 +1079,50 @@ class FsckService:
+@@ -1051,6 +1091,50 @@ class FsckService:
              session_agent_id + ":"
          )
  
@@ -423,7 +435,7 @@ index 2dfd3c6..1d9b63f 100644
      def apply_check(
          self,
          check_id: str,
-@@ -1102,9 +1174,20 @@ class FsckService:
+@@ -1102,9 +1186,20 @@ class FsckService:
          else:
              issues = list(check.issues)
  
@@ -444,7 +456,7 @@ index 2dfd3c6..1d9b63f 100644
          details: list[dict] = []
  
          for issue in issues:
-@@ -1138,6 +1221,30 @@ class FsckService:
+@@ -1138,6 +1233,30 @@ class FsckService:
                          for memory in issue.affected_memories
                      }
                      for index, action in enumerate(issue.actions):
@@ -475,7 +487,7 @@ index 2dfd3c6..1d9b63f 100644
                          source = (
                              self._vector.get_by_id(action.memory_id)
                              if action.memory_id
-@@ -1193,6 +1300,55 @@ class FsckService:
+@@ -1193,6 +1312,55 @@ class FsckService:
                          "skipped",
                          "superseded",
                      }:
@@ -531,7 +543,7 @@ index 2dfd3c6..1d9b63f 100644
                          skipped += 1
                          details.append(
                              {
-@@ -1506,6 +1662,24 @@ class FsckService:
+@@ -1506,6 +1674,24 @@ class FsckService:
                      check.applied_issue_ids.add(issue.issue_id)
                      applied += 1
                      status = "applied"
@@ -556,7 +568,7 @@ index 2dfd3c6..1d9b63f 100644
                  else:
                      skipped += 1
                      status = "skipped"
-@@ -1594,6 +1768,7 @@ class FsckService:
+@@ -1594,6 +1780,7 @@ class FsckService:
          return {
              "applied": applied,
              "skipped": skipped,
@@ -564,7 +576,7 @@ index 2dfd3c6..1d9b63f 100644
              "failed": failed,
              "details": details,
          }
-@@ -2009,6 +2184,7 @@ class FsckService:
+@@ -2009,6 +2196,7 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_security",
@@ -572,7 +584,7 @@ index 2dfd3c6..1d9b63f 100644
          )
  
          try:
-@@ -2277,9 +2453,10 @@ class FsckService:
+@@ -2277,9 +2465,10 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_dedup",
@@ -584,7 +596,7 @@ index 2dfd3c6..1d9b63f 100644
          if not parsed or "issues" not in parsed:
              return []
  
-@@ -2456,6 +2633,7 @@ class FsckService:
+@@ -2456,6 +2645,7 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_content_quality",
@@ -592,15 +604,50 @@ index 2dfd3c6..1d9b63f 100644
          )
  
          return self._parse_quality_response(
-@@ -2479,12 +2657,40 @@ class FsckService:
+@@ -2467,6 +2657,7 @@ class FsckService:
+         batch: list[dict],
+         *,
+         available_categories: list[str] | None = None,
++        allow_split: bool = True,
+     ) -> list[FsckIssue]:
+         """Pass B: check a batch of memories for metadata issues."""
+         messages, schema, id_mapping = build_fsck_metadata_normalization_prompt(
+@@ -2479,12 +2670,65 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_metadata_normalization",
-+            max_tokens=_FSCK_MAX_TOKENS,
++            max_tokens=_FSCK_METADATA_MAX_TOKENS,
          )
  
-         return self._parse_quality_response(
-             response, id_mapping, batch, default_type="reclassify"
+-        return self._parse_quality_response(
+-            response, id_mapping, batch, default_type="reclassify"
++        parsed = self._parse_llm_json(response, "metadata normalization")
++        if parsed is None and allow_split and len(batch) >= _METADATA_RETRY_MIN_BATCH:
++            # LOCAL-PATCH: see the constant block - at batch 30 this pass truncated and
++            # salvage recovered nothing, so 30 memories silently lost their metadata
++            # pass. Halving halves the echoed output. One level only (sub-batches pass
++            # allow_split=False), and it fires solely on an unparseable reply.
++            mid = len(batch) // 2
++            logger.info(
++                "Fsck metadata normalization: batch of %d unparseable after salvage - "
++                "retrying as %d + %d",
++                len(batch),
++                mid,
++                len(batch) - mid,
++            )
++            issues: list[FsckIssue] = []
++            for sub in (batch[:mid], batch[mid:]):
++                issues.extend(
++                    self._evaluate_metadata_normalization_batch(
++                        sub,
++                        available_categories=available_categories,
++                        allow_split=False,
++                    )
++                )
++            return issues
++
++        return self._issues_from_parsed(
++            parsed, id_mapping, batch, default_type="reclassify"
          )
  
 +    def _parse_llm_json(self, response: str, context: str) -> dict[str, Any] | None:
@@ -633,16 +680,33 @@ index 2dfd3c6..1d9b63f 100644
      def _parse_quality_response(
          self,
          response: str,
-@@ -2494,7 +2700,7 @@ class FsckService:
+@@ -2494,7 +2738,24 @@ class FsckService:
          default_type: str = "quality",
      ) -> list[FsckIssue]:
          """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
 -        parsed = parse_json_response(response)
 +        parsed = self._parse_llm_json(response, "quality check")
++        return self._issues_from_parsed(
++            parsed, id_mapping, batch, default_type=default_type
++        )
++
++    def _issues_from_parsed(
++        self,
++        parsed: dict[str, Any] | None,
++        id_mapping: dict[str, str],
++        batch: list[dict],
++        *,
++        default_type: str = "quality",
++    ) -> list[FsckIssue]:
++        """Build ``FsckIssue`` objects from an already-parsed reply.
++
++        LOCAL-PATCH: split out of _parse_quality_response so Pass B can parse once,
++        decide on a recovery split, and then build issues without a second parse.
++        """
          if not parsed or "issues" not in parsed:
              return []
  
-@@ -3134,3 +3340,4 @@ class FsckService:
+@@ -3134,3 +3395,4 @@ class FsckService:
                  summary.security += 1
              summary.total += 1
          return summary
