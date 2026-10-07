@@ -310,7 +310,7 @@ index 6776c15..a179324 100644
          return stored_ids
 +
 diff --git a/mnemory/fsck.py b/mnemory/fsck.py
-index 2dfd3c6..bf47c62 100644
+index 2dfd3c6..0e4d9e7 100644
 --- a/mnemory/fsck.py
 +++ b/mnemory/fsck.py
 @@ -29,13 +29,14 @@ from qdrant_client.models import PointStruct
@@ -656,7 +656,7 @@ index 2dfd3c6..bf47c62 100644
      ) -> list[FsckIssue]:
          """Pass B: check a batch of memories for metadata issues."""
          messages, schema, id_mapping = build_fsck_metadata_normalization_prompt(
-@@ -2479,12 +2708,65 @@ class FsckService:
+@@ -2479,12 +2708,69 @@ class FsckService:
              temperature=0.1,
              reasoning_effort=self._reasoning_effort,
              operation="fsck_metadata_normalization",
@@ -709,12 +709,16 @@ index 2dfd3c6..bf47c62 100644
 +        except ValueError:
 +            salvaged = salvage_json_objects(response, "issues")
 +            if salvaged:
++                # LOCAL-PATCH 2026-10-07: salvage_json_objects returns a flat list of the
++                # closed array items. The old code called .get("issues") on that list
++                # (AttributeError) and returned the bare list, which _issues_from_parsed
++                # then silently discarded. Wrap it in the envelope callers expect.
 +                logger.warning(
 +                    "Fsck %s: truncated response, salvaged %d complete issues",
 +                    context,
-+                    len(salvaged.get("issues", [])),
++                    len(salvaged),
 +                )
-+                return salvaged
++                return {"issues": salvaged}
 +            logger.warning(
 +                "Fsck %s: unparseable response after salvage, skipping batch",
 +                context,
@@ -724,7 +728,7 @@ index 2dfd3c6..bf47c62 100644
      def _parse_quality_response(
          self,
          response: str,
-@@ -2494,7 +2776,24 @@ class FsckService:
+@@ -2494,7 +2780,24 @@ class FsckService:
          default_type: str = "quality",
      ) -> list[FsckIssue]:
          """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
@@ -750,7 +754,7 @@ index 2dfd3c6..bf47c62 100644
          if not parsed or "issues" not in parsed:
              return []
  
-@@ -2502,10 +2801,27 @@ class FsckService:
+@@ -2502,10 +2805,27 @@ class FsckService:
          mem_lookup = {m["id"]: m for m in batch}
  
          issues: list[FsckIssue] = []
@@ -778,7 +782,7 @@ index 2dfd3c6..bf47c62 100644
              affected_mems = self._resolve_affected_memories(
                  raw_issue, id_mapping, mem_lookup, action_target_ids
              )
-@@ -2548,8 +2864,54 @@ class FsckService:
+@@ -2548,8 +2868,54 @@ class FsckService:
                  )
              )
  
@@ -833,13 +837,13 @@ index 2dfd3c6..bf47c62 100644
      @staticmethod
      def _get_memory_agent_id(mem: dict[str, Any]) -> str | None:
          """Return the memory agent ID from the normalized memory shape."""
-@@ -3134,3 +3496,4 @@ class FsckService:
+@@ -3134,3 +3500,4 @@ class FsckService:
                  summary.security += 1
              summary.total += 1
          return summary
 +
 diff --git a/mnemory/llm.py b/mnemory/llm.py
-index 3840ea2..bf0c841 100644
+index 3840ea2..f0854e6 100644
 --- a/mnemory/llm.py
 +++ b/mnemory/llm.py
 @@ -46,7 +46,15 @@ class LLMClient:
@@ -859,7 +863,7 @@ index 3840ea2..bf0c841 100644
          reasoning_effort: str | None = None,
          operation: str = "unknown",
      ) -> str:
-@@ -361,3 +369,53 @@ def parse_json_response(text: str) -> dict[str, Any]:
+@@ -361,3 +369,60 @@ def parse_json_response(text: str) -> dict[str, Any]:
              pass
  
      raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}")
@@ -905,7 +909,14 @@ index 3840ea2..bf0c841 100644
 +            if depth == 0 and obj_start is not None:
 +                try:
 +                    obj = json.loads(cleaned[obj_start : i + 1])
-+                    if isinstance(obj, dict) and obj.get("text"):
++                    # LOCAL-PATCH 2026-10-07: was `obj.get("text")`, which hardcoded the
++                    # remember-extraction shape. fsck calls this with key="issues" and
++                    # issue objects carry type/severity/actions - no "text" - so the
++                    # filter rejected every object and fsck truncation recovery never
++                    # recovered anything (46 truncations in one run, 46 dead skips).
++                    # The walk only collects depth-0 items of the anchored array, i.e.
++                    # exactly the payload entries, so accept any object.
++                    if isinstance(obj, dict):
 +                        objects.append(obj)
 +                except json.JSONDecodeError:
 +                    pass
@@ -1027,7 +1038,7 @@ index 095af66..2396e4d 100644
              # Filter by dedup threshold
              candidates = [
 diff --git a/mnemory/prompts.py b/mnemory/prompts.py
-index 2c3d037..1efa8ff 100644
+index 2c3d037..2c8a793 100644
 --- a/mnemory/prompts.py
 +++ b/mnemory/prompts.py
 @@ -513,13 +513,35 @@ When an existing memory captures the same information, use CONFIRM only for new
@@ -1106,7 +1117,7 @@ index 2c3d037..1efa8ff 100644
  ### Dedup examples
  
  Existing: [{{"id": "0", "text": "Assistant's name is Bob"}}]
-@@ -3289,16 +3333,29 @@ def parse_remember_extraction_response(
+@@ -3289,16 +3333,34 @@ def parse_remember_extraction_response(
          - summary: Turn summary string
          - store_artifact: Whether to save original content as artifact
      """
@@ -1122,7 +1133,12 @@ index 2c3d037..1efa8ff 100644
 +        # at 42,796 chars = the 12288-token ceiling). salvage_json_objects() recovers the
 +        # objects that closed before the cut - the same recovery fsck already uses. Zero
 +        # extra LLM calls; the discarded-fact path disappears.
-+        data = salvage_json_objects(response_text, "memories") or {}
++        # salvage_json_objects returns a flat list of closed objects; wrap it in the
++        # envelope below. The previous revision called .get("memories") on the list,
++        # which raised AttributeError and took the whole Remember call down - worse
++        # than the empty-return it replaced.
++        salvaged = salvage_json_objects(response_text, "memories")
++        data = {"memories": salvaged} if salvaged else {}
 +        if not data.get("memories"):
 +            if not silent:
 +                logger.warning(
@@ -1140,7 +1156,7 @@ index 2c3d037..1efa8ff 100644
  
      summary = str(data.get("summary", "")).strip()
      store_artifact = bool(data.get("store_artifact", False))
-@@ -3620,7 +3677,13 @@ def parse_dedup_response(
+@@ -3620,7 +3682,13 @@ def parse_dedup_response(
          raw_action = entry.get("action")
          fact_index = entry.get("fact_index")
          raw_text = entry.get("text")
@@ -1155,7 +1171,7 @@ index 2c3d037..1efa8ff 100644
              if not silent:
                  logger.warning("Invalid field type in dedup response")
              return [], set()
-@@ -3633,7 +3696,7 @@ def parse_dedup_response(
+@@ -3633,7 +3701,7 @@ def parse_dedup_response(
              "CONFIRMED": "CONFIRM",
          }
          action = aliases.get(raw_action.upper(), raw_action.upper())
@@ -1164,7 +1180,7 @@ index 2c3d037..1efa8ff 100644
  
          if (
              not isinstance(fact_index, int)
-@@ -3644,10 +3707,27 @@ def parse_dedup_response(
+@@ -3644,10 +3712,27 @@ def parse_dedup_response(
                  logger.warning("Invalid or duplicate fact_index in dedup response")
              return [], set()
  
@@ -1193,7 +1209,7 @@ index 2c3d037..1efa8ff 100644
  
          raw_target = entry.get("target_id")
          if action in ("ADD", "SKIP") and raw_target is not None:
-@@ -4000,7 +4080,13 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
+@@ -4000,7 +4085,13 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -1208,7 +1224,7 @@ index 2c3d037..1efa8ff 100644
                              "description": "IDs of all memories involved",
                          },
                          "actions": {
-@@ -4019,7 +4105,12 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
+@@ -4019,7 +4110,12 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
                                          "type": "string",
                                          "enum": ["update", "delete"],
                                      },
@@ -1222,7 +1238,7 @@ index 2c3d037..1efa8ff 100644
                                      "new_content": {
                                          "type": ["string", "null"],
                                          "description": (
-@@ -4224,7 +4315,13 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
+@@ -4224,7 +4320,13 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -1237,7 +1253,7 @@ index 2c3d037..1efa8ff 100644
                              "description": "IDs of memories with this issue",
                          },
                          "actions": {
-@@ -4244,6 +4341,9 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
+@@ -4244,6 +4346,9 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
                                      },
                                      "memory_id": {
                                          "type": "string",
@@ -1247,7 +1263,7 @@ index 2c3d037..1efa8ff 100644
                                      },
                                      "new_content": {
                                          "type": ["string", "null"],
-@@ -4484,7 +4584,13 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
+@@ -4484,7 +4589,13 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
                          },
                          "affected_memory_ids": {
                              "type": "array",
@@ -1262,7 +1278,7 @@ index 2c3d037..1efa8ff 100644
                              "description": "IDs of memories with this issue",
                          },
                          "actions": {
-@@ -4504,6 +4610,9 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
+@@ -4504,6 +4615,9 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
                                      },
                                      "memory_id": {
                                          "type": "string",
@@ -1272,7 +1288,7 @@ index 2c3d037..1efa8ff 100644
                                      },
                                      "new_metadata": {
                                          "type": "object",
-@@ -5377,3 +5486,4 @@ def build_cross_session_prompt(
+@@ -5377,3 +5491,4 @@ def build_cross_session_prompt(
      ]
  
      return messages, CROSS_SESSION_OUTPUT_SCHEMA
