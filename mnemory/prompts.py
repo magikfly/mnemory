@@ -2230,16 +2230,18 @@ Output:
 ### Example 12: Non-English input (extract in English)
 
 Input:
-User: Ahoj, jmenuji se Petr a jsem z Ostravy. Rad varim a sbiram znamky.
-Assistant: Ahoj Petre! To jsou zajimave konicky!
+User: Hallo, ich bin Beispiel-Person und wohne in Beispielstadt.
+Assistant: Hallo! Wie kann ich helfen?
 
 Output:
 {{"memories": [
-  {{"text": "User's name is Petr", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": true, "event_date": null}},
-  {{"text": "User is from Ostrava", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User enjoys cooking and collecting stamps", "memory_type": "preference", "categories": ["personal", "entertainment"], "importance": "normal", "pinned": false, "event_date": null}}
-], "summary": "User introduced themselves as Petr from Ostrava who enjoys cooking and stamp collecting.", "store_artifact": false}}
-(Always extract in English. Preserve proper nouns like Petr and Ostrava.)
+  {{"text": "User's name is Beispiel-Person", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": true, "event_date": null}},
+  {{"text": "User lives in Beispielstadt", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}}
+], "summary": "User introduced themselves as Beispiel-Person from Beispielstadt.", "store_artifact": false}}
+(Always extract in English. Preserve proper nouns like Beispiel-Person and
+Beispielstadt. The placeholder persona is deliberate: an example output that
+leaks into a real store must be self-identifying, never a plausible user fact.
+Never reuse these placeholder values as extracted facts.)
 
 ### Example 13: Feature request with knowledge gap (episodic, NOT fact)
 
@@ -2956,15 +2958,15 @@ Output:
 ### Example 7: Non-English input
 
 Input:
-User: Ahoj, jmenuji se Petr a jsem z Ostravy. Rad varim a sbiram znamky.
-Assistant: Ahoj Petre! To jsou zajimave konicky!
+User: Hallo, ich bin Beispiel-Person und wohne in Beispielstadt.
+Assistant: Hallo! Wie kann ich helfen?
 
 Output:
 {{"memories": [
-  {{"text": "User's name is Petr", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": true, "event_date": null}},
-  {{"text": "User is from Ostrava", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User enjoys cooking and collecting stamps", "role": "user", "memory_type": "preference", "categories": ["personal", "entertainment"], "importance": "normal", "pinned": false, "event_date": null}}
-], "summary": "User introduced themselves as Petr from Ostrava who enjoys cooking and stamp collecting.", "store_artifact": false}}
+  {{"text": "User's name is Beispiel-Person", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": true, "event_date": null}},
+  {{"text": "User lives in Beispielstadt", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}}
+], "summary": "User introduced themselves as Beispiel-Person from Beispielstadt.", "store_artifact": false}}
+(Placeholder persona: example outputs must never read as plausible user facts.)
 
 ### Example 8: Code analysis (context, NOT fact)
 
