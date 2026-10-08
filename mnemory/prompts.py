@@ -4840,6 +4840,44 @@ When sources differ, use this order:
 - Observations about the current state of the memory system (what is
   or isn't remembered) — these become stale immediately
 
+## Phrasing rules
+
+Apply these to every output memory. They override the urge to preserve detail.
+
+- One memory, one clause. Never stitch decisions with "also", "additionally",
+  "furthermore", or chained semicolons. Three decisions in the source are three
+  memories, or one memory containing only the durable conclusion.
+- Head verb must be a durable act, not a speech act. Forbidden as the head of a
+  memory: noted, mentioned, stated, clarified, offered, provided, gave, shared,
+  answered, observed that, pointed out, walked through, went over.
+- "suggested" / "explained" / "identified that" are allowed only when the memory
+  also carries a decision or a fix. "Assistant suggested using document.querySelectorAll
+  for selector robustness" is dropped; "Assistant fixed the selector by querying
+  within the container" survives.
+- "recommended" survives only with a specific option AND a specific target:
+  "Assistant recommended Redis with TTL-based eviction for the session store".
+  A bare "Assistant recommended a conservative approach" is dropped.
+- Rewrite, do not delete, when a speech-act memory contains a technical
+  behaviour, a root cause, or a configuration consequence: state the fact
+  directly and drop the actor.
+  "Assistant explained that --n-gpu-layers keeps model weights resident in VRAM"
+  becomes "--n-gpu-layers keeps model weights resident in VRAM" (type context).
+  "Assistant identified that the root cause is in ResponseMessage.svelte:897"
+  becomes "OWUI suppresses the response cursor at ResponseMessage.svelte:897 when
+  a status is visible" (type context).
+- Drop only when the sentence records that something was observed or offered and
+  says nothing that would change what you do next.
+- Delete test: remove the framing words ("User decided to", "Assistant
+  recommended"). If what remains is not an actionable fact about the world, the
+  memory is noise. Drop it.
+- Operational parameters are context, never fact or preference: ports, versions,
+  image tags, token limits, tool counts, cron schedules, sizes, counts. Name the
+  system they belong to. They decay on their own; do not make them permanent and
+  do not pin them.
+- From a session summary, take only decisions, outcomes, constraints, and
+  measurements. A summary sentence describing what the assistant did or said is
+  not a memory, however well written.
+
 ## Quality rules
 
 - Be CONSERVATIVE. It is better to produce fewer high-quality memories
@@ -5000,6 +5038,44 @@ When sources differ, use this order:
 - Brief confirmations or status responses
 - Observations about the current state of the memory system (what is
   or isn't remembered) — these become stale immediately
+
+## Phrasing rules
+
+Apply these to every output memory. They override the urge to preserve detail.
+
+- One memory, one clause. Never stitch decisions with "also", "additionally",
+  "furthermore", or chained semicolons. Three decisions in the source are three
+  memories, or one memory containing only the durable conclusion.
+- Head verb must be a durable act, not a speech act. Forbidden as the head of a
+  memory: noted, mentioned, stated, clarified, offered, provided, gave, shared,
+  answered, observed that, pointed out, walked through, went over.
+- "suggested" / "explained" / "identified that" are allowed only when the memory
+  also carries a decision or a fix. "Assistant suggested using document.querySelectorAll
+  for selector robustness" is dropped; "Assistant fixed the selector by querying
+  within the container" survives.
+- "recommended" survives only with a specific option AND a specific target:
+  "Assistant recommended Redis with TTL-based eviction for the session store".
+  A bare "Assistant recommended a conservative approach" is dropped.
+- Rewrite, do not delete, when a speech-act memory contains a technical
+  behaviour, a root cause, or a configuration consequence: state the fact
+  directly and drop the actor.
+  "Assistant explained that --n-gpu-layers keeps model weights resident in VRAM"
+  becomes "--n-gpu-layers keeps model weights resident in VRAM" (type context).
+  "Assistant identified that the root cause is in ResponseMessage.svelte:897"
+  becomes "OWUI suppresses the response cursor at ResponseMessage.svelte:897 when
+  a status is visible" (type context).
+- Drop only when the sentence records that something was observed or offered and
+  says nothing that would change what you do next.
+- Delete test: remove the framing words ("User decided to", "Assistant
+  recommended"). If what remains is not an actionable fact about the world, the
+  memory is noise. Drop it.
+- Operational parameters are context, never fact or preference: ports, versions,
+  image tags, token limits, tool counts, cron schedules, sizes, counts. Name the
+  system they belong to. They decay on their own; do not make them permanent and
+  do not pin them.
+- From a session summary, take only decisions, outcomes, constraints, and
+  measurements. A summary sentence describing what the assistant did or said is
+  not a memory, however well written.
 
 ## Quality rules
 
