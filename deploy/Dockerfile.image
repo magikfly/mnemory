@@ -24,9 +24,13 @@ RUN pip install --no-cache-dir -c /tmp/constraints.txt ".[all]" \
 
 # Stage 2: full source, no dependency re-resolve.
 COPY mnemory/ mnemory/
+# mnemory.server builds the Starlette app at import time, which validates config (needs an
+# API key) and would default its store dir to ~/.mnemory — so give the check throwaway values.
 RUN pip install --no-cache-dir --no-deps . \
     && pip check \
-    && python -c "import mcp, fastembed, qdrant_client, openai, fastapi, starlette, mnemory.server"
+    && python -c "import mcp, fastembed, qdrant_client, openai, fastapi, starlette" \
+    && DATA_DIR=/tmp/mn-import-check LLM_API_KEY=build-time-check python -c "import mnemory.server" \
+    && rm -rf /tmp/mn-import-check /root/.mnemory
 
 # Pre-download the BM25 sparse embedding model so containers start without network dependency.
 RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='Qdrant/bm25')"
