@@ -1,0 +1,39 @@
+# GHCR build for ghcr.io/magikfly/mnemory (pushed by .github/workflows/mnemory-ghcr.yml).
+#
+# Recipe = upstream v1.15.0 root Dockerfile (pip install .[all] on python:3.13-slim, then the
+# full tree with --no-deps), plus two deliberate production deviations:
+#   1. deploy/constraints.txt pins the six runtime versions verified live (qdrant-client 1.19.1
+#      in particular: the _LockedLocalClient read-lock patch is tuned to that version's race).
+#   2. No HEALTHCHECK: since v1.15.0 /health requires an API key on the main port (MGMT_PORT is
+#      the unauthenticated option). The deployed container runs with its healthcheck disabled.
+#
+# Unlike the old two-step local build (mnemory:base + overlay), this is self-contained:
+# building it from any checkout of this branch reproduces the image without extra parent tags.
+
+FROM python:3.13-slim
+
+WORKDIR /app
+
+# Stage 1: dependencies only (cached layer). Constraints keep the resolve identical to the
+# runtime verified in production; see deploy/constraints.txt for the why.
+COPY deploy/constraints.txt /tmp/constraints.txt
+COPY pyproject.toml README.md ./
+COPY mnemory/__init__.py mnemory/__init__.py
+RUN pip install --no-cache-dir -c /tmp/constraints.txt ".[all]" \
+    && pip uninstall -y mnemory
+
+# Stage 2: full source, no dependency re-resolve.
+COPY mnemory/ mnemory/
+RUN pip install --no-cache-dir --no-deps . \
+    && pip check \
+    && python -c "import mcp, fastembed, qdrant_client, openai, fastapi, starlette, mnemory.server"
+
+# Pre-download the BM25 sparse embedding model so containers start without network dependency.
+RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='Qdrant/bm25')"
+
+ENV DATA_DIR=/data
+RUN mkdir -p /data
+
+EXPOSE 8050
+
+CMD ["mnemory"]

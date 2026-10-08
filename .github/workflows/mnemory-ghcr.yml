@@ -1,0 +1,127 @@
+name: Build and publish mnemory image
+
+on:
+  schedule:
+    - cron: "30 0 * * *" # daily 00:30 UTC: merges any new upstream release, finishes well before the 04:00 Europe/Amsterdam Watchtower poll
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream mnemory release tag to merge/build (blank selects newest)"
+        required: false
+        type: string
+        default: ""
+      rebuild:
+        description: "Rebuild even if this release tag is already published"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: mnemory-ghcr-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE: ghcr.io/magikfly/mnemory
+    steps:
+      - name: Check out the patched branch
+        uses: actions/checkout@v4
+        with:
+          ref: mn-deployed
+          fetch-depth: 0            # tags, so merge-base checks and checkout by tag work
+          persist-credentials: true # merge commits are pushed back to mn-deployed
+
+      - name: Merge newest upstream release into mn-deployed
+        id: upstream
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "mnemory-ci"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/fpytloun/mnemory.git
+          git fetch --quiet --tags upstream
+          releases() { grep -E '^v[0-9]+(\.[0-9]+)*$'; }
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            TARGET="$REQUESTED_TAG"
+          else
+            TARGET="$(git ls-remote --tags --refs upstream 'refs/tags/v*' \
+              | awk '{ sub("refs/tags/", "", $2); print $2 }' | releases | sort -V | tail -n 1)"
+          fi
+          [[ "$TARGET" =~ ^v[0-9]+([.][0-9]+)*([.-][0-9A-Za-z.-]+)?$ ]] \
+            || { echo "Invalid release tag: $TARGET" >&2; exit 1; }
+          echo "Newest upstream release: $TARGET"
+          if ! git merge-base --is-ancestor "refs/tags/$TARGET" HEAD; then
+            echo "Merging upstream $TARGET into the patched branch"
+            if ! git merge --no-edit "refs/tags/$TARGET"; then
+              git merge --abort 2>/dev/null || true
+              echo "::error title=Upstream merge conflict::upstream $TARGET conflicts with the local mnemory patches. Merge $TARGET into mn-deployed by hand (the patched files are listed in deploy/DEPLOYED.md), push, and rerun. The last good image stays deployed."
+              exit 1
+            fi
+            git push origin "HEAD:refs/heads/mn-deployed"
+          else
+            echo "$TARGET is already merged; nothing new from upstream"
+          fi
+          echo "version=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if this release is already published
+        id: published
+        env:
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+        shell: bash
+        run: |
+          if [[ "$FORCE_REBUILD" != "true" ]] && docker manifest inspect "$IMAGE:${{ steps.upstream.outputs.version }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$IMAGE:${{ steps.upstream.outputs.version }} already exists."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.published.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and publish GHCR tags
+        if: steps.published.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.image
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/magikfly/mnemory
+            org.opencontainers.image.version=${{ steps.upstream.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.upstream.outputs.version }}
+
+      - name: Report result
+        if: always()
+        env:
+          RESULT: ${{ steps.published.outputs.skip }}
+        run: |
+          if [[ "$RESULT" == "true" ]]; then
+            echo "Already published: $IMAGE:${{ steps.upstream.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ job.status }}" == "success" ]]; then
+            echo "Published $IMAGE:latest and $IMAGE:${{ steps.upstream.outputs.version }} (mn-deployed ${{ steps.upstream.outputs.sha }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "Upstream release merged: ${{ steps.upstream.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          fi

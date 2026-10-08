@@ -1,0 +1,12 @@
+# Runtime versions verified in production (netvault services.mnemory.runtime_deps, read from the
+# live container 2026-10-07). Upstream pyproject range-pins only and ships no lockfile, so a
+# fresh resolve would drift. Do not drop these without re-checking behaviour:
+# - qdrant-client 1.19.1 is the version whose LOCAL-mode thread race the _LockedLocalClient
+#   read-lock patch works around; a newer client may fix, keep, or move that race.
+# - mcp >=1.30 broke the login/API-key flow on this deployment; 1.29.0 is the verified pin.
+qdrant-client==1.19.1
+fastapi==0.141.1
+starlette==1.6.0
+mcp==1.29.0
+fastembed==0.8.0
+openai==3.16.2
