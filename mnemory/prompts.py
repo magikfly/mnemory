@@ -4210,27 +4210,18 @@ def build_fsck_duplicate_prompt(
         id_mapping[alias] = mid
         text = mem.get("memory", "")
         metadata = mem.get("metadata") or {}
-        tags = []
-        # Include scope (agent_id or "shared") so the LLM can see
-        # which visibility scope each memory belongs to.
-        agent_id = mem.get("agent_id")
-        tags.append(f"scope: {agent_id}" if agent_id else "scope: shared")
-        if metadata.get("memory_type"):
-            tags.append(f"type: {metadata['memory_type']}")
-        if metadata.get("categories"):
-            tags.append(f"categories: {', '.join(metadata['categories'])}")
-        if metadata.get("importance"):
-            tags.append(f"importance: {metadata['importance']}")
-        if metadata.get("pinned"):
-            tags.append("pinned")
-        if metadata.get("event_date"):
-            tags.append(f"event_date: {metadata['event_date']}")
-        if metadata.get("created_at_utc"):
-            tags.append(f"created: {metadata['created_at_utc'][:10]}")
-        if metadata.get("artifacts"):
-            tags.append("has_artifacts")
-        tag_str = f" [{' | '.join(tags)}]" if tags else ""
-        mem_lines.append(f"- id={alias}: {text}{tag_str}")
+        # Only `pinned` is shown, and only as a suffix on the alias. The full
+        # metadata block was removed on 2026-10-09: a 4B model copies whatever
+        # sits next to the text it is asked to rewrite, and 111 of the 113
+        # contaminated rows in the production store carried this exact
+        # "[scope: ... | type: ... | created: ...]" serialization inside the
+        # memory body. Pinned stays because it is the one attribute the dedup
+        # decision genuinely needs - a pinned row must not be merged away - and
+        # if echoed it is a word, not a forged provenance line. Do not
+        # reintroduce inline metadata here without also guarding the write path
+        # in fsck.py, which is where this text is persisted.
+        flag = " (pinned)" if metadata.get("pinned") else ""
+        mem_lines.append(f"- id={alias}{flag}: {text}")
     mem_text = "\n".join(mem_lines)
 
     user_content = (

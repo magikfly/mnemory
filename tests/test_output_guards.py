@@ -9,6 +9,7 @@ store; every negative case is real text that must survive untouched.
 """
 
 import os
+import pathlib
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -74,13 +75,79 @@ def test_role_mismatch():
         assert got == want, f"role_mismatch({text!r}, {role!r}) got {got!r} want {want!r}"
 
 
+def test_fsck_scope_flavour_is_stripped():
+    """The fsck dedup prompt emitted "[scope: ... | type: ... | created: ...]".
+
+    Regression guard: the original regex keyed on "type:" only, so this whole
+    flavour - 75 of 116 stored blocks on 2026-10-09 - passed straight through.
+    """
+    raw = ("User's deployed image contains 7 instances of a token "
+           "[scope: open-webui | type: episodic | categories: project:mnemory | "
+           "importance: high | event_date: 2026-10-07T22:00:00+00:00 | created: 2026-10-08]")
+    out = clean_memory_text(raw)
+    assert out is not None
+    assert "scope:" not in out and "created:" not in out and "importance:" not in out
+    assert out.startswith("User's deployed image contains 7 instances of a token")
+
+
+def test_alias_prefix_with_pinned_flag():
+    """build_fsck_duplicate_prompt now writes "- id=0 (pinned): text"; the alias
+    prefix guard has to accept the flag, or the new format becomes the echo."""
+    out = clean_memory_text(
+        "- id=0 (pinned): Assistant prefers pinned tests [scope: shared | type: fact]")
+    assert out == "Assistant prefers pinned tests", out
+
+
+def test_ordinary_brackets_survive():
+    for text in [
+        "User runs llama.cpp with [S1] as the source alias reference line",
+        "The 3rd array index [10] is out of range on the qdrant collection",
+        "Wiki style [[memory_item]] links should stay visible in the text body",
+        "The bracketed word [type] without a colon is ordinary prose here ok",
+    ]:
+        assert clean_memory_text(text) == text, text
+
+
+def test_fsck_prompt_emits_no_inline_metadata():
+    """The root-cause fix: metadata must not sit next to memory text in the prompt."""
+    from mnemory.prompts import build_fsck_duplicate_prompt
+    cluster = [
+        {"id": "a" * 36, "memory": "User prefers conventional commit messages for git.",
+         "agent_id": "open-webui",
+         "metadata": {"memory_type": "preference", "importance": "high", "pinned": True,
+                      "categories": ["git"], "created_at_utc": "2026-10-01T00:00:00+00:00",
+                      "event_date": "2026-10-01"}},
+        {"id": "b" * 36, "memory": "User prefers conventional commit messages for git.",
+         "agent_id": None, "metadata": {"memory_type": "preference"}},
+    ]
+    out = build_fsck_duplicate_prompt(cluster)
+    blob = str(out)
+    assert "[scope:" not in blob and " | created:" not in blob, "inline metadata block is back"
+    assert "(pinned)" in blob, "pinned flag should still reach the model"
+    assert "- id=0 (pinned): User prefers" in blob or "id=0 (pinned)" in blob
+
+
+def test_fsck_write_paths_are_guarded():
+    """fsck.py must import the guard and use it at both model-authored writes.
+
+    Checked at source level, not by import: this module is deliberately free of
+    third-party dependencies so it runs without qdrant_client installed.
+    """
+    src = (pathlib.Path(__file__).resolve().parents[1] / "mnemory" / "fsck.py").read_text()
+    assert "from mnemory.output_guards import clean_memory_text" in src
+    assert src.count("clean_memory_text(") >= 2, "a fsck write path lost its guard"
+
+
+
 if __name__ == "__main__":
-    failures = 0
-    for fn in (test_clean_memory_text, test_role_mismatch):
+    import sys as _sys, inspect as _inspect, traceback as _tb
+    names = sorted(k for k, v in globals().items()
+                   if k.startswith("test_") and _inspect.isfunction(v))
+    fails = 0
+    for n in names:
         try:
-            fn()
-            print(f"PASS {fn.__name__}")
-        except AssertionError as exc:
-            failures += 1
-            print(f"FAIL {fn.__name__}: {exc}")
-    raise SystemExit(1 if failures else 0)
+            globals()[n](); print("PASS", n)
+        except Exception:
+            fails += 1; print("FAIL", n); _tb.print_exc()
+    print("\n%d tests, %d failures" % (len(names), fails))
+    _sys.exit(1 if fails else 0)

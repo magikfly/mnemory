@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any
 
 from qdrant_client.models import PointStruct
 
+from mnemory.output_guards import clean_memory_text
+
 from mnemory.categories import (
     PREDEFINED_CATEGORIES,
     sanitize_categories,
@@ -3218,6 +3220,15 @@ class FsckService:
                     kwargs.update(meta)
                     if action.new_content is None:
                         kwargs.pop("content")
+                    else:
+                        # action.new_content is model output. This path had no
+                        # content guard, so prompt formatting written by the
+                        # dedup model was persisted verbatim; clean it, and keep
+                        # the original only if the guard finds nothing usable
+                        # (never fail an fsck action over formatting).
+                        cleaned = clean_memory_text(action.new_content)
+                        if cleaned:
+                            kwargs["content"] = cleaned
                     start_action(index)
                     mutation = self._memory_service.update_memory(
                         action.memory_id, **kwargs
@@ -3410,7 +3421,10 @@ class FsckService:
 
                     start_action(index)
                     self._memory_service.add_memory(
-                        content=action.new_content,
+                        # Same guard as the update path above: fsck-authored
+                        # text is model output, not trusted content.
+                        content=clean_memory_text(action.new_content)
+                        or action.new_content,
                         user_id=user_id,
                         owner_id=source_owner_id,
                         agent_id=source_agent_id or meta.get("agent_id"),

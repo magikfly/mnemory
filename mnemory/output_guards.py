@@ -34,14 +34,25 @@ _LIST_MARKER_RE = re.compile(r"^\s*(?:[-*\u2022]\s+)+")
 
 # The consolidation prompt numbers its sources S0..Sn and its fsck/dedup prompts
 # number memories id=0, id=1. Neither belongs in user-facing memory text.
-_ALIAS_PREFIX_RE = re.compile(r"^\s*(?:\(\s*)?id\s*=\s*\d+\s*(?:\))?\s*[:\-\u2013]\s*")
+# The optional " (pinned)" group matches the flag build_fsck_duplicate_prompt has
+# emitted since 2026-10-09; without it, "- id=0 (pinned): " survives into stored
+# text and the guard that exists to catch prompt echoes would miss this one.
+_ALIAS_PREFIX_RE = re.compile(
+    r"^\s*(?:\(\s*)?id\s*=\s*\d+\s*(?:\))?\s*(?:\(\s*pinned\s*\))?\s*[:\-\u2013]\s*",
+    re.IGNORECASE,
+)
 # Punctuation is required: without it, real text such as "S3 lifecycle rules
 # were configured" would be mistaken for a source alias and have its subject cut.
 _SOURCE_PREFIX_RE = re.compile(r"^\s*(?:\(\s*)?\[?\s*S\d{1,3}\s*\)?\s*\]?\s*[:\-]\s+")
 
-# A metadata tag block: "[type: fact | categories: ... | importance: high]".
-# Keyed on "type:" so ordinary brackets (e.g. "[S1]") are left alone.
-_METADATA_BLOCK_RE = re.compile(r"\[\s*type\s*:[^\]]{0,300}?\]", re.IGNORECASE)
+# A metadata tag block. Two flavours reproduced in the production store:
+#   "[type: fact | categories: ... | importance: high]"      consolidation
+#   "[scope: open-webui | type: ... | created: 2026-10-08]"  fsck dedup
+# Measured 2026-10-09 over 116 stored blocks: 75 open with "scope:", 41 with
+# "type:". Keying on "type" alone - the original form of this regex - missed
+# 65% of them, including the whole fsck flavour. Both keys are specific enough
+# that ordinary brackets ("[S1]", "[10]", "[[nested]]") are still left alone.
+_METADATA_BLOCK_RE = re.compile(r"\[\s*(?:scope|type)\s*:[^\]]{0,400}?\]", re.IGNORECASE)
 
 # mnemory's boundary tags (U+27E8 / U+27E9) used by wrap_with_boundary(). The
 # whole tag goes, not just the brackets: a test showed stripping only the
