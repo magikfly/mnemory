@@ -256,6 +256,62 @@ except Exception:
     traceback.print_exc()
     FAILURES.append("_issues_from_parsed salvaged envelope raised")
 
+# ---------------------------------------------------------------- output guards
+section("consolidation output guards")
+try:
+    from mnemory.output_guards import clean_memory_text, role_mismatch
+
+    check(
+        "id= alias prefix stripped",
+        clean_memory_text(
+            "- id=0: Assistant recommended explicitly disabling the healthcheck for mnemory"
+        ),
+        "Assistant recommended explicitly disabling the healthcheck for mnemory",
+    )
+    check(
+        "metadata block stripped, sentence preserved",
+        clean_memory_text(
+            "- [type: fact | categories: technical, project:mnemory | importance: high"
+            " | role: assistant] Assistant decided to enable automatic merge for PRs"
+        ),
+        "Assistant decided to enable automatic merge for PRs",
+    )
+    check(
+        "boundary tags removed with their names",
+        clean_memory_text(
+            "\u27e8memory_item\u27e9User prefers conventional commit messages"
+            "\u27e8/memory_item\u27e9"
+        ),
+        "User prefers conventional commit messages",
+    )
+    check("schema scaffolding dropped entirely", clean_memory_text("store_artifact: false"), None)
+    # Negative cases: real prose that must survive untouched.
+    for keep in (
+        "Assistant noted that --n-gpu-layers keeps weights resident in VRAM",
+        "S3 lifecycle rules were configured for the backup bucket",
+        "Assistant set the port to 8050 [mnemory] in the compose file",
+        "The array [10] indexes the tenth element",
+    ):
+        check(f"untouched: {keep[:30]}...", clean_memory_text(keep), keep)
+    check(
+        "cross-role: user subject in assistant pass",
+        role_mismatch("User decided to enable reasoning in the agent", "assistant"),
+        "assistant_pass_user_subject",
+    )
+    check(
+        "cross-role: assistant's own subject kept",
+        role_mismatch("Assistant implemented the guard in consolidation", "assistant"),
+        None,
+    )
+    check(
+        "cross-role: assistant subject in user pass reported, not dropped",
+        role_mismatch("Assistant recommended Redis for the session store", "user"),
+        "user_pass_assistant_subject",
+    )
+except Exception:
+    traceback.print_exc()
+    FAILURES.append("output guards raised")
+
 # ---------------------------------------------------------------- summary
 print("\n================ SUMMARY ================")
 if FAILURES:

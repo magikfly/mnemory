@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from mnemory.categories import sanitize_categories
+from mnemory.output_guards import clean_memory_text, role_mismatch
 from mnemory.revisions import (
     RevisionConflictError,
     RevisionService,
@@ -1071,6 +1072,54 @@ class ConsolidationService:
                         batch_idx + 1,
                     )
                     continue
+                # Content guards run before dedup, so a fact whose text was only
+                # prompt scaffolding cannot occupy a dedup slot, and the surviving
+                # text is what gets compared. Grammar enforcement is already on;
+                # these catch what a valid string field still allows through.
+                raw_text = f.get("text", "")
+                cleaned = clean_memory_text(raw_text)
+                if cleaned is None:
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: "
+                        "output text held only formatting artifacts: %.80r",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                        raw_text,
+                    )
+                    continue
+                if cleaned != raw_text.strip():
+                    logger.info(
+                        "Consolidation session %s [%s] batch %d: stripped prompt "
+                        "artifacts from output text (%d -> %d chars)",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                        len(raw_text),
+                        len(cleaned),
+                    )
+                    f["text"] = cleaned
+                mismatch = role_mismatch(f.get("text", ""), role)
+                if mismatch == "assistant_pass_user_subject":
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: dropped "
+                        "user-subject fact from the assistant pass: %.80s",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                        f.get("text", ""),
+                    )
+                    continue
+                if mismatch:
+                    logger.info(
+                        "Consolidation session %s [%s] batch %d: cross-role "
+                        "subject in the %s pass (kept): %.80s",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                        role,
+                        f.get("text", ""),
+                    )
                 norm = _norm(f.get("text", ""))
                 if norm in seen_norms:
                     logger.info(
