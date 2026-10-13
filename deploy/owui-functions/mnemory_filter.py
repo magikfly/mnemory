@@ -5,7 +5,7 @@ description: Automatic memory recall and storage for conversations
 # Patched locally (atlas.1): injector fix, tag-aware + capped sanitizer,
 # example-leak and speech-act hygiene, placeholder regex de-anchored.
 # Upstream baseline was version: 0.4.2
-version: 0.4.3-atlas.2
+version: 0.4.4-atlas.1
 """
 
 import asyncio
@@ -18,6 +18,11 @@ import aiohttp
 from pydantic import BaseModel, Field
 
 _log = logging.getLogger(__name__)
+# Bump on every deploy: this line is the proof in `docker logs OpenWebUI` that the
+# running filter pipeline recompiled the stored content rather than serving a cache.
+_NUM_RE_FINDALL = re.compile(r"\d[\d.,:/-]*").findall
+_FILTER_BUILD = "0.4.4-atlas.1"
+_log.info("mnemory filter build %s loaded", _FILTER_BUILD)
 
 
 class Filter:
@@ -121,6 +126,28 @@ class Filter:
             description=(
                 "Minimum seconds between Laya semantic refine passes per "
                 "session (background, never blocks a turn)."
+            ),
+        )
+        laya_systemone_url: str = Field(
+            default="http://192.168.2.1:8012",
+            description=(
+                "laya-serve System One endpoint (POST /v1/systemone) used as the "
+                "typed-decision judge for near-duplicate recall memories. Preferred "
+                "over the legacy /memcheck bridge: on 10 adversarial pairs measured "
+                "2026-10-13 it separated same-fact from distinct-fact with no overlap "
+                "(distinct <=0.31, same >=0.55) where /memcheck scored two UNRELATED "
+                "statements same=0.948. Set empty to fall back to laya_url /memcheck. "
+                "Direct URL on purpose: llama-swap does not route /v1/systemone/batch "
+                "and pins the checkpoint, defeating per-request language routing."
+            ),
+        )
+        laya_merge_guard: bool = Field(
+            default=True,
+            description=(
+                "Model-free guard that stops the char-ngram dedup from collapsing two "
+                "memories that disagree on a number or a polarity word (Oct 16 vs "
+                "Oct 12, 16h vs 32-40h, FTHR 175 vs 165, is vs is not). Catches those "
+                "at zero cost and zero network; the typed pass decides the rest."
             ),
         )
         near_dup_jaccard: float = Field(
@@ -248,6 +275,17 @@ class Filter:
     _GRAM_LOW = 0.30        # below this: definitely distinct (no Laya call)
     _LAYA_SAME = 0.90       # 'same' probability that triggers a merge
     _LAYA_PAIR_CAP = 20     # max ambiguous pairs per refine pass
+    # 0.30 was the review band floor; cross-lingual and light-paraphrase pairs sat
+    # below it and were never reviewed by anything (dutch 0.303, role 0.521).
+    _GRAM_REVIEW_LOW = 0.20
+    _GRAM_LOW = 0.30        # kept for reference; superseded by _GRAM_REVIEW_LOW
+    _S1_SAME = 0.45         # typed-noul P(same fact) needed to authorise a merge
+    _S1_MODEL = "typed-decisions"
+    _S1_PROMPT = "Do these two statements describe the same fact about the same thing?"
+    _S1_CRITERIA = {
+        "true": "Interchangeable: same entities, values, dates and polarity",
+        "false": "Any entity, value, date or polarity differs",
+    }
     _last_laya: dict = {}   # session_id -> last refine-pass timestamp
 
     # NOTE: continuation lines start at column 0 on purpose.  Indenting
@@ -574,6 +612,33 @@ prompt for them."""
             return 0.0
         return len(ga & gb) / len(ga | gb)
 
+    _NUM_RE = _NUM_RE_FINDALL  # class alias; the module-level name is the real one
+    _POLARITY = frozenset({
+        "no", "not", "never", "none", "without", "off", "false", "disable", "disabled",
+        "disables", "dropped", "skip", "skipped", "yes", "always", "with", "on", "true",
+        "enable", "enabled", "uses", "using",
+    })
+
+    @classmethod
+    def _facts_diverge(cls, a: str, b: str) -> bool:
+        """True when two look-alike memories carry different facts.
+
+        The n-gram rule cannot see past shared words, so "TSB by October 16" and
+        "TSB by October 12" score 0.857 and used to merge with the longer string
+        winning. Digit runs and polarity words are the two signals that are cheap,
+        deterministic and exactly the axis facts change on. Deliberately biased to
+        answer True: keeping one redundant memory in context costs a few tokens,
+        deleting the wrong fact is silent and permanent.
+        """
+        na, nb = cls._norm_text(a), cls._norm_text(b)
+        if na == nb:
+            return False
+        if sorted(_NUM_RE_FINDALL(na)) != sorted(_NUM_RE_FINDALL(nb)):
+            return True
+        wa = set(re.findall(r"[a-z0-9]+", na))
+        wb = set(re.findall(r"[a-z0-9]+", nb))
+        return bool((wa ^ wb) & cls._POLARITY)
+
     def _near_dedup(self, items: list[str]) -> list[str]:
         """Collapse near-duplicates, keeping the more complete (longer)
         text of each cluster. Hygiene-violating entries are dropped.
@@ -584,7 +649,16 @@ prompt for them."""
                 continue
             dup_idx = None
             for i, kept in enumerate(clean):
-                if kept == text or self._jaccard(text, kept) >= self.valves.near_dup_jaccard:
+                g = self._jaccard(text, kept)
+                guarded = (kept != text and g >= self.valves.near_dup_jaccard
+                           and self.valves.laya_merge_guard
+                           and self._facts_diverge(text, kept))
+                if kept == text or (g >= self.valves.near_dup_jaccard and not guarded):
+                    if guarded:
+                        _log.debug(
+                            "mnemory: merge guard kept divergent pair (jaccard %.3f): %.60s",
+                            g, text)
+
                     dup_idx = i
                     break
             if dup_idx is None:
@@ -594,13 +668,14 @@ prompt for them."""
         return clean
 
     def _maybe_laya_refine(self, session_id: str, bucket: list[str]) -> None:
-        """Schedule an async Laya semantic pass over Jaccard-ambiguous
-        pairs (_GRAM_LOW <= j < threshold). Throttled per session,
-        fail-open, never blocks the turn. Merge only when Laya reports
-        'same' >= _LAYA_SAME; on any error the pass is skipped and the
-        next throttle window retries."""
+        """Schedule an async typed-decision pass over every pair at or
+        above _GRAM_REVIEW_LOW. Throttled per session, fail-open, never
+        blocks the turn. The band used to stop at near_dup_jaccard, which
+        put it entirely below the local merge threshold - the pairs being
+        destroyed by that merge were structurally invisible to it. Merge on
+        typed-noul P(same) >= _S1_SAME; on any error the pass is skipped."""
         base = (self.valves.laya_url or "").rstrip("/")
-        if not base or len(bucket) < 2:
+        if not (base or (self.valves.laya_systemone_url or "")) or len(bucket) < 2:
             return
         now = time.time()
         if now - self._last_laya.get(session_id, 0.0) < self.valves.laya_refine_interval:
@@ -613,7 +688,7 @@ prompt for them."""
                 if a == b:
                     continue
                 g = self._jaccard(a, b)
-                if self._GRAM_LOW <= g < self.valves.near_dup_jaccard:
+                if g >= self._GRAM_REVIEW_LOW:
                     pairs.append((i, j, a, b))
                 if len(pairs) >= self._LAYA_PAIR_CAP:
                     break
@@ -629,42 +704,59 @@ prompt for them."""
     async def _laya_refine_pass(
         self, base: str, session_id: str, pairs: list, snapshot: list[str]
     ) -> None:
-        """Background Laya pass: merge pairs Laya judges near-identical.
-        Applied only if the bucket prefix still matches the snapshot
-        (no concurrent growth); otherwise the pass is discarded."""
+        """Background pass: merge pairs the decision model calls one fact.
+
+        Two changes from the original. It asks a typed noul over /v1/systemone
+        instead of the bridge's /memcheck, because /memcheck measured same=0.948
+        on two unrelated statements. And it applies drops BY VALUE: the old code
+        required the bucket prefix to still equal the snapshot it was scheduled
+        with, so any concurrent growth threw the finished work away. Values are
+        unique in the bucket (dedup guarantees it), so index bookkeeping is
+        unnecessary. `snapshot` is no longer used for the apply decision.
+        """
+        s1 = (self.valves.laya_systemone_url or "").rstrip("/")
         try:
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as http:
-                drops: set = set()
+                drop: set = set()
                 for i, j, a, b in pairs:
-                    if i in drops or j in drops:
+                    if a in drop or b in drop:
                         continue
-                    async with http.post(
-                        f"{base}/memcheck", json={"a": a, "b": b}
-                    ) as resp:
+                    if s1:
+                        url = f"{s1}/v1/systemone"
+                        body = {
+                            "state": a + "\n---\n" + b,
+                            "model": self._S1_MODEL,
+                            "questions": {"same": {"type": "noul",
+                                                   "instructions": self._S1_PROMPT,
+                                                   "criteria": self._S1_CRITERIA}},
+                        }
+                        threshold = self._S1_SAME
+                    else:
+                        url, body, threshold = f"{base}/memcheck", {"a": a, "b": b}, self._LAYA_SAME
+                    async with http.post(url, json=body) as resp:
                         if resp.status != 200:
                             _log.debug(
-                                "mnemory: laya /memcheck HTTP %d — pass aborted (fail-open)",
-                                resp.status,
-                            )
+                                "mnemory: laya refine HTTP %d — pass aborted (fail-open)",
+                                resp.status)
                             return
                         data = await resp.json()
-                    same = data.get("same")
-                    if isinstance(same, (int, float)) and same >= self._LAYA_SAME:
-                        # keep the longer (more complete) of the pair
-                        drops.add(j if len(b) >= len(a) else i)
-                if drops:
-                    cur = self._recalled.get(session_id)
-                    if cur and len(cur) >= len(snapshot) and cur[:len(snapshot)] == snapshot:
-                        self._recalled[session_id] = [
-                            t for k, t in enumerate(cur) if k not in drops
-                        ]
+                    if s1:
+                        same = ((data.get("answers") or {}).get("same") or {}).get("noul")
+                    else:
+                        same = data.get("same")
+                    if isinstance(same, (int, float)) and same >= threshold:
+                        drop.add(b if len(b) <= len(a) else a)   # keep the longer
+                if drop:
+                    cur = self._recalled.get(session_id) or []
+                    kept = [t for t in cur if t not in drop]
+                    if len(kept) != len(cur):
+                        self._recalled[session_id] = kept
                         _log.info(
                             "mnemory: laya refine merged %d near-dup memor%s (session %s)",
-                            len(drops),
-                            "y" if len(drops) == 1 else "ies",
-                            session_id,
-                        )
+                            len(cur) - len(kept),
+                            "y" if len(cur) - len(kept) == 1 else "ies",
+                            session_id)
         except Exception as exc:
             _log.debug("mnemory: laya refine pass skipped (fail-open): %s", exc)
 
