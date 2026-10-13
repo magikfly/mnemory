@@ -5,7 +5,7 @@ description: Automatic memory recall and storage for conversations
 # Patched locally (atlas.1): injector fix, tag-aware + capped sanitizer,
 # example-leak and speech-act hygiene, placeholder regex de-anchored.
 # Upstream baseline was version: 0.4.2
-version: 0.4.4-atlas.1
+version: 0.4.4-atlas.2
 """
 
 import asyncio
@@ -21,7 +21,7 @@ _log = logging.getLogger(__name__)
 # Bump on every deploy: this line is the proof in `docker logs OpenWebUI` that the
 # running filter pipeline recompiled the stored content rather than serving a cache.
 _NUM_RE_FINDALL = re.compile(r"\d[\d.,:/-]*").findall
-_FILTER_BUILD = "0.4.4-atlas.1"
+_FILTER_BUILD = "0.4.4-atlas.2"
 _log.info("mnemory filter build %s loaded", _FILTER_BUILD)
 
 
@@ -279,7 +279,12 @@ class Filter:
     # below it and were never reviewed by anything (dutch 0.303, role 0.521).
     _GRAM_REVIEW_LOW = 0.20
     _GRAM_LOW = 0.30        # kept for reference; superseded by _GRAM_REVIEW_LOW
-    _S1_SAME = 0.45         # typed-noul P(same fact) needed to authorise a merge
+    # 0.45 came from a 10-pair set of short sentences. On real memories (165-780 chars)
+    # two related-but-distinct config notes scored same=0.555 and would have merged,
+    # deleting the shorter one. Observed spread: true-same 0.626-0.854, false-same
+    # 0.555, true-distinct 0.095-0.368. 0.60 sits in the gap and errs to the cheap
+    # side: a missed merge leaves a duplicate in context, a false merge deletes a fact.
+    _S1_SAME = 0.60
     _S1_MODEL = "typed-decisions"
     _S1_PROMPT = "Do these two statements describe the same fact about the same thing?"
     _S1_CRITERIA = {
@@ -746,6 +751,14 @@ prompt for them."""
                     else:
                         same = data.get("same")
                     if isinstance(same, (int, float)) and same >= threshold:
+                        # Het model mag niet samenvoegen wat de gratis feitencontrole
+                        # een verschillend getal of tegengestelde polarity ziet: die
+                        # twee lange configuratie-herinneringen kregen same=0.555.
+                        if self.valves.laya_merge_guard and self._facts_diverge(a, b):
+                            _log.debug(
+                                "mnemory: refine vetoed by fact guard (same %.3f): %.60s",
+                                same, a)
+                            continue
                         drop.add(b if len(b) <= len(a) else a)   # keep the longer
                 if drop:
                     cur = self._recalled.get(session_id) or []
