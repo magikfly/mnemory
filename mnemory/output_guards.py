@@ -196,6 +196,33 @@ _META_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Narration verb followed by an object from the memory subsystem. The guard
+#: deliberately excludes "identified" from _ASSISTANT_ACT_RE, because "Assistant
+#: identified the root cause and patched the migration path" is a real outcome.
+#: But the writer keeps producing "Assistant identified four retrieval misses"
+#: and "Assistant identified that 3 remaining misses are not ranking problems",
+#: both transcribed from a single assistant turn seconds after they were said.
+#: Requiring a memory-subsystem object narrows the rule without re-widening the
+#: verb list, so the engineering-record phrasing survives.
+_ASSISTANT_META_OBJECT_RE = re.compile(
+    r"^\s*assistant\s+(?:is\s+|was\s+|has\s+)?(?:identif(?:y|ies|ied)|"
+    r"not(?:e|es|ed)|explain(?:s|ed)?|report(?:s|ed)?|observ(?:e|es|ed)|"
+    r"confirm(?:s|ed)?|note(?:s|d)?|note?d?)\b[^.]{0,60}\b"
+    r"(?:memor(?:y|ies)|retrieval|recall|miss(?:es)?|rows?|store|noise|filter|"
+    r"retract|pinned|dedup|fsck|pointer|bucket|entry|carried)\b",
+    re.IGNORECASE,
+)
+
+#: "User initiated a greeting with 'hey there'" / "User greeted the assistant".
+#: A greeting is not a fact about anyone, and the recall-side trivia filter
+#: already refuses these once stored; refusing them at the writer is cheaper.
+_GREETING_ACT_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:user|assistant)\s+(?:greet(?:ed|s)|initiated\s+a\s+"
+    r"greeting|opened\s+with\s+(?:a\s+)?(?:greeting|hi|hello|hey)|"
+    r"said\s+(?:hi|hello|hey)|exchanged\s+greetings)\b",
+    re.IGNORECASE,
+)
+
 #: log = report only (default), drop = actually refuse the row. There is no
 #: un-retract endpoint, so refusing to write must be a conscious opt-in.
 _NOISE_MODE_ENV = "MEMORY_NOISE_GUARD"
@@ -218,6 +245,8 @@ def noise_memory(text: str | None) -> str | None:
     if not probe:
         return "empty_after_strip"
     for regex, reason in (
+        (_GREETING_ACT_RE, "greeting_narration"),
+        (_ASSISTANT_META_OBJECT_RE, "assistant_meta_observation"),
         (_QUESTION_PROGRESS_RE, "question_in_progress"),
         (_QUESTION_PAST_RE, "question_recorded_as_fact"),
         (_ASSISTANT_ACT_RE, "assistant_speech_act"),

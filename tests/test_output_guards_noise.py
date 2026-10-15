@@ -30,6 +30,11 @@ SHOULD_DROP = [
     "Dashboard cleaned up diagnostic points to reduce bucket noise",
     "Memory store housekeeping left no findings open",
     "- Assistant explained that the flag defaults to off",
+    "Assistant identified four retrieval misses where queries did not contain",
+    "Assistant identified that 3 remaining misses are not ranking problems",
+    "Assistant noted the pinned row still claims the old filter version",
+    "User initiated a greeting with 'hey there'",
+    "User greeted the assistant in Dutch",
 ]
 
 MUST_KEEP = [
@@ -47,6 +52,10 @@ MUST_KEEP = [
     "User decided to keep the old config file for rollback readability.",
     "User lives in a suburb of a large city in the Netherlands",
     "User merged the upstream release tag without conflicts",
+    "Assistant identified the root cause and patched the migration path",
+    "Assistant identified cross-role leak bug where claims were laundered",
+    "User's memory of the run includes pace and heart rate per kilometre",
+    "User stores the vault file at mode 0600 with git history",
 ]
 
 
