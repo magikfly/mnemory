@@ -1,3 +1,41 @@
+"""Open WebUI mnemory_filter pipe — ARCHIVED COPY, NOT THE DEPLOYMENT.
+
+The live filter is the ``function`` table row with id ``mnemory_filter`` in the
+Open WebUI sqlite database; that row is what actually executes. This file is the
+git-tracked archive of each shipped version, per the owner's decision on
+2026-10-15 that the filter is always git-tracked.
+
+  version        0.4.7-atlas.1
+  live row sha256 b403d7cf9f156ebaa26633526383feacd0d29f26267bf8569a342b3da14cbb4c
+  this file sha256  (differs by design, see below)
+
+SANITIZED: the three valve defaults that name LAN endpoints carry the literal
+placeholder ``<LAN_HOST>`` instead of the private address. Earlier archives were
+byte-identical to the deployed row and were verified by sha equality; that habit
+has to change, so verify provenance against the live row sha recorded above (and
+in vault key services.mnemory.owui_function), never against this file's sha.
+
+Consequence when restoring from this archive: set the ``mnemory_url``,
+``embedding_api_base`` and ``rerank_url`` valve defaults, or their saved values,
+back to the real host before saving the function, or recall, embeddings and
+rerank all fail open into silence rather than loudly.
+
+Changes shipped in this version, on top of 0.4.6-atlas.1 (cross-encoder rerank):
+  * ``rerank_keep_top`` valve: keep the top K rows by RERANKED ORDER, a rank
+    cutoff rather than a score floor. Measured on 12 real queries, full coverage
+    was already reached at K=2 and K=3 leaves slack, cutting injected rows from
+    ~8.9 to 3.0 with no coverage loss. A score floor cannot be used here: the
+    reranker assigned its lowest confidence to the correct answer for a direct
+    lookup and its highest to a same-subject decoy.
+  * ``rerank_min_score`` stays at 0.0 and rows it does drop are dropped outright,
+    never resurrected by the unscored fallback.
+
+Carried from 0.4.6: cross-encoder rerank of recall candidates with fail-open on
+any error, timeout, non-200 or missing index. Carried from 0.4.5: the per-turn
+carry bucket stores dicts with the memory id and a timestamp, so an updated or
+retracted memory is replaced in place instead of being injected forever, and
+``recall_entry_ttl`` expires entries on the early-exit paths too.
+"""
 """
 title: Mnemory - Persistent Memory
 author: mnemory
@@ -5,7 +43,7 @@ description: Automatic memory recall and storage for conversations
 # Patched locally (atlas.1): injector fix, tag-aware + capped sanitizer,
 # example-leak and speech-act hygiene, placeholder regex de-anchored.
 # Upstream baseline was version: 0.4.2
-version: 0.4.4-atlas.2
+version: 0.4.7-atlas.1
 """
 
 import asyncio
@@ -21,7 +59,7 @@ _log = logging.getLogger(__name__)
 # Bump on every deploy: this line is the proof in `docker logs OpenWebUI` that the
 # running filter pipeline recompiled the stored content rather than serving a cache.
 _NUM_RE_FINDALL = re.compile(r"\d[\d.,:/-]*").findall
-_FILTER_BUILD = "0.4.4-atlas.2"
+_FILTER_BUILD = "0.4.7-atlas.1"
 _log.info("mnemory filter build %s loaded", _FILTER_BUILD)
 
 
@@ -94,6 +132,54 @@ class Filter:
                 "Set 0 for upstream behaviour (this turn's results only)."
             ),
         )
+        rerank_enabled: bool = Field(
+            default=False,
+            description=(
+                "Re-score each turn's recall results with a cross-encoder before "
+                "injecting them. Dense similarity separates a correct memory from "
+                "junk by ~0.04 on this store; qwen3-reranker-0.6b separated them by "
+                "17x in testing, so this is the lever that actually fixes recall "
+                "precision. Costs ~0.3s per turn. Fail-open: any error leaves the "
+                "ordering exactly as mnemory returned it."
+            ),
+        )
+        rerank_url: str = Field(
+            default="http://<LAN_HOST>:11434/v1/rerank",
+            description="llama-swap rerank endpoint (llama-server --rerank).",
+        )
+        rerank_model: str = Field(default="reranker", description="Reranker model id")
+        rerank_timeout: int = Field(default=5, description="Rerank HTTP timeout (s)")
+        rerank_min_score: float = Field(
+            default=0.0,
+            description=(
+                "Drop recalled memories whose rerank score is below this (0 = never "
+                "drop, reorder only). Unlike recall_score_threshold this sits on a "
+                "calibrated 0..1 relevance scale."
+            ),
+        )
+        rerank_keep_top: int = Field(
+            default=0,
+            description=(
+                "Keep only the top N reranked memories and drop the rest (0 = keep "
+                "all). A rank cutoff, not a score floor: rerank scores on this store "
+                "overlap between correct rows and junk, so thresholding on the score "
+                "deletes facts, while rank needs no calibration. Only applies when "
+                "rerank_enabled is true - with rerank off there is no trustworthy "
+                "ordering to truncate, so nothing is dropped."
+            ),
+        )
+        recall_entry_ttl: int = Field(
+            default=900,
+            description=(
+                "Seconds a carried memory stays eligible for re-injection "
+                "without being re-recalled. The carry bucket stores TEXT, so "
+                "without an expiry a memory that was updated or retracted in "
+                "the store keeps replaying its old wording into the chat for "
+                "the rest of the session. 0 disables expiry (pre-0.4.5 "
+                "behaviour); id reconciliation still repairs updated text on "
+                "the next recall."
+            ),
+        )
         show_status: bool = Field(
             default=True,
             description="Show memory status messages in chat (can be overridden per-user)",
@@ -111,7 +197,7 @@ class Filter:
             description="HTTP request timeout in seconds for mnemory API calls",
         )
         laya_url: str = Field(
-            default="http://192.168.2.1:8013",
+            default="http://<LAN_HOST>:8013",
             description=(
                 "Laya /memcheck endpoint used as a semantic tie-breaker for "
                 "near-duplicate recall memories. Fail-open: if unreachable "
@@ -129,7 +215,7 @@ class Filter:
             ),
         )
         laya_systemone_url: str = Field(
-            default="http://192.168.2.1:8012",
+            default="http://<LAN_HOST>:8012",
             description=(
                 "laya-serve System One endpoint (POST /v1/systemone) used as the "
                 "typed-decision judge for near-duplicate recall memories. Preferred "
@@ -337,7 +423,7 @@ prompt for them."""
         # one turn.  Keyed by session_id rather than stored on the
         # session dict because _save_session rebuilds that dict and
         # would drop extra keys.
-        self._recalled: dict[str, list[str]] = {}
+        self._recalled: dict[str, list[dict]] = {}
         # user_id -> static context text.  Fallback for when the
         # per-chat session is missing (no chat_id in the inlet, evicted
         # session, filter reload) so the static block never vanishes
@@ -393,6 +479,71 @@ prompt for them."""
         except Exception as exc:
             await self._debug(emitter, f"API {path} error: {exc}")
             return None  # Graceful degradation
+
+    async def _rerank(self, query: str, results: list | None,
+                     emitter=None) -> list | None:
+        """Re-order this turn's recall results with a cross-encoder.
+
+        Dense similarity on this store leaves ~0.04 between the right memory and
+        noise, which is why no score_threshold value helped. A cross-encoder
+        scores query/document pairs jointly and separates them by an order of
+        magnitude. Fail-open by design: the reranker is a CPU sidecar, and a
+        cold or dead model must never cost the user their memories.
+        """
+        if not self.valves.rerank_enabled or not results or not (query or "").strip():
+            return results
+        docs = [(m.get("memory") or "") for m in results]
+        keep = [(i, d) for i, d in enumerate(docs) if d.strip()]
+        if not keep:
+            return results
+        payload = {"model": self.valves.rerank_model, "query": query,
+                   "documents": [d for _, d in keep], "top_n": len(keep)}
+        headers = {"Content-Type": "application/json"}
+        if self.valves.api_key and self.valves.rerank_url.startswith(
+                self.valves.mnemory_url):
+            headers["Authorization"] = "Bearer " + self.valves.api_key
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.valves.rerank_url, headers=headers, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=self.valves.rerank_timeout),
+                ) as resp:
+                    if resp.status != 200:
+                        _log.warning("mnemory: rerank HTTP %d (fail-open)", resp.status)
+                        return results
+                    data = await resp.json()
+            order = sorted(data.get("results") or [],
+                           key=lambda r: r.get("relevance_score", 0.0), reverse=True)
+            return self._apply_rerank_order(results, keep, order)
+        except Exception as exc:
+            _log.warning("mnemory: rerank skipped (fail-open): %s", exc)
+            return results
+
+    def _apply_rerank_order(self, results, keep, order):
+        """Map rerank (index, score) back onto the original result dicts."""
+        floor = getattr(self.valves, "rerank_min_score", 0.0) or 0.0
+        out, used, dropped = [], set(), set()
+        for r in order:
+            i, score = r.get("index"), r.get("relevance_score")
+            if not isinstance(i, int) or not (0 <= i < len(keep)):
+                continue
+            src = results[keep[i][0]]
+            if floor and isinstance(score, (int, float)) and score < floor:
+                dropped.add(keep[i][0])
+                continue
+            item = dict(src)
+            item["rerank_score"] = score
+            out.append(item)
+            used.add(keep[i][0])
+        for i, src in enumerate(results):
+            if i not in used and i not in dropped:
+                out.append(src)
+        # Rank cutoff. Unscored leftovers sit at the tail, so truncation removes
+        # them before it removes anything the reranker actually placed.
+        keep_top = getattr(self.valves, "rerank_keep_top", 0) or 0
+        if keep_top > 0:
+            out = out[:keep_top]
+        return out
 
     def _strip_managed_tools(
         self, body: dict, emitter: Callable | None = None
@@ -679,6 +830,7 @@ prompt for them."""
         put it entirely below the local merge threshold - the pairs being
         destroyed by that merge were structurally invisible to it. Merge on
         typed-noul P(same) >= _S1_SAME; on any error the pass is skipped."""
+        bucket = [e["t"] if isinstance(e, dict) else e for e in bucket]
         base = (self.valves.laya_url or "").rstrip("/")
         if not (base or (self.valves.laya_systemone_url or "")) or len(bucket) < 2:
             return
@@ -762,7 +914,8 @@ prompt for them."""
                         drop.add(b if len(b) <= len(a) else a)   # keep the longer
                 if drop:
                     cur = self._recalled.get(session_id) or []
-                    kept = [t for t in cur if t not in drop]
+                    kept = [e for e in cur
+                            if (e["t"] if isinstance(e, dict) else e) not in drop]
                     if len(kept) != len(cur):
                         self._recalled[session_id] = kept
                         _log.info(
@@ -772,6 +925,43 @@ prompt for them."""
                             session_id)
         except Exception as exc:
             _log.debug("mnemory: laya refine pass skipped (fail-open): %s", exc)
+
+    def _upgrade_bucket(self, session_id: str) -> list[dict]:
+        """Normalise the session carry bucket to dict entries.
+
+        Buckets written by pre-0.4.5 code hold bare strings, which carry no id
+        and can therefore never be reconciled against an updated or retracted
+        store row. Keeping one alongside fresh text would inject two
+        contradictory facts, so legacy entries are dropped once and the next
+        recall repopulates the session with id-bearing entries.
+        """
+        raw = self._recalled.get(session_id) or []
+        if all(isinstance(e, dict) for e in raw):
+            return raw
+        legacy = sum(1 for e in raw if not isinstance(e, dict))
+        live = [e for e in raw if isinstance(e, dict)]
+        self._recalled[session_id] = live
+        _log.info("mnemory: dropped %d legacy id-less carried recall(s)", legacy)
+        return live
+
+    def _bucket_texts(self, session_id: str) -> list[str]:
+        """Texts of the session carry bucket, TTL-pruned in place.
+
+        Used by the early-exit injection paths, which do not call /api/recall
+        and therefore never get a chance to reconcile ids: without the TTL
+        filter they replay a deleted memory indefinitely.
+        """
+        bucket = self._upgrade_bucket(session_id)
+        ttl = getattr(self.valves, "recall_entry_ttl", 0) or 0
+        if ttl:
+            now = time.time()
+            live = [e for e in bucket if (e.get("ts", now) >= now - ttl)]
+            if len(live) != len(bucket):
+                self._recalled[session_id] = live
+                _log.debug("mnemory: TTL dropped %d carried recall(s)",
+                           len(bucket) - len(live))
+            bucket = live
+        return [(e["t"] if isinstance(e, dict) else e) for e in bucket]
 
     def _carry_recalled(
         self, session_id: str, search_results: list | None
@@ -785,7 +975,12 @@ prompt for them."""
         Also schedules an async Laya semantic pass for the ambiguous
         Jaccard zone (fail-open, throttled).
         """
-        bucket = self._recalled.setdefault(session_id, [])
+        now = time.time()
+        ttl = getattr(self.valves, "recall_entry_ttl", 0) or 0
+        self._recalled.setdefault(session_id, [])
+        bucket = self._upgrade_bucket(session_id)
+        bucket = [e for e in bucket if not ttl or e.get("ts", now) >= now - ttl]
+        by_id = {e["id"]: e for e in bucket if e.get("id")}
         for m in search_results or []:
             text = m.get("memory")
             if not text:
@@ -795,12 +990,31 @@ prompt for them."""
                     "mnemory: not carrying hygiene-violating recall: %.80s", text
                 )
                 continue
-            bucket.append(text)
+            mid = m.get("id") or m.get("memory_id")
+            hit = by_id.get(mid) if mid else None
+            if hit is not None:
+                # Same memory id, different wording => the store was updated.
+                # Replace in place, keeping position so the server-side prompt
+                # cache is not churned, and refresh the expiry.
+                if hit["t"] != text:
+                    _log.info("mnemory: recall replaced changed text for %s", mid)
+                    hit["t"] = text
+                hit["ts"] = now
+                continue
+            entry = {"t": text, "id": mid, "ts": now}
+            bucket.append(entry)
+            if mid:
+                by_id[mid] = entry
 
         # Re-clean the whole bucket: catches pre-patch accumulation
         # (historical near-dups) and replaces shorter cluster members
         # with the most complete one.
-        cleaned = self._near_dedup(bucket)
+        meta = {}
+        for e in bucket:
+            meta.setdefault(e["t"], e)
+        cleaned = []
+        for t in self._near_dedup([e["t"] for e in bucket]):
+            cleaned.append(meta.get(t) or {"t": t, "id": None, "ts": now})
         cap = self.valves.recall_carry_max
         if len(cleaned) > cap:
             cleaned = cleaned[len(cleaned) - cap:]
@@ -818,7 +1032,7 @@ prompt for them."""
 
         self._maybe_laya_refine(session_id, cleaned)
 
-        return cleaned
+        return [e["t"] for e in cleaned]
 
     # ── Inlet (before LLM) ───────────────────────────────────────────
 
@@ -890,7 +1104,7 @@ prompt for them."""
         if not is_first and self.valves.recall_mode == "first_only":
             self._inject_static_context(body, sess, user_id)
             if sess and self.valves.recall_carry_max > 0:
-                self._inject_recalled(body, self._recalled.get(sess["session_id"]))
+                self._inject_recalled(body, self._bucket_texts(sess["session_id"]))
             return body
 
         # Extract query from last user message
@@ -909,7 +1123,7 @@ prompt for them."""
         if not query and not is_first:
             self._inject_static_context(body, sess, user_id)
             if sess and self.valves.recall_carry_max > 0:
-                self._inject_recalled(body, self._recalled.get(sess["session_id"]))
+                self._inject_recalled(body, self._bucket_texts(sess["session_id"]))
             return body  # No query on subsequent turn — skip search
 
         # Show status (admin valve AND user valve must both be true)
@@ -1060,7 +1274,9 @@ prompt for them."""
         #    system messages, so we re-inject them ourselves.
         sid = (result or {}).get("session_id") or (sess["session_id"] if sess else None)
         if sid and self.valves.recall_carry_max > 0:
-            memories = self._carry_recalled(sid, (result or {}).get("search_results"))
+            fresh = await self._rerank(
+                query, (result or {}).get("search_results"), __event_emitter__)
+            memories = self._carry_recalled(sid, fresh)
             if memories:
                 self._inject_recalled(body, memories)
                 await self._debug(
