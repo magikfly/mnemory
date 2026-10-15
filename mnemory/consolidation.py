@@ -19,7 +19,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from mnemory.categories import sanitize_categories
-from mnemory.output_guards import clean_memory_text, role_mismatch
+from mnemory.output_guards import (
+    clean_memory_text,
+    noise_enforcing,
+    noise_memory,
+    role_mismatch,
+)
 from mnemory.revisions import (
     RevisionConflictError,
     RevisionService,
@@ -1099,6 +1104,18 @@ class ConsolidationService:
                         len(cleaned),
                     )
                     f["text"] = cleaned
+                noise = noise_memory(f.get("text", ""))
+                if noise:
+                    enforcing = noise_enforcing()
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: %s noise memory"
+                        " (%s): %.80s",
+                        session_id, role, batch_idx + 1,
+                        "dropped" if enforcing else "would drop (log only)",
+                        noise, f.get("text", ""),
+                    )
+                    if enforcing:
+                        continue
                 mismatch = role_mismatch(f.get("text", ""), role)
                 if mismatch == "assistant_pass_user_subject":
                     logger.warning(

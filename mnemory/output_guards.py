@@ -22,9 +22,15 @@ No third-party imports, so this module is unit-testable without the service.
 
 from __future__ import annotations
 
+import os
 import re
 
-__all__ = ["clean_memory_text", "role_mismatch"]
+__all__ = [
+    "clean_memory_text",
+    "noise_enforcing",
+    "noise_memory",
+    "role_mismatch",
+]
 
 #: Below this length, cleaned text carries no usable statement.
 MIN_CLEAN_LENGTH = 12
@@ -109,4 +115,117 @@ def role_mismatch(text: str | None, role: str) -> str | None:
         return "assistant_pass_user_subject"
     if role == "user" and re.match(r"^Assistant\b", probe, re.IGNORECASE):
         return "user_pass_assistant_subject"
+    return None
+
+
+# ── write-side noise guard ────────────────────────────────────────────────
+# Why: the extractor and the consolidator both store the *act* of asking or
+# answering as though it were a durable statement, and both store housekeeping
+# counts about this very store. None of those carry information a future turn
+# can use, yet each one occupies a retrieval slot for the life of the store.
+# Measured 2026-10-15 on a 2705-row store: 15 such rows in one probe pass, and
+# every probe ("user asked", "assistant offered") surfaced more of the species.
+# Two of them were injected into a live turn within minutes of being written,
+# which is how this became worth blocking at the writer instead of purging.
+#
+# Deliberately narrow. The failure mode that matters is dropping a real fact,
+# so the patterns key on a speech-act or question *head* (subject + verb in
+# clause-initial position), never on a topic word: "User's maximum heart rate
+# is 188 BPM" and "The fsck dedup call site echoes cluster content" must both
+# survive, and both are covered by MUST_KEEP in tests/test_output_guards_noise.py.
+# Bare domain words ("mnemory", "dedup", "knee") are never sufficient on their
+# own, because this user's real work and health facts contain them.
+
+#: "User is asking who the assistant is" / "User asked how old they are"
+_QUESTION_PROGRESS_RE = re.compile(
+    r"^\s*(?:the\s+)?user\s+(?:is|was|has\s+been|keeps)\s+"
+    r"(?:asked|asking|inquir(?:e|ed|ing)|wonder(?:ed|ing)|wants\s+to\s+know)"
+    r"\b",
+    re.IGNORECASE,
+)
+
+#: "User asked how proficient I am in COBOL." - a question, stored as a fact.
+_QUESTION_PAST_RE = re.compile(
+    r"^\s*(?:the\s+)?user\s+(?:inquired|wondered)\b|"
+    r"^\s*(?:the\s+)?user\s+asked\s+(?:how|what|why|whether|if|who|when|"
+    r"where)\b",
+    re.IGNORECASE,
+)
+
+#: "Assistant explained that ..." / "Assistant recommended using ..." /
+#: "Assistant will dump the tokenizer keys". Only narration verbs: fixed,
+#: added, changed, removed and similar outcome verbs are intentionally absent.
+_ASSISTANT_ACT_RE = re.compile(
+    r"^\s*assistant(?:'s)?\s+(?:is\s+|was\s+|has\s+|have\s+|will\s+|can\s+|"
+    r"would\s+)*"
+    r"(?:will|shall)\s+[a-z]+|"
+    r"(?:offer(?:s|ed)?|explain(?:s|ed)?|not(?:e|es|ed)|"
+    r"mention(?:s|ed)?|clarif(?:y|ies|ied)|agree[sd]?|declin(?:e|es|ed)|"
+    r"advis(?:e|es|ed)|warn(?:s|ed)?|demonstrat(?:e|es|ed)|recommend(?:s|ed)?|"
+    r"suggest(?:s|ed)?|report(?:s|ed)?|stat(?:e|es|ed)\s+that|"
+    r"confirm(?:s|ed)?\s+that)\b",
+    re.IGNORECASE,
+)
+
+#: A pointer to where a fact lives, instead of the fact. Retrieval returns the
+#: pointer and the caller still has to find the real row.
+_POINTER_RE = re.compile(
+    r"^\s*(?:the\s+)?user\s+wants\s+to\s+have\s+.{0,48}\bstored\b|"
+    r"\b(?:real\s+)?name\s+is\s+stored\s+(?:as|at|in)\b",
+    re.IGNORECASE,
+)
+
+#: Housekeeping state of the store itself, e.g. "store contains 408 rows
+#: classified as delete_safe" or "purge: 442 rows retracted, 104 stripped".
+#: Needs a count AND a housekeeping verb, so "grows at 40-60 rows per day"
+#: (a real capacity metric) is not caught.
+_STORE_HOUSEKEEPING_RE = re.compile(
+    r"\b\d[\d,.]*\s*(?:rows?|memories|records|entries)\b"
+    r"[^.]{0,80}\b(?:retract|delet|strip|dedup|purge|classif|archiv|merge)"
+    r"[a-z]*",
+    re.IGNORECASE,
+)
+
+_META_HEAD_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:dashboard|memory\s+(?:store|ui|system|filter))\b",
+    re.IGNORECASE,
+)
+_META_PHRASE_RE = re.compile(
+    r"\b(?:bucket\s+noise|data\s+quality\s+issues?|retrieval\s+miss(es)?|"
+    r"self-reference\s+loop|memory\s+(?:quality|noise)\s+(?:issues?|improve))\b",
+    re.IGNORECASE,
+)
+
+#: log = report only (default), drop = actually refuse the row. There is no
+#: un-retract endpoint, so refusing to write must be a conscious opt-in.
+_NOISE_MODE_ENV = "MEMORY_NOISE_GUARD"
+
+
+def noise_enforcing() -> bool:
+    """True when the noise guard should drop rows rather than only log them."""
+    return os.getenv(_NOISE_MODE_ENV, "log").strip().lower() == "drop"
+
+
+def noise_memory(text: str | None) -> str | None:
+    """Return a reason code when a memory carries no durable statement.
+
+    ``None`` means "keep it". Like ``role_mismatch`` this is pure and
+    deterministic: no model call, no store access, unit-testable in isolation.
+    """
+    if not text:
+        return None
+    probe = _LIST_MARKER_RE.sub("", text, count=1).strip()
+    if not probe:
+        return "empty_after_strip"
+    for regex, reason in (
+        (_QUESTION_PROGRESS_RE, "question_in_progress"),
+        (_QUESTION_PAST_RE, "question_recorded_as_fact"),
+        (_ASSISTANT_ACT_RE, "assistant_speech_act"),
+        (_POINTER_RE, "pointer_not_fact"),
+        (_STORE_HOUSEKEEPING_RE, "store_housekeeping"),
+    ):
+        if regex.search(probe):
+            return reason
+    if _META_HEAD_RE.search(probe) or _META_PHRASE_RE.search(probe):
+        return "about_the_memory_system"
     return None

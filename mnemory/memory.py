@@ -37,6 +37,7 @@ from mnemory.categories import (
 )
 from mnemory.config import Config
 from mnemory.llm import LLMClient, parse_json_response
+from mnemory.output_guards import noise_enforcing, noise_memory
 from mnemory.prompts import (
     build_answer_prompt,
     build_classification_prompt,
@@ -1316,6 +1317,23 @@ class MemoryService:
                 )
             if not facts:
                 return []
+
+        # Write-side noise guard (see output_guards.noise_memory). Runs before
+        # embedding so a noise row costs neither a vector nor a dedup slot.
+        flagged = [(f, noise_memory(f.get("text", ""))) for f in facts]
+        if any(reason for _, reason in flagged):
+            enforcing = noise_enforcing()
+            for fact, reason in flagged:
+                if reason:
+                    logger.info(
+                        "Remember noise guard: %s (%s): %.80s",
+                        "dropped" if enforcing else "would drop (log only)",
+                        reason, fact.get("text", ""),
+                    )
+            if enforcing:
+                facts = [f for f, reason in flagged if not reason]
+                if not facts:
+                    return []
 
         # 1. Batch embed all fact texts
         fact_texts = [f["text"] for f in facts]
