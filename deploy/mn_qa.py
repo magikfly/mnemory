@@ -312,6 +312,67 @@ except Exception:
     traceback.print_exc()
     FAILURES.append("output guards raised")
 
+# ------------------------------------------- extraction guard + pin policy
+# Added 2026-10-18. These live in the image gate, not only in tests/, because
+# the Test workflow does not trigger on mn-deployed pushes -- without this
+# section nothing in the pipeline would notice the pin policy going missing.
+try:
+    import re as _re
+
+    import mnemory.prompts as _prompts
+    from mnemory import output_guards as _og
+
+    check("pin_allowed exported", "pin_allowed" in _og.__all__, True)
+
+    _CURLY = chr(0x2019)
+    for _text, _want in (
+        ("Fact 5 identifies a specific data corruption issue in the table",
+         "meta_indexical"),
+        ("Today's date is Wednesday, 7 October 2026.", "date_echo"),
+        ("Today" + _CURLY + "s date is Wednesday, 7 October 2026.", "date_echo"),
+        ('Assistant: "That settles it, lock in 512"', "speaker_quote"),
+        ("User's name is Ada Lovelace", None),
+        ("User" + _CURLY + "s birthday is August 13, 1975.", None),
+    ):
+        check("guard: " + _text[:32], _og.noise_memory(_text), _want)
+
+    for _text, _want in (
+        ("The Planck constant quantifies energy per photon", False),
+        ("User's resting heart rate was 75 on Tuesday", False),
+        ("User" + _CURLY + "s name is Ada Lovelace", True),
+        ("Assistant" + _CURLY + "s name is Atlas", True),
+        ("User takes metformin 1000 mg twice daily", True),
+        ("User lives in Amsterdam, Netherlands.", True),
+        ("User is a solutions architect at Example Corp", True),
+    ):
+        check("pin=" + str(_want) + ": " + _text[:32], _og.pin_allowed(_text), _want)
+
+    # The invariant that caught the bug which reached a published image: no
+    # guard pattern may assume an ASCII apostrophe or quote, because the
+    # extractor writes typographic punctuation as a matter of course.
+    _offenders = []
+    _esc = chr(92) + "u"
+    _pairs = ((chr(39), (chr(0x2019), chr(0x2018))),
+              (chr(34), (chr(0x201c), chr(0x201d))))
+    for _name in dir(_og):
+        _value = getattr(_og, _name)
+        if not isinstance(_value, _re.Pattern):
+            continue
+        _pat = _value.pattern
+        for _ascii, _twins in _pairs:
+            if _ascii in _pat and not any(
+                _t in _pat or (_esc + "%04x" % ord(_t)) in _pat for _t in _twins
+            ):
+                _offenders.append(_name)
+    check("no ASCII-only punctuation in guard patterns", sorted(set(_offenders)), [])
+
+    _src = open(_prompts.__file__, encoding="utf-8").read()
+    for _marker in ("noise_memory(text)", "pin_allowed(text)", "noise_enforcing()"):
+        check("prompts wired: " + _marker, _marker in _src, True)
+except Exception:
+    traceback.print_exc()
+    FAILURES.append("extraction guard checks raised")
+
 # ---------------------------------------------------------------- summary
 print("\n================ SUMMARY ================")
 if FAILURES:

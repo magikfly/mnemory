@@ -36,6 +36,13 @@ __all__ = [
 #: Below this length, cleaned text carries no usable statement.
 MIN_CLEAN_LENGTH = 12
 
+#: Apostrophe, either form.  The extractor writes typographic punctuation into
+#: its facts as a matter of course, so an ASCII-only apostrophe in a guard
+#: pattern silently misses most real rows.  Defined here, above every pattern
+#: that uses it.  tests/test_output_guards_punctuation.py enforces the twin for
+#: all patterns in this module, so the next one added cannot repeat the mistake.
+_APOS = r"['\u2019]"
+
 # Leading markdown/list noise, including the doubled "- - " form.
 _LIST_MARKER_RE = re.compile(r"^\s*(?:[-*\u2022]\s+)+")
 
@@ -157,7 +164,8 @@ _QUESTION_PAST_RE = re.compile(
 #: "Assistant will dump the tokenizer keys". Only narration verbs: fixed,
 #: added, changed, removed and similar outcome verbs are intentionally absent.
 _ASSISTANT_ACT_RE = re.compile(
-    r"^\s*assistant(?:'s)?\s+(?:is\s+|was\s+|has\s+|have\s+|will\s+|can\s+|"
+    r"^\s*assistant(?:" + _APOS + r"s)?\s+"
+    r"(?:is\s+|was\s+|has\s+|have\s+|will\s+|can\s+|"
     r"would\s+)*"
     r"(?:will|shall)\s+[a-z]+|"
     r"(?:offer(?:s|ed)?|explain(?:s|ed)?|not(?:e|es|ed)|"
@@ -186,15 +194,6 @@ _STORE_HOUSEKEEPING_RE = re.compile(
     r"[a-z]*",
     re.IGNORECASE,
 )
-
-#: Apostrophe, either form. The extractor writes typographic punctuation into
-#: its facts -- em dashes and curly quotes appear throughout the production
-#: store -- so an ASCII-only apostrophe in these patterns silently misses the
-#: majority of real rows.  Caught in the published image, not by the unit tests,
-#: because the fixtures were ASCII: a pin rule that fails on "User’s name is …"
-#: withholds a legitimate pin, which is the one direction this module must not
-#: get wrong.
-_APOS = r"['\u2019]"
 
 #: Indexical reference into a numbered list the extractor was reading, e.g.
 #: "Fact 5 identifies a specific data corruption issue".  Unresolvable once the
