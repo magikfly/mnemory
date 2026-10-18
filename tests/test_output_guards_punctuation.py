@@ -10,6 +10,14 @@ withholding a legitimate identity pin from "User's name is ...".
 Sweeping the module for that one instance would have left the next one in place.
 This test makes the whole class fail loudly at the point of definition, for
 every pattern in the module, including patterns added later.
+
+Outcome of the sweep, measured rather than assumed: 20 patterns, one offender
+(_ASSISTANT_ACT_RE), and fixing it changed **zero** verdicts -- that rule needs
+"assistant is/was/has ... will/shall <verb>" or a bare "<verb> that", so it
+never matched the shape in question with either apostrophe. The sweep found no
+second exploitable bug. It stays because the class of defect is real (it did
+ship once, in _PIN_ALLOW_RE and _DATE_ECHO_RE) and because the negative control
+below proves the sweep can see one.
 """
 
 from __future__ import annotations

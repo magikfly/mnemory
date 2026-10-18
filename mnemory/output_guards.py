@@ -164,6 +164,13 @@ _QUESTION_PAST_RE = re.compile(
 #: "Assistant will dump the tokenizer keys". Only narration verbs: fixed,
 #: added, changed, removed and similar outcome verbs are intentionally absent.
 _ASSISTANT_ACT_RE = re.compile(
+    # _APOS here is a consistency fix, not a behavioural one, and the
+    # distinction matters: before/after on noise_memory() at e6ec6fb vs 80eac0b
+    # produced zero changed verdicts, because this rule only fires on
+    # "assistant is/was/has ... will/shall <verb>" or a bare "<verb> that"
+    # construction. "assistant's recommending we restart" matches with neither
+    # apostrophe. The genuine U+2019 damage was in _PIN_ALLOW_RE and
+    # _DATE_ECHO_RE, where it was measured to change outcomes.
     r"^\s*assistant(?:" + _APOS + r"s)?\s+"
     r"(?:is\s+|was\s+|has\s+|have\s+|will\s+|can\s+|"
     r"would\s+)*"
