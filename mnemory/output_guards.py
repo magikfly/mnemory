@@ -187,6 +187,15 @@ _STORE_HOUSEKEEPING_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Apostrophe, either form. The extractor writes typographic punctuation into
+#: its facts -- em dashes and curly quotes appear throughout the production
+#: store -- so an ASCII-only apostrophe in these patterns silently misses the
+#: majority of real rows.  Caught in the published image, not by the unit tests,
+#: because the fixtures were ASCII: a pin rule that fails on "User’s name is …"
+#: withholds a legitimate pin, which is the one direction this module must not
+#: get wrong.
+_APOS = r"['\u2019]"
+
 #: Indexical reference into a numbered list the extractor was reading, e.g.
 #: "Fact 5 identifies a specific data corruption issue".  Unresolvable once the
 #: producing chat is gone, so it is information-free to every later reader.
@@ -200,8 +209,8 @@ _META_INDEXICAL_RE = re.compile(
 #: October 2026.", and the "user indicated today's date is ..." framing.  Both
 #: were sitting in the store classified as type=fact, i.e. never decaying.
 _DATE_ECHO_RE = re.compile(
-    r"^(?:today|yesterday|tomorrow)(?:'s)?\s+date\s+is\b"
-    r"|\btoday(?:'s|s)\s+date\b"
+    r"^(?:today|yesterday|tomorrow)(?:" + _APOS + r"s)?\s+date\s+is\b"
+    r"|\btoday(?:" + _APOS + r"s|s)\s+date\b"
     # Deliberately narrow: only the two shapes actually observed in the store.
     # A general "the date is ..." rule would drop legitimate facts such as "The
     # date is August 13, my birthday", and there is no evidence broadening it.
@@ -227,13 +236,13 @@ _SPEAKER_QUOTE_RE = re.compile(
 #: pinned=true.  Explicit add_memory/update calls bypass this -- a user asking
 #: to pin something is a different act from a model guessing.
 _PIN_ALLOW_RE = re.compile(
-    r"^(?:user|assistant)(?:'s|s)?\s+(?:full\s+)?name\s+is\b"
+    r"^(?:user|assistant)(?:" + _APOS + r"s|s)?\s+(?:full\s+)?name\s+is\b"
     r"|\b(?:born|birthday|date of birth)\b"
     r"|\b(?:metformin|semaglutide|ozempic|empagliflozin|jardiance|insulin|"
     r"diabetes|t2d|allerg(?:y|ic)|anaphylaxis|coeliac|celiac|asthma|"
     r"sulfonylurea|glp-1|sglt2)\b"
     r"|\b(?:lives|located|resides|based)\s+in\b"
-    r"|^(?:user|assistant)(?:'s|s)?\s+(?:job|profession|occupation|role)\s+is\b"
+    r"|^(?:user|assistant)(?:" + _APOS + r"s|s)?\s+(?:job|profession|occupation|role)\s+is\b"
     r"|\bis\s+an?\s+(?:[a-z]+\s+){0,3}(?:engineer|architect|developer|"
     r"designer|manager|consultant|analyst|freelancer|professional|student)\b"
     r"|\bworks\s+(?:at|for|as)\b",

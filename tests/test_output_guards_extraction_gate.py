@@ -91,6 +91,35 @@ def test_date_echo_rejected():
         assert noise_memory(text) == "date_echo", text
 
 
+# --- typographic apostrophe ------------------------------------------------
+# The extractor emits U+2019, not ASCII.  These are the cases that first failed
+# against the published image; ASCII-only fixtures hid them.
+TYPOGRAPHIC = [
+    ("Today\u2019s date is Wednesday, 7 October 2026.", "date_echo"),
+    ("User\u2019s name is Ada Lovelace", None),
+    ("Assistant\u2019s name is Atlas", None),
+    ("User\u2019s birthday is August 13, 1975.", None),
+    ("User\u2019s job is solutions architect at Example Corp", None),
+]
+
+
+def test_typographic_apostrophe_handled():
+    for text, want in TYPOGRAPHIC:
+        assert noise_memory(text) == want, text
+
+
+def test_typographic_apostrophe_keeps_its_pin():
+    """A rule that misses U+2019 would withhold a legitimate identity pin."""
+    for text in (
+        "User\u2019s name is Ada Lovelace",
+        "Assistant\u2019s name is Atlas",
+        "User\u2019s birthday is August 13, 1975.",
+        "User\u2019s job is solutions architect at Example Corp",
+    ):
+        assert pin_allowed(text) is True, text
+    assert pin_allowed("User\u2019s resting heart rate was 75 on Tuesday") is False
+
+
 def test_date_statements_that_are_the_fact_survive():
     for text in DATE_NOT_ECHO:
         assert noise_memory(text) is None, text
