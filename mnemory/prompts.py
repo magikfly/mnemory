@@ -1149,7 +1149,45 @@ def parse_extraction_response(
         memory_type = _correct_memory_type(memory_type, text)
         categories = _validate_categories(entry.get("categories"))
         importance = _validate_importance(entry.get("importance"))
+
+        # LOCAL-PATCH: content guard + pin policy at the single chokepoint
+        # every extractor reply passes through.  Two enforcement modes on
+        # purpose, because the two decisions are not equally reversible:
+        #
+        #   pin policy applies outright.  Withholding a pin from a row that has
+        #   not been written yet loses nothing -- the fact stays fully
+        #   searchable -- while `pinned` is a REQUIRED schema field, so absent
+        #   this the model guesses a permanent core-context pin onto every
+        #   ordinary fact it extracts.
+        #
+        #   noise drops stay log-only unless MEMORY_NOISE_GUARD=drop, matching
+        #   output_guards' shipped-closed default: mnemory has no un-retract
+        #   endpoint, so a false positive here would be permanent.
         pinned = bool(entry.get("pinned", False))
+
+        from mnemory.output_guards import (
+            noise_enforcing,
+            noise_memory,
+            pin_allowed,
+        )
+
+        noise = noise_memory(text)
+        if noise:
+            enforce = noise_enforcing()
+            if not silent:
+                logger.info(
+                    "Extraction guard: %s (%s): %.120s",
+                    noise,
+                    "dropping" if enforce else "would drop, log-only",
+                    text,
+                )
+            if enforce:
+                continue
+
+        if pinned and not pin_allowed(text):
+            pinned = False
+            if not silent:
+                logger.info("Extraction guard: pin withheld: %.120s", text)
 
         # Extract event_date (YYYY-MM-DD string or None)
         raw_event_date = entry.get("event_date")

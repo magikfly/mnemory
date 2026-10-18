@@ -29,6 +29,7 @@ __all__ = [
     "clean_memory_text",
     "noise_enforcing",
     "noise_memory",
+    "pin_allowed",
     "role_mismatch",
 ]
 
@@ -186,6 +187,73 @@ _STORE_HOUSEKEEPING_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Indexical reference into a numbered list the extractor was reading, e.g.
+#: "Fact 5 identifies a specific data corruption issue".  Unresolvable once the
+#: producing chat is gone, so it is information-free to every later reader.
+#: Observed as a cluster of six such rows written on 2026-10-07/08.
+_META_INDEXICAL_RE = re.compile(
+    r"^\s*(?:fact|item|point|entry|row|note|issue|number)\s+\d+\b",
+    re.IGNORECASE,
+)
+
+#: The session clock stored as durable knowledge: "Today's date is Wednesday, 7
+#: October 2026.", and the "user indicated today's date is ..." framing.  Both
+#: were sitting in the store classified as type=fact, i.e. never decaying.
+_DATE_ECHO_RE = re.compile(
+    r"^(?:today|yesterday|tomorrow)(?:'s)?\s+date\s+is\b"
+    r"|\btoday(?:'s|s)\s+date\b"
+    # Deliberately narrow: only the two shapes actually observed in the store.
+    # A general "the date is ..." rule would drop legitimate facts such as "The
+    # date is August 13, my birthday", and there is no evidence broadening it.
+    r"|^(?:the\s+current\s+)?date\s+(?:is|was)\s+\d",
+    re.IGNORECASE,
+)
+
+#: Literal transcript form -- a bare quoted utterance with no proposition
+#: attached: 'Assistant: "That settles it — lock in 512"'.  _ASSISTANT_ACT_RE
+#: matches narration of the "Assistant explained that ..." kind; it does not
+#: match this quoting shape, which is the same defect wearing different clothes.
+_SPEAKER_QUOTE_RE = re.compile(
+    r'^\s*(?:assistant|user|ai|model)\s*:\s*["\u201c\u2018].*["\u201d\u2019]\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: The only subjects a *newly extracted* memory may earn a permanent pin for:
+#: identity, medical, location, role.  The extraction schema makes ``pinned`` a
+#: REQUIRED field, so the model must emit a value on every single fact; without
+#: a server-side allowlist it guesses, and the guesses land in core context.
+#: Measured cost of guessing, from the live store: a Planck-constant
+#: explanation, a resting-HR reading and two credential-audit counts all arrived
+#: pinned=true.  Explicit add_memory/update calls bypass this -- a user asking
+#: to pin something is a different act from a model guessing.
+_PIN_ALLOW_RE = re.compile(
+    r"^(?:user|assistant)(?:'s|s)?\s+(?:full\s+)?name\s+is\b"
+    r"|\b(?:born|birthday|date of birth)\b"
+    r"|\b(?:metformin|semaglutide|ozempic|empagliflozin|jardiance|insulin|"
+    r"diabetes|t2d|allerg(?:y|ic)|anaphylaxis|coeliac|celiac|asthma|"
+    r"sulfonylurea|glp-1|sglt2)\b"
+    r"|\b(?:lives|located|resides|based)\s+in\b"
+    r"|^(?:user|assistant)(?:'s|s)?\s+(?:job|profession|occupation|role)\s+is\b"
+    r"|\bis\s+an?\s+(?:[a-z]+\s+){0,3}(?:engineer|architect|developer|"
+    r"designer|manager|consultant|analyst|freelancer|professional|student)\b"
+    r"|\bworks\s+(?:at|for|as)\b",
+    re.IGNORECASE,
+)
+
+
+def pin_allowed(text: str | None) -> bool:
+    """True when an extracted memory's text justifies ``pinned=True``.
+
+    Used to *withhold* pins, never to grant them: a caller keeps its own pin
+    only when this returns True.  Withholding a pin from a row that has not been
+    written yet loses nothing durable -- the fact stays fully searchable --
+    which is why this can be enforced on sight, unlike the drop-on-noise
+    behaviour behind ``noise_enforcing``.
+    """
+    if not text:
+        return False
+    return bool(_PIN_ALLOW_RE.search(_LIST_MARKER_RE.sub("", text, count=1)))
+
 _META_HEAD_RE = re.compile(
     r"^\s*(?:the\s+)?(?:dashboard|memory\s+(?:store|ui|system|filter))\b",
     re.IGNORECASE,
@@ -252,6 +320,9 @@ def noise_memory(text: str | None) -> str | None:
         (_ASSISTANT_ACT_RE, "assistant_speech_act"),
         (_POINTER_RE, "pointer_not_fact"),
         (_STORE_HOUSEKEEPING_RE, "store_housekeeping"),
+        (_META_INDEXICAL_RE, "meta_indexical"),
+        (_DATE_ECHO_RE, "date_echo"),
+        (_SPEAKER_QUOTE_RE, "speaker_quote"),
     ):
         if regex.search(probe):
             return reason
