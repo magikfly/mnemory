@@ -37,7 +37,7 @@ from mnemory.categories import (
 )
 from mnemory.config import Config
 from mnemory.llm import LLMClient, parse_json_response
-from mnemory.output_guards import noise_enforcing, noise_memory
+from mnemory.output_guards import noise_enforcing, triage_memory
 from mnemory.prompts import (
     build_answer_prompt,
     build_classification_prompt,
@@ -1320,7 +1320,18 @@ class MemoryService:
 
         # Write-side noise guard (see output_guards.noise_memory). Runs before
         # embedding so a noise row costs neither a vector nor a dedup slot.
-        flagged = [(f, noise_memory(f.get("text", ""))) for f in facts]
+        # Narration is unwrapped rather than dropped where the clause is a
+        # real statement (see output_guards.triage_memory).
+        flagged = []
+        for f in facts:
+            new_text, reason, rewrote = triage_memory(f.get("text", ""))
+            if rewrote:
+                logger.info(
+                    "Remember speech-act rewrite: %.80s -> %.80s",
+                    f.get("text", ""), new_text,
+                )
+                f["text"] = new_text
+            flagged.append((f, reason))
         if any(reason for _, reason in flagged):
             enforcing = noise_enforcing()
             for fact, reason in flagged:

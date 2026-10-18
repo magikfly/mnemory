@@ -31,6 +31,7 @@ __all__ = [
     "noise_memory",
     "pin_allowed",
     "role_mismatch",
+    "triage_memory",
 ]
 
 #: Below this length, cleaned text carries no usable statement.
@@ -160,28 +161,74 @@ _QUESTION_PAST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── assistant narration: anchored head, verb list, rewriter split ───────────
+#
+# PRECEDENCE BUG CLOSED 2026-10-18. The rule used to read:
+#
+#     r"^\s*assistant(?:'s)?\s+(?:is\s+|...)*(?:will|shall)\s+[a-z]+|"
+#     r"(?:offer|explain|note|agree|report|advis|recommend|...)\b"
+#
+# The `|` between those alternatives is TOP LEVEL, so the second branch was
+# never anchored to "^\s*assistant". Any sentence containing note / agree /
+# report / offer / explain / recommend anywhere at all was classified as
+# assistant narration -- and under MEMORY_NOISE_GUARD=drop, deleted. Measured
+# against five ordinary user facts, all five dropped:
+#
+#   "User's wife Lisandra agreed to the move to Zoetermeer"
+#   "User's note about knee pain says it started in August"
+#   "User keeps a training log and reports it weekly to his coach"
+#
+# It shipped 2026-10-15 and logged 47 hits in the following 24h, which read as
+# a writer producing a great deal of narration. It was mostly the word "note"
+# appearing in prose. Both alternatives now share one anchored head, built once
+# so the noise rule and triage_memory() below cannot drift apart.
+
+#: Clause-initial narration head: subject + optional perfect/progressive modal.
+_ACT_HEAD = (
+    r"^\s*(?:the\s+)?assistant(?:" + _APOS + r"s)?\s+"
+    r"(?:(?:is|was|has|have|had)\s+)*"
+)
+
+#: Reporting verbs that introduce narration rather than a proposition. Outcome
+#: verbs (fixed, added, changed, removed, patched) stay out on purpose, and
+#: "identified" belongs to _ASSISTANT_META_OBJECT_RE, not here.
+_ACT_VERBS = (
+    r"offer(?:s|ed)?|explain(?:s|ed)?|not(?:e|es|ed)|mention(?:s|ed)?|"
+    r"clarif(?:y|ies|ied)|agree[sd]?|declin(?:e|es|ed)|demonstrat(?:e|es|ed)|"
+    r"advis(?:e|es|ed)|warn(?:s|ed)?|recommend(?:s|ed)?|suggest(?:s|ed)?|"
+    r"report(?:s|ed)?|stat(?:e|es|ed)|confirm(?:s|ed)?|said|told|urge[sd]?"
+)
+
 #: "Assistant explained that ..." / "Assistant recommended using ..." /
-#: "Assistant will dump the tokenizer keys". Only narration verbs: fixed,
-#: added, changed, removed and similar outcome verbs are intentionally absent.
+#: "Assistant will dump the tokenizer keys".
 _ASSISTANT_ACT_RE = re.compile(
-    # _APOS here is a consistency fix, not a behavioural one, and the
-    # distinction matters: before/after on noise_memory() at e6ec6fb vs 80eac0b
-    # produced zero changed verdicts, because this rule only fires on
-    # "assistant is/was/has ... will/shall <verb>" or a bare "<verb> that"
-    # construction. "assistant's recommending we restart" matches with neither
-    # apostrophe. The genuine U+2019 damage was in _PIN_ALLOW_RE and
-    # _DATE_ECHO_RE, where it was measured to change outcomes.
-    r"^\s*assistant(?:" + _APOS + r"s)?\s+"
-    r"(?:is\s+|was\s+|has\s+|have\s+|will\s+|can\s+|"
-    r"would\s+)*"
-    r"(?:will|shall)\s+[a-z]+|"
-    r"(?:offer(?:s|ed)?|explain(?:s|ed)?|not(?:e|es|ed)|"
-    r"mention(?:s|ed)?|clarif(?:y|ies|ied)|agree[sd]?|declin(?:e|es|ed)|"
-    r"advis(?:e|es|ed)|warn(?:s|ed)?|demonstrat(?:e|es|ed)|recommend(?:s|ed)?|"
-    r"suggest(?:s|ed)?|report(?:s|ed)?|stat(?:e|es|ed)\s+that|"
-    r"confirm(?:s|ed)?\s+that)\b",
+    # _APOS keeps the module-wide punctuation invariant intact
+    # (tests/test_output_guards_punctuation.py): the extractor writes U+2019.
+    _ACT_HEAD + r"(?:will|shall|would|can|could)\s+[a-z]+"
+    r"|" + _ACT_HEAD + r"(?:" + _ACT_VERBS + r")\b",
     re.IGNORECASE,
 )
+
+#: Head + reporting verb + everything after it, so triage_memory() can recover
+#: the proposition the narration was wrapped around.
+_ACT_SPLIT_RE = re.compile(
+    _ACT_HEAD + r"(?P<verb>" + _ACT_VERBS + r")\b(?P<rest>.*)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: Verbs where the act IS the content; what follows says nothing a later reader
+#: can use ("Assistant offered to adapt it", "agreed to the plan").
+_ACT_ONLY_VERBS = ("offer", "agree", "decline", "apolog")
+
+#: A clause after one of these is an instruction, so when it has no subject of
+#: its own it is labelled as advice instead of being left a floating fragment.
+_ADVICE_VERBS = ("advis", "recommend", "suggest", "urge", "warn", "told",
+                 "tell", "said")
+
+#: A recovered clause shorter than this is not worth keeping.
+MIN_REWRITE_CLAUSE = 20
+
+
 
 #: A pointer to where a fact lives, instead of the fact. Retrieval returns the
 #: pointer and the caller still has to find the real row.
@@ -344,3 +391,86 @@ def noise_memory(text: str | None) -> str | None:
     if _META_HEAD_RE.search(probe) or _META_PHRASE_RE.search(probe):
         return "about_the_memory_system"
     return None
+
+
+def triage_memory(text: str | None) -> tuple[str, str | None, bool]:
+    """Decide what to store: ``(text_to_store, drop_reason, was_rewritten)``.
+
+    Narration is not always noise. "Assistant recommended not running on an
+    empty stomach" wraps a real instruction inside a speech-act head, and
+    dropping the row loses the instruction. Measured 2026-10-18 on 24h of
+    ``would drop`` logs, ``assistant_speech_act`` was firing on substantive
+    guidance: the euDKA fueling rule, sodium intake with empagliflozin, a
+    cadence cue, a scheduled rest day. Enforcing the drop as written would have
+    silently deleted medical advice.
+
+    So the head is stripped and the clause kept, in exactly two provable shapes:
+
+      * an explicit ``that``-clause, kept verbatim -- it already has a subject,
+        so nothing has to be inferred;
+      * a subject-less clause (gerund, or the ``told the user to ...``
+        indirect-object form), given a short provenance label rather than being
+        rephrased into a bald assertion.
+
+    Everything else keeps the original drop verdict. This does not breach
+    ``clean_memory_text``'s "never rewrite wording" invariant: that function
+    removes formatting only, whereas this one is a separate, logged operation
+    whose whole job is de-narration, and it removes precisely the reporting head
+    it matched and nothing else.
+    """
+    reason = noise_memory(text)
+    if reason != "assistant_speech_act" or not text:
+        return text, reason, False
+
+    probe = _LIST_MARKER_RE.sub("", text, count=1).strip()
+    m = _ACT_SPLIT_RE.match(probe)
+    if m is None:
+        return text, reason, False        # future-modal form: pure act
+    verb = m.group("verb").lower()
+    if verb.startswith(_ACT_ONLY_VERBS):
+        return text, reason, False
+
+    rest = (m.group("rest") or "").strip()
+    rest = re.sub(r"^[\s,;:.\u2013\u2014-]+", "", rest)
+    had_that = bool(re.match(r"^(?:the\s+fact\s+)?that\b", rest, re.IGNORECASE))
+    rest = re.sub(r"^(?:the\s+fact\s+)?that\s+", "", rest, flags=re.IGNORECASE)
+    # "told/advised the user to drink water" -> "drink water"
+    rest = re.sub(r"^(?:the\s+)?user\s+(?:to|that)\s+", "", rest,
+                  flags=re.IGNORECASE)
+    rest = _WHITESPACE_RE.sub(" ", rest).strip(" .;,:")
+
+    if len(rest) < MIN_REWRITE_CLAUSE:
+        return text, reason, False
+
+    # Only capitalise an ordinary leading word. "Assistant noted that
+    # qdrant-client 1.19.1 is pinned" must not become "Qdrant-client ...":
+    # re-shaping a version string or identifier is exactly the silent
+    # rewording the guard has to avoid.
+    capitalised = rest
+    if re.match(r"^[a-z][a-z]+\b", rest):
+        capitalised = rest[0].upper() + rest[1:]
+
+    # Advice verbs always keep a label, including before a that-clause. Dropping
+    # the head from "Assistant recommended that the user sleep more" and storing
+    # "The user sleep more" would turn advice into a broken assertion about a
+    # third party; the label preserves the modality that the verb carried.
+    if verb.startswith(_ADVICE_VERBS):
+        return f"Advice: {capitalised}", None, True
+
+    if had_that:
+        return capitalised, None, True
+
+    subjectless = (
+        re.match(r"^(?:not\s+)?[a-z]+ing\b", rest, re.IGNORECASE)
+        or re.match(
+            r"^(?:drink|run|eat|keep|avoid|take|sleep|hydrate|stretch|rest|"
+            r"raise|reduce|add|drop|swap|try|aim|hold|push|slow|speed|"
+            r"weigh|log|record|prioritise|prioritize|expect|monitor)\b",
+            rest, re.IGNORECASE,
+        )
+    )
+    if subjectless:
+        label = "Advice" if verb.startswith(_ADVICE_VERBS) else "Note"
+        return f"{label}: {capitalised}", None, True
+
+    return text, reason, False

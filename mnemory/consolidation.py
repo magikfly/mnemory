@@ -22,7 +22,7 @@ from mnemory.categories import sanitize_categories
 from mnemory.output_guards import (
     clean_memory_text,
     noise_enforcing,
-    noise_memory,
+    triage_memory,
     role_mismatch,
 )
 from mnemory.revisions import (
@@ -1104,7 +1104,15 @@ class ConsolidationService:
                         len(cleaned),
                     )
                     f["text"] = cleaned
-                noise = noise_memory(f.get("text", ""))
+                new_text, noise, rewrote = triage_memory(f.get("text", ""))
+                if rewrote:
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: stripped "
+                        "speech-act head from memory (%.60s -> %.60s)",
+                        session_id, role, batch_idx + 1,
+                        f.get("text", ""), new_text,
+                    )
+                    f["text"] = new_text
                 if noise:
                     enforcing = noise_enforcing()
                     logger.warning(

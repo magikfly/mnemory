@@ -1167,11 +1167,15 @@ def parse_extraction_response(
 
         from mnemory.output_guards import (
             noise_enforcing,
-            noise_memory,
             pin_allowed,
+            triage_memory,
         )
 
-        noise = noise_memory(text)
+        text, noise, rewrote = triage_memory(text)
+        if rewrote and not silent:
+            logger.info(
+                "Extraction guard: speech-act rewrite: %.120s", text
+            )
         if noise:
             enforce = noise_enforcing()
             if not silent:

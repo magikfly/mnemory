@@ -347,6 +347,70 @@ try:
     ):
         check("pin=" + str(_want) + ": " + _text[:32], _og.pin_allowed(_text), _want)
 
+    # ── narration: anchored head, and rewrite-instead-of-drop ────────────────
+    # Shipped 2026-10-18. The previous rule's verb list sat in a second
+    # top-level alternative, so it was never anchored to the assistant subject
+    # and flagged ordinary facts. Replaying 24h of live "would drop" verdicts:
+    # of 28 assistant_speech_act rows, 11 were not narration at all and 13 were
+    # substantive advice being thrown away (training decisions, the euDKA
+    # fueling rule, cadence and sodium guidance). Only 4 were genuine acts.
+    check("triage_memory exported", "triage_memory" in _og.__all__, True)
+
+    # _CURLY and _re come from the block above; not redefined here.
+    # facts whose sentence merely happens to contain a reporting verb
+    for _text in (
+        "User agreed to change Monday from strength to Z2 45 min recovery",
+        "User" + _CURLY + "s note about knee pain says it started in August",
+        "User keeps a training log and reports it weekly to his coach",
+    ):
+        check("not narration: " + _text[:30], _og.noise_memory(_text), None)
+
+    # narration around a real clause -- unwrap, never delete
+    for _text, _want in (
+        ("Assistant recommended not running on an empty stomach",
+         "Advice: Not running on an empty stomach"),
+        ("Assistant advised drinking water with salt today instead of volume",
+         "Advice: Drinking water with salt today instead of volume"),
+        # explicit that-clause stays verbatim, and a code identifier must come
+        # back intact rather than re-capitalised
+        ("Assistant noted that icu_apply_sport_settings will overwrite zones",
+         "icu_apply_sport_settings will overwrite zones"),
+    ):
+        _stored, _reason, _rewrote = _og.triage_memory(_text)
+        check("triage text: " + _text[:30], _stored, _want)
+        check("triage keeps: " + _text[:30], _reason, None)
+        check("triage flagged rewritten: " + _text[:30], _rewrote, True)
+
+    # the act IS the content -- still refused, and left word-for-word intact
+    _act = "Assistant offered to unpin memories 28, 35, 45 via PUT"
+    _stored, _reason, _rewrote = _og.triage_memory(_act)
+    check("act refused", _reason, "assistant_speech_act")
+    check("act untouched", _stored, _act)
+    check("act not rewritten", _rewrote, False)
+
+    for _text, _want in (
+        ("Assistant recommended not running on an empty stomach", True),
+        ("Assistant offered to adapt it", True),
+        ("User agreed to change Monday from strength to Z2 recovery", False),
+        ("User" + _CURLY + "s note about knee pain says it started in August",
+         False),
+    ):
+        check("anchored head: " + _text[:30],
+              bool(_og._ASSISTANT_ACT_RE.search(_text)), _want)
+
+    # Negative control. If the verb list ever floats free of the anchor again,
+    # this is the shape that breaks: every one of these sentences contains a
+    # reporting verb and says nothing about the assistant narrating anything.
+    _detached = _re.compile(r"(?:" + _og._ACT_VERBS + r")\b", _re.IGNORECASE)
+    _caught_by_detached = sum(
+        1 for _t in ("User agreed to change Monday from strength to Z2",
+                     "User" + _CURLY + "s note about knee pain",
+                     "User keeps a training log and reports it weekly",
+                     "The knee offer of service is expired")
+        if _detached.search(_t))
+    check("control: detached verb list still over-matches (>=4)",
+          _caught_by_detached >= 4, True)
+
     # The invariant that caught the bug which reached a published image: no
     # guard pattern may assume an ASCII apostrophe or quote, because the
     # extractor writes typographic punctuation as a matter of course.
@@ -367,7 +431,10 @@ try:
     check("no ASCII-only punctuation in guard patterns", sorted(set(_offenders)), [])
 
     _src = open(_prompts.__file__, encoding="utf-8").read()
-    for _marker in ("noise_memory(text)", "pin_allowed(text)", "noise_enforcing()"):
+    # noise_memory(text) is deliberately absent: the write paths call it
+    # through triage_memory now, which is the marker that matters.
+    for _marker in ("pin_allowed(text)", "noise_enforcing()",
+                    "triage_memory(text)"):
         check("prompts wired: " + _marker, _marker in _src, True)
 except Exception:
     traceback.print_exc()
