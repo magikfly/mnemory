@@ -375,6 +375,9 @@ try:
         # back intact rather than re-capitalised
         ("Assistant noted that icu_apply_sport_settings will overwrite zones",
          "icu_apply_sport_settings will overwrite zones"),
+        # the shape the live extractor actually produced
+        ("Assistant recommended against running on an empty stomach",
+         "Advice: Not running on an empty stomach"),
     ):
         _stored, _reason, _rewrote = _og.triage_memory(_text)
         check("triage text: " + _text[:30], _stored, _want)

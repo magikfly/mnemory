@@ -37,6 +37,12 @@ MUST_KEEP = [
 
 # ── narration wrapping a real statement: unwrap, do not delete ──────────────
 MUST_REWRITE = {
+    # phrasing taken verbatim from the first live rewrite, 2026-10-19
+    "Assistant recommended against running on an empty stomach before "
+    "long runs":
+        "Advice: Not running on an empty stomach before long runs",
+    "Assistant advised to sleep more during a training block":
+        "Advice: Sleep more during a training block",
     "Assistant recommended keeping Thursday 21/10 as a rest day":
         "Advice: Keeping Thursday 21/10 as a rest day",
     "Assistant advised drinking water with salt today instead of plain water":

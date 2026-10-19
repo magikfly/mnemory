@@ -437,6 +437,15 @@ def triage_memory(text: str | None) -> tuple[str, str | None, bool]:
     # "told/advised the user to drink water" -> "drink water"
     rest = re.sub(r"^(?:the\s+)?user\s+(?:to|that)\s+", "", rest,
                   flags=re.IGNORECASE)
+    # Live 2026-10-19: the extractor writes "recommended AGAINST running",
+    # not "recommended NOT running". The negation belongs to the reporting
+    # verb, so a bare head-strip left "Advice: Against running on an empty
+    # stomach" -- a prepositional fragment that loses the "do not" force
+    # altogether. Fold it into the clause instead.
+    rest = re.sub(r"^against\s+", "not ", rest, flags=re.IGNORECASE)
+    # "advised to sleep more" -> "sleep more"; the infinitive marker is part
+    # of the head, same as "that".
+    rest = re.sub(r"^to\s+", "", rest, flags=re.IGNORECASE)
     rest = _WHITESPACE_RE.sub(" ", rest).strip(" .;,:")
 
     if len(rest) < MIN_REWRITE_CLAUSE:
