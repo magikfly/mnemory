@@ -75,7 +75,7 @@ def validate_categories(categories: list[str]) -> list[str]:
         if not cat:
             continue
 
-        # Check for namespaced category (e.g., project:domecek/k8s-manifests)
+        # Check for namespaced category (e.g., project:demo/deployment-files)
         if ":" in cat:
             prefix, name = cat.split(":", 1)
             if prefix not in PREDEFINED_CATEGORIES:

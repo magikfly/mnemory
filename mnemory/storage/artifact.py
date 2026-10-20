@@ -218,10 +218,14 @@ class S3Backend:
             response = self._client.list_objects_v2(**kwargs)
             objects = response.get("Contents", [])
             if objects:
-                self._client.delete_objects(
+                deleted = self._client.delete_objects(
                     Bucket=self._bucket,
                     Delete={"Objects": [{"Key": obj["Key"]} for obj in objects]},
                 )
+                if deleted.get("Errors"):
+                    raise RuntimeError(
+                        "Artifact cleanup was rejected by object storage"
+                    )
             if not response.get("IsTruncated"):
                 break
             continuation_token = response.get("NextContinuationToken")

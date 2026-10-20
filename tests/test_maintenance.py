@@ -63,6 +63,7 @@ def _make_fsck_service(
 ):
     """Build a minimal mock FsckService."""
     fsck = MagicMock()
+    fsck._memory_service = None
 
     # list_user_ids on the vector store
     fsck._vector.list_user_ids.return_value = user_ids or []
@@ -110,13 +111,13 @@ class TestMaintenanceService:
 
         asyncio.run(_run())
 
-    def test_consolidation_uses_one_global_scan_and_recovers_first(self):
-        """Maintenance uses one session scan and retries reset idle sessions."""
+    def test_consolidation_pages_due_work_and_blocks_legacy_recovery(self):
+        """An old consolidating row does not authorize replay or reset."""
 
         async def _run():
             old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
             consolidation = MagicMock()
-            consolidation._sessions.scan_consolidation_candidates.return_value = [
+            records = [
                 {
                     "session_id": "completed",
                     "user_id": "alice",
@@ -140,7 +141,13 @@ class TestMaintenanceService:
                     "consolidation_state": "idle",
                 },
             ]
-            consolidation.recover_session.side_effect = [True, False]
+            for record in records:
+                record["_point_id"] = record["session_id"]
+            consolidation._sessions.maintenance_page.side_effect = [
+                (records, None),
+                (records, None),
+            ]
+            consolidation._sessions.get.side_effect = records
             result = MagicMock()
             result.state = "consolidated"
             consolidation.consolidate_session.return_value = result
@@ -152,22 +159,24 @@ class TestMaintenanceService:
 
             await service._run_consolidation()
 
-            consolidation._sessions.scan_consolidation_candidates.assert_called_once_with()
+            assert consolidation._sessions.maintenance_page.call_count == 2
+            consolidation.recover_session.assert_not_called()
+            assert consolidation._sessions.diagnose_maintenance.call_count == 2
             consolidation._vector.list_user_ids.assert_not_called()
             assert [
                 call.args[0]
                 for call in consolidation.consolidate_session.call_args_list
-            ] == ["retry", "idle"]
+            ] == ["idle"]
 
         asyncio.run(_run())
 
-    def test_consolidation_isolates_recovery_errors_per_session(self):
-        """One recovery error does not block other sessions for the user."""
+    def test_consolidation_does_not_call_unsafe_recovery(self):
+        """A broken recovery handler is never invoked by maintenance."""
 
         async def _run():
             old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
             consolidation = MagicMock()
-            consolidation._sessions.scan_consolidation_candidates.return_value = [
+            records = [
                 {
                     "session_id": "broken",
                     "user_id": "alice",
@@ -194,6 +203,13 @@ class TestMaintenanceService:
                 RuntimeError("recovery failed"),
                 False,
             ]
+            for record in records:
+                record["_point_id"] = record["session_id"]
+            consolidation._sessions.maintenance_page.side_effect = [
+                (records, None),
+                (records, None),
+            ]
+            consolidation._sessions.get.side_effect = records
             result = MagicMock()
             result.state = "consolidated"
             consolidation.consolidate_session.return_value = result
@@ -208,7 +224,8 @@ class TestMaintenanceService:
             assert [
                 call.args[0]
                 for call in consolidation.consolidate_session.call_args_list
-            ] == ["retry", "idle"]
+            ] == ["idle"]
+            consolidation.recover_session.assert_not_called()
 
         asyncio.run(_run())
 

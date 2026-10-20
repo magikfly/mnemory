@@ -2484,14 +2484,14 @@ class TestExpandCategoryFilter:
         service.vector.get_all.return_value = {
             "results": [
                 {"metadata": {"categories": ["project:myapp"]}},
-                {"metadata": {"categories": ["project:domecek"]}},
+                {"metadata": {"categories": ["project:demo"]}},
                 {"metadata": {"categories": ["work"]}},
             ]
         }
         expanded = service._expand_category_filter(["project"], "filip")
         assert "project" in expanded
         assert "project:myapp" in expanded
-        assert "project:domecek" in expanded
+        assert "project:demo" in expanded
         assert "work" not in expanded
 
     def test_non_prefix_category_passed_through(self):

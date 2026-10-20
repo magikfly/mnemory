@@ -376,7 +376,7 @@ mcp = FastMCP(
     # Disable DNS rebinding protection — mnemory runs behind a reverse
     # proxy / ingress that handles host validation and TLS termination.
     # Without this, the MCP SDK rejects requests with external Host
-    # headers (e.g., mem.fpy.cz) with HTTP 421.
+    # headers (e.g., memory.example.com) with HTTP 421.
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     ),
@@ -1277,13 +1277,17 @@ async def delete_memory(
     idempotency_key: str | None = None,
     privacy_erase: bool = False,
 ) -> str:
-    """Retract a memory, or explicitly erase its lineage for privacy.
+    """Retract a memory, or request best-effort physical lineage cleanup.
+
+    Erasure is not transactional across stores. Concurrent jobs or recovery may
+    retain or recreate data; backups and provider/external logs are out of scope.
+    Success reports completion of known cleanup, not verified permanent erasure.
 
     Args:
         memory_id: ID of the memory to delete.
         expected_revision: Expected active revision for stale-write detection.
         idempotency_key: Retry key scoped to this lineage retraction.
-        privacy_erase: Physically erase all revisions and artifacts.
+        privacy_erase: Best-effort cleanup of revisions and unshared artifacts.
     """
     try:
         uid = _resolve_user_id(user_id)

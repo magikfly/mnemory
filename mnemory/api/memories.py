@@ -721,7 +721,11 @@ def privacy_erase_memory(
     memory_id: str,
     ctx: SessionContext = Depends(get_session_context),
 ):
-    """Physically erase one memory lineage and its unreferenced artifacts."""
+    """Best-effort lineage/unshared-artifact cleanup, not permanent-erasure proof.
+
+    Concurrent jobs or recovery may retain/recreate data. Multiple stores are
+    nontransactional; backups and provider/external logs are outside this scope.
+    """
     _record("privacy_erase_memory", ctx)
     service = _get_service()
     try:

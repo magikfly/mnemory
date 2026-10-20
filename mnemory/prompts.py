@@ -361,23 +361,24 @@ Output: {{"memories": [
     "importance": "normal", "pinned": false, "event_date": "2025-03-15"}}
 ], "store_artifact": false}}
 
-Input: "User: My mom likes sweet drinks, especially Malibu. She loves \
-Stephen King books and has a garden. I have a Kurilian Bobtail cat.\n\
-Assistant: Nice! A Malibu set or a new Stephen King novel could be great gifts."
+Fictional example:
+Input: "User: My uncle likes puzzles, especially jigsaws. He loves \
+astronomy books and has a balcony. I have a Welsh Corgi dog.\n\
+Assistant: A landscape jigsaw or an astronomy atlas could be good gifts."
 Output: {{"memories": [
-  {{"text": "User's mother likes sweet drinks, especially Malibu",
+  {{"text": "User's uncle likes puzzles, especially jigsaws",
     "action": "ADD", "target_id": null, "old_memory": null,
     "memory_type": "fact", "categories": ["personal"],
     "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User's mother loves Stephen King books",
+  {{"text": "User's uncle loves astronomy books",
     "action": "ADD", "target_id": null, "old_memory": null,
     "memory_type": "fact", "categories": ["personal", "entertainment"],
     "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User's mother has a garden",
+  {{"text": "User's uncle has a balcony",
     "action": "ADD", "target_id": null, "old_memory": null,
     "memory_type": "fact", "categories": ["personal"],
     "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User has a Kurilian Bobtail cat",
+  {{"text": "User has a Welsh Corgi dog",
     "action": "ADD", "target_id": null, "old_memory": null,
     "memory_type": "fact", "categories": ["personal"],
     "importance": "normal", "pinned": false, "event_date": null}}
@@ -2200,20 +2201,20 @@ Output:
   {{"text": "Sarah prefers ECS over Kubernetes for their scale", "memory_type": "episodic", "categories": ["technical"], "importance": "normal", "pinned": false, "event_date": "2025-03-15"}}
 ], "summary": "John and Sarah discussed container orchestration — John favors Kubernetes, Sarah prefers ECS.", "store_artifact": false}}
 
-### Example 7: Third-party facts (family, pets)
+### Example 7: Third-party facts (fictional family and pets)
 
 Input:
-User: My mom likes sweet drinks, especially Malibu. She loves \
-Stephen King books and has a garden. I have a Kurilian Bobtail cat.
-Assistant: Nice! A Malibu set or a new Stephen King novel could be great gifts.
+User: My uncle likes puzzles, especially jigsaws. He loves \
+astronomy books and has a balcony. I have a Welsh Corgi dog.
+Assistant: A landscape jigsaw or an astronomy atlas could be good gifts.
 
 Output:
 {{"memories": [
-  {{"text": "User's mother likes sweet drinks, especially Malibu", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User's mother loves Stephen King books", "memory_type": "fact", "categories": ["personal", "entertainment"], "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User's mother has a garden", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User has a Kurilian Bobtail cat", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}}
-], "summary": "User described their mother's preferences and mentioned owning a Kurilian Bobtail cat.", "store_artifact": false}}
+  {{"text": "User's uncle likes puzzles, especially jigsaws", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
+  {{"text": "User's uncle loves astronomy books", "memory_type": "fact", "categories": ["personal", "entertainment"], "importance": "normal", "pinned": false, "event_date": null}},
+  {{"text": "User's uncle has a balcony", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
+  {{"text": "User has a Welsh Corgi dog", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}}
+], "summary": "User described their uncle's preferences and mentioned owning a Welsh Corgi dog.", "store_artifact": false}}
 
 ### Example 8: Transient task instruction (no facts)
 
@@ -2566,16 +2567,16 @@ Output:
 ], "summary": "User asked about assistant's interests. Assistant described enjoying problem-solving and technical explanations.", "store_artifact": false}}
 (The user's hiking preference is NOT extracted — user facts belong in user memories.)
 
-### Example 5: Session-specific assistant actions (not extracted)
+### Example 5: Session-specific assistant actions (fictional, not extracted)
 
 Input:
-User: I have 2.5 fields in this section.
-Assistant: Does your count of 2.5 fields include the end posts? I need \
-to know whether there is a post at both the start and end of the section. \
-I can also calculate the exact center positions for stems once you clarify.
+User: I have 3.5 shelf boards for this display.
+Assistant: Does that include the two end shelves? I need \
+to know whether both ends of the display have shelves. \
+I can calculate the bracket positions once you clarify.
 
 Output:
-{{"memories": [], "summary": "User mentioned having 2.5 fields. Assistant asked for clarification about end posts and offered to calculate stem positions.", "store_artifact": false}}
+{{"memories": [], "summary": "User mentioned having 3.5 shelf boards. Assistant asked about end shelves and offered to calculate bracket positions.", "store_artifact": false}}
 (The assistant's clarifying question and offer are session-specific — \
 not lasting facts about the assistant.)
 
@@ -2915,36 +2916,36 @@ details as separate memories.
 
 ## Examples
 
-### Example 1: User fact + assistant finding (question skipped)
+### Example 1: Fictional user fact + assistant finding (question skipped)
 
 Input:
-User: I need help swapping the motor in my 2015 Skoda Octavia.
-Assistant: Can you provide the exact VIN? I've researched this model \
-and the 2015 Octavia uses a MQB platform with specific connector pinouts.
+User: I need help replacing the brakes on my Example Cycles touring bike.
+Assistant: Can you provide the frame serial number? I've researched this model \
+and the Example Cycles touring bike uses cable-operated disc brakes.
 (Today's date: 2025-03-15)
 
 Output:
 {{"memories": [
-  {{"text": "User needs help swapping the motor in their 2015 Skoda Octavia", "role": "user", "memory_type": "episodic", "categories": ["vehicles"], "importance": "normal", "pinned": false, "event_date": "2025-03-15"}},
-  {{"text": "Assistant researched the 2015 Skoda Octavia and found it uses MQB platform with specific connector pinouts", "role": "assistant", "memory_type": "episodic", "categories": ["vehicles"], "importance": "normal", "pinned": false, "event_date": "2025-03-15"}}
-], "summary": "User needs help with a motor swap on their 2015 Skoda Octavia. Assistant found it uses MQB platform.", "store_artifact": false}}
-(The assistant's VIN request is a session-specific clarifying question — \
-not extracted. The platform finding has lasting reference value.)
+  {{"text": "User needs help replacing the brakes on their Example Cycles touring bike", "role": "user", "memory_type": "episodic", "categories": ["vehicles"], "importance": "normal", "pinned": false, "event_date": "2025-03-15"}},
+  {{"text": "Assistant researched the Example Cycles touring bike and found it uses cable-operated disc brakes", "role": "assistant", "memory_type": "episodic", "categories": ["vehicles"], "importance": "normal", "pinned": false, "event_date": "2025-03-15"}}
+], "summary": "User needs help replacing touring bike brakes. Assistant found the model uses cable-operated disc brakes.", "store_artifact": false}}
+(The assistant's serial-number request is a session-specific clarifying question — \
+not extracted. The brake finding has lasting reference value.)
 
-### Example 2: User personal facts (assistant response is context only)
+### Example 2: Fictional personal facts (assistant response is context only)
 
 Input:
-User: My mom likes sweet drinks, especially Malibu. She loves \
-Stephen King books and has a garden. I have a Kurilian Bobtail cat.
-Assistant: Nice! A Malibu set or a new Stephen King novel could be great gifts.
+User: My uncle likes puzzles, especially jigsaws. He loves \
+astronomy books and has a balcony. I have a Welsh Corgi dog.
+Assistant: A landscape jigsaw or an astronomy atlas could be good gifts.
 
 Output:
 {{"memories": [
-  {{"text": "User's mother likes sweet drinks, especially Malibu", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User's mother loves Stephen King books", "role": "user", "memory_type": "fact", "categories": ["personal", "entertainment"], "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User's mother has a garden", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
-  {{"text": "User has a Kurilian Bobtail cat", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}}
-], "summary": "User described their mother's preferences and mentioned owning a Kurilian Bobtail cat.", "store_artifact": false}}
+  {{"text": "User's uncle likes puzzles, especially jigsaws", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
+  {{"text": "User's uncle loves astronomy books", "role": "user", "memory_type": "fact", "categories": ["personal", "entertainment"], "importance": "normal", "pinned": false, "event_date": null}},
+  {{"text": "User's uncle has a balcony", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
+  {{"text": "User has a Welsh Corgi dog", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}}
+], "summary": "User described their uncle's preferences and mentioned owning a Welsh Corgi dog.", "store_artifact": false}}
 (The assistant's gift suggestion is a generic response, not a substantive recommendation.)
 
 ### Example 3: Goal extraction + assistant decision

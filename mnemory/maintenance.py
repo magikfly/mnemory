@@ -66,6 +66,9 @@ class MaintenanceService:
         self._task: asyncio.Task | None = None
         self._consolidation = consolidation
         self._consolidation_task: asyncio.Task | None = None
+        self._consolidation_cursor: Any = None
+        self._diagnostic_cursor: Any = None
+        self._operation_diagnostic_cursor: Any = None
 
         # Scheduling state — exposed via properties for the stats endpoint.
         self._next_run_at: float | None = None  # Unix timestamp
@@ -297,9 +300,69 @@ class MaintenanceService:
 
     async def _run_consolidation(self) -> None:
         """Run within-session consolidation for all users with idle sessions."""
-        candidates: list[dict[str, Any]] = await asyncio.to_thread(
-            self._consolidation._sessions.scan_consolidation_candidates
+        from mnemory.maintenance_state import parse_timestamp
+
+        store = self._consolidation._sessions
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(
+            seconds=self._config.memory.consolidation_idle_threshold
         )
+        page, self._consolidation_cursor = await asyncio.to_thread(
+            store.maintenance_page,
+            cutoff=cutoff,
+            now=now,
+            offset=self._consolidation_cursor,
+            limit=32,
+        )
+        diagnostics, self._diagnostic_cursor = await asyncio.to_thread(
+            store.maintenance_page,
+            cutoff=cutoff,
+            now=now,
+            offset=self._diagnostic_cursor,
+            diagnostic=True,
+            limit=16,
+        )
+        for record in diagnostics:
+            diagnosis = None
+            if (
+                record.get("consolidation_state") == "consolidating"
+                or record.get("consolidation_token")
+                or record.get("retry_operation_token")
+            ):
+                diagnosis = "ownership_unknown"
+            elif parse_timestamp(record.get("updated_at")) is None:
+                diagnosis = "invalid_timestamp"
+            if diagnosis:
+                await asyncio.to_thread(store.diagnose_maintenance, record, diagnosis)
+                if self._collector is not None:
+                    self._collector.record_maintenance_diagnosis(diagnosis)
+        candidates = []
+        for record in page:
+            # Hydrate only due work, including the summary and append events.
+            session = await asyncio.to_thread(
+                store.get, record["session_id"], point_id=record["_point_id"]
+            )
+            # LOCAL-PATCH: accept "failed" alongside "idle" — see maintenance_page.
+            # Ownership guards below (consolidation_token / retry_operation_token)
+            # still fence anything another worker holds.
+            if not session or session.get("consolidation_state") not in ("idle", "failed"):
+                continue
+            if session.get("consolidation_token") or session.get(
+                "retry_operation_token"
+            ):
+                continue
+            updated = parse_timestamp(session.get("updated_at"))
+            if updated is None or updated >= cutoff:
+                continue
+            if not session.get("memory_ids"):
+                await asyncio.to_thread(
+                    store.diagnose_maintenance,
+                    session,
+                    "empty_inputs",
+                    next_at=now + timedelta(days=1),
+                )
+                continue
+            candidates.append(session)
         if not candidates:
             return
         by_user: dict[str, list[dict[str, Any]]] = {}
@@ -317,21 +380,6 @@ class MaintenanceService:
             try:
                 pending: list[dict[str, Any]] = []
                 for session in sessions:
-                    if session.get("consolidation_state") == "consolidating":
-                        try:
-                            completed = await asyncio.to_thread(
-                                self._consolidation.recover_session,
-                                session,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Recovery failed for session %s, continuing",
-                                session.get("session_id", ""),
-                            )
-                            continue
-                        if completed:
-                            continue
-
                     updated_at_str = session.get("updated_at", "")
                     if not updated_at_str or not session.get("memory_ids"):
                         continue
@@ -393,6 +441,14 @@ class MaintenanceService:
 
     async def _run_auto_fsck(self) -> None:
         """Run fsck for every user and auto-apply qualifying fixes."""
+        if self._fsck._memory_service is not None:
+            operations = self._fsck._memory_service.revisions.operations
+            diagnoses, self._operation_diagnostic_cursor = await asyncio.to_thread(
+                operations.diagnose_fsck_page, self._operation_diagnostic_cursor
+            )
+            if self._collector is not None:
+                for diagnosis in diagnoses:
+                    self._collector.record_maintenance_diagnosis(diagnosis)
         # list_user_ids() is a synchronous Qdrant scroll — run in thread pool
         # to avoid blocking the event loop.
         user_ids: list[str] = await asyncio.to_thread(self._fsck._vector.list_user_ids)
@@ -431,12 +487,12 @@ class MaintenanceService:
 
         # run_check() is synchronous and CPU/IO-bound (LLM calls via requests).
         # Run in a thread pool to avoid blocking the event loop.
-        # LOCAL-PATCH: raws included. incremental=True keeps the cost bounded —
-        # only memories changed since their checked_at stamp are re-examined,
-        # so a cycle pays for new raw notes, not the whole store.
-        await asyncio.to_thread(
-            self._fsck.run_check, check_id, include_raw=True, incremental=True
-        )
+        # LOCAL-PATCH: raws included (see _run_fsck_worker). incremental=True keeps
+        # the cost bounded — only memories changed since their checked_at stamp are
+        # re-examined, so a cycle pays for new raw notes, not the whole store.
+        # Upstream 1.15.1 route: go through the worker so fsck lifecycle telemetry
+        # is recorded even when this await is cancelled.
+        await asyncio.to_thread(self._run_fsck_worker, check_id)
 
         check = self._fsck.get_check(check_id)
         if check is None or check.status != "completed":
@@ -504,6 +560,26 @@ class MaintenanceService:
                     issues_found=issues_found,
                     fixes_applied=fixes_applied,
                     fixes_failed=fixes_failed,
+                )
+
+    def _run_fsck_worker(self, check_id: str) -> None:
+        """Observe the real worker lifetime, even if its await is cancelled."""
+        started = time.monotonic()
+        outcome = "failed"
+        if self._collector is not None:
+            self._collector.record_maintenance_lifecycle("fsck", "started")
+        try:
+            # LOCAL-PATCH: include_raw=True. The session/consolidation lifecycle
+            # writes raw notes that durable-only fsck never saw, so duplicate and
+            # garbled raws accumulated un-checked. incremental=True bounds the cost.
+            self._fsck.run_check(check_id, include_raw=True, incremental=True)
+            check = self._fsck.get_check(check_id)
+            if check is not None and check.status == "completed":
+                outcome = "completed"
+        finally:
+            if self._collector is not None:
+                self._collector.record_maintenance_lifecycle(
+                    "fsck", outcome, time.monotonic() - started
                 )
 
     # ── Helpers ──────────────────────────────────────────────────────

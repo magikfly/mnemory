@@ -93,7 +93,7 @@ Arbitrarily large messages are not guaranteed successful extraction.
 | `/api/memories/by-ids` | POST | Fetch memories by ID list (batch) |
 | `/api/memories/{id}` | PUT | Create a successor revision |
 | `/api/memories/{id}` | DELETE | Retract without erasing history |
-| `/api/memories/{id}/privacy` | DELETE | Explicitly erase a lineage and unreferenced artifacts |
+| `/api/memories/{id}/privacy` | DELETE | Best-effort physical lineage and unshared-artifact cleanup |
 | `/api/memories/{id}/history` | GET | Get immutable revisions and audit records |
 | `/api/memories/{id}/links` | GET | Get exact supersession and derivation links |
 | `/api/memories/{id}/artifacts` | POST | Save artifact |
@@ -105,8 +105,8 @@ Arbitrarily large messages are not guaranteed successful extraction.
 | `/api/categories` | GET | List categories |
 
 Artifact deletion removes the reference from the selected revision. Immutable
-history can retain the artifact bytes. Use lineage privacy erasure when the
-artifact content must be physically removed from all revisions.
+history can retain the artifact bytes. Lineage privacy erasure attempts physical
+cleanup; it does not guarantee permanent absence. See [deletion limits](deletion.md).
 
 ## Revision preconditions
 

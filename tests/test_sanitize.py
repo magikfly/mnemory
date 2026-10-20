@@ -210,7 +210,7 @@ class TestValidateCategoryName:
 
     def test_name_with_slashes(self):
         assert (
-            validate_category_name("domecek/k8s-manifests") == "domecek/k8s-manifests"
+            validate_category_name("demo/deployment-files") == "demo/deployment-files"
         )
 
     def test_name_with_dots(self):

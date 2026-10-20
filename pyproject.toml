@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnemory"
-version = "1.15.0"
+version = "1.15.1"
 description = "A self-hosted, two-tier memory system for AI agents and assistants"
 readme = "README.md"
 license = "Apache-2.0"
@@ -77,3 +77,6 @@ addopts = "-m 'not e2e'"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mnemory"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.gitea", "/.git", "/dist"]

@@ -482,9 +482,14 @@ def test_privacy_erase_claim_blocks_revision_and_is_retryable() -> None:
     assert service.operations.find_privacy_erase(MEMORY_ID) is None
 
 
-def test_privacy_erase_retries_after_artifact_failure() -> None:
+@pytest.mark.parametrize("retracted", [False, True])
+def test_privacy_erase_retries_after_artifact_failure(retracted) -> None:
     revisions = _service()
     _insert(revisions)
+    if retracted:
+        revisions.retract(
+            MEMORY_ID, user_id="user-1", owner_id="owner-1", session_agent_id=None
+        )
     memory = MemoryService.__new__(MemoryService)
     memory.revisions = revisions
     memory.vector = revisions._vector
@@ -514,6 +519,176 @@ def test_privacy_erase_retries_after_artifact_failure() -> None:
     assert result["status"] == "erased"
     assert revisions._read_point(MEMORY_ID) is None
     assert memory.artifact.delete_by_id.call_count == 2
+
+
+@pytest.mark.parametrize("old_id", [False, True])
+def test_privacy_erase_retracted_lineage_resolves_head_and_replays(old_id):
+    service = _service()
+    _insert(service, agent_id="parent:alpha")
+    auth = dict(user_id="user-1", owner_id="owner-1", session_agent_id="parent:alpha")
+    updated = service.revise(MEMORY_ID, changes={"data": "new"}, **auth)
+    head = updated["revision_id"]
+    service.retract(head, **auth)
+    predecessor_payload = dict(service._read_point(MEMORY_ID).payload)
+    target = MEMORY_ID if old_id else head
+    with pytest.raises(ValueError, match="Cannot access"):
+        service.prepare_privacy_erase(
+            target, **{**auth, "session_agent_id": "parent:beta"}
+        )
+    with pytest.raises(ValueError, match="Cannot access"):
+        service.prepare_privacy_erase(target, **{**auth, "owner_id": "other-owner"})
+    plan = service.prepare_privacy_erase(target, **auth)
+    assert set(plan["target_revision_ids"]) == {MEMORY_ID, head}
+    assert plan["artifact_ids"] == ["artifact-1"]
+    assert service._read_point(head).payload["transition_kind"] == "privacy_erase"
+    assert service._read_point(MEMORY_ID).payload == predecessor_payload
+    replay = service.prepare_privacy_erase(MEMORY_ID, **auth)
+    assert replay["operation_id"] == plan["operation_id"]
+    for mutation in (
+        lambda: service.revise(head, changes={"data": "late"}, **auth),
+        lambda: service.retract(head, **auth),
+    ):
+        with pytest.raises(RevisionConflictError):
+            mutation()
+    assert service.finalize_privacy_erase(replay)["status"] == "erased"
+    assert service._read_point(MEMORY_ID) is None
+    assert service._read_point(head) is None
+    assert service.finalize_privacy_erase(plan)["status"] == "erased"
+    # Completion removes audit data too; a new request is deliberately not found.
+    with pytest.raises(ValueError, match="not found"):
+        service.prepare_privacy_erase(target, **auth)
+
+
+@pytest.mark.parametrize(
+    "racing_payload",
+    [
+        {"revision_state": "retracted"},
+        {"revision": 2},
+        {"artifact_revision": 1},
+        {"transition_token": "competing-claim", "transition_kind": "retract"},
+    ],
+)
+def test_privacy_erase_rejects_changes_between_read_and_claim(
+    monkeypatch, racing_payload
+):
+    service = _service()
+    _insert(service)
+    claim = service._claim
+
+    def race(**kwargs):
+        service._client.set_payload(
+            collection_name="memories",
+            points=[MEMORY_ID],
+            payload=racing_payload,
+            wait=True,
+        )
+        return claim(**kwargs)
+
+    monkeypatch.setattr(service, "_claim", race)
+    with pytest.raises(RevisionConflictError):
+        service.prepare_privacy_erase(
+            MEMORY_ID, user_id="user-1", owner_id="owner-1", session_agent_id=None
+        )
+    point = service._read_point(MEMORY_ID)
+    assert point is not None
+    assert point.payload.get("transition_kind") != "privacy_erase"
+
+
+def test_erase_ignores_aborted_successor_but_removes_it():
+    service = _service()
+    _insert(service)
+    auth = dict(user_id="user-1", owner_id="owner-1", session_agent_id=None)
+    service.retract(MEMORY_ID, **auth)
+    aborted_id = "88888888-8888-4888-8888-888888888888"
+    aborted = dict(service._read_point(MEMORY_ID).payload)
+    aborted.update(revision=2, revision_state="aborted", transition_token=None)
+    service._client.upsert(
+        collection_name="memories",
+        points=[PointStruct(id=aborted_id, vector=[1.0, 0.0], payload=aborted)],
+        wait=True,
+    )
+    plan = service.prepare_privacy_erase(MEMORY_ID, **auth)
+    assert set(plan["target_revision_ids"]) == {MEMORY_ID, aborted_id}
+    assert service._read_point(MEMORY_ID).payload["transition_kind"] == "privacy_erase"
+    assert service.finalize_privacy_erase(plan)["status"] == "erased"
+    assert service._read_point(aborted_id) is None
+
+
+def test_stale_retraction_does_not_recreate_erased_journal():
+    service = _service()
+    _insert(service)
+    auth = dict(user_id="user-1", owner_id="owner-1", session_agent_id=None)
+    service.retract(MEMORY_ID, **auth)
+    cached = service._read_point(MEMORY_ID)
+    token = cached.payload["transition_token"]
+    service.finalize_privacy_erase(service.prepare_privacy_erase(MEMORY_ID, **auth))
+    with pytest.raises(RevisionConflictError, match="existing memory and journal"):
+        service._recover_claimed(cached, cached.payload)
+    assert service.operations.get(token) is None
+
+
+def test_online_erase_preserves_shared_bytes_sequentially(tmp_path):
+    from mnemory.config import ArtifactConfig
+    from mnemory.storage.artifact import ArtifactStore
+
+    service = _service()
+    _insert(service)
+    store = ArtifactStore(
+        ArtifactConfig(
+            backend="filesystem", filesystem_path=str(tmp_path / "artifacts")
+        )
+    )
+    meta = store.save(
+        user_id="user-1", content="Synthetic shared bytes", filename="data.txt"
+    )
+    service._client.set_payload(
+        collection_name="memories",
+        points=[MEMORY_ID],
+        payload={"artifacts": [meta.to_dict()]},
+        wait=True,
+    )
+    sibling = "77777777-7777-4777-8777-777777777777"
+    payload = dict(service._read_point(MEMORY_ID).payload)
+    payload["lineage_id"] = sibling
+    service._client.upsert(
+        collection_name="memories",
+        points=[PointStruct(id=sibling, vector=[1.0, 0.0], payload=payload)],
+        wait=True,
+    )
+    memory = MemoryService.__new__(MemoryService)
+    memory.revisions, memory.vector, memory.artifact = service, service._vector, store
+    from mnemory.storage.vector import VectorStore
+
+    memory.vector.artifact_has_references_outside = lambda **kwargs: (
+        VectorStore.artifact_has_references_outside(memory.vector, **kwargs)
+    )
+    memory._get_user_lock = lambda key: threading.Lock()
+    memory._core_cache, memory._category_cache = MagicMock(), MagicMock()
+    memory.privacy_erase_memory(MEMORY_ID, user_id="user-1", owner_id="owner-1")
+    assert (
+        store._backend.load("user-1", meta.artifact_id, "data.txt")
+        == b"Synthetic shared bytes"
+    )
+    memory.privacy_erase_memory(sibling, user_id="user-1", owner_id="owner-1")
+    with pytest.raises(FileNotFoundError):
+        store._backend.load("user-1", meta.artifact_id, "data.txt")
+
+
+def test_ordinary_claim_still_rejects_retracted_state():
+    service = _service()
+    _insert(service)
+    service.retract(
+        MEMORY_ID, user_id="user-1", owner_id="owner-1", session_agent_id=None
+    )
+    payload = service._read_point(MEMORY_ID).payload
+    with pytest.raises(RevisionConflictError):
+        service._claim(
+            point_id=MEMORY_ID,
+            payload=payload,
+            token="ordinary-update",
+            kind="revise",
+            successor_id=None,
+        )
 
 
 def test_privacy_recovery_checks_agent_scope_after_points_are_deleted() -> None:

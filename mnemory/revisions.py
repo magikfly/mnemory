@@ -2023,6 +2023,102 @@ class RevisionOperationStore:
         )
         return dict(points[0].payload or {}) if points else None
 
+    def get_fsck_issue(self, check_id: str, issue_id: str) -> dict[str, Any] | None:
+        """Look up immutable identity before consulting mutable target state."""
+        points, _ = self._client.scroll(
+            collection_name=OPERATIONS_COLLECTION,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="operation_kind", match=MatchValue(value="fsck")
+                    ),
+                    FieldCondition(
+                        key="fsck_check_id", match=MatchValue(value=check_id)
+                    ),
+                    FieldCondition(
+                        key="fsck_issue_id", match=MatchValue(value=issue_id)
+                    ),
+                ]
+            ),
+            limit=2,
+            with_payload=True,
+            with_vectors=False,
+        )
+        if len(points) > 1:
+            raise ValueError(
+                "Ambiguous fsck issue journal identity; operator diagnosis required"
+            )
+        return dict(points[0].payload or {}) if points else None
+
+    def diagnose_fsck_page(self, offset: Any = None) -> tuple[list[str], Any]:
+        """Bounded content-free sweep; old rows stay visible without replay."""
+        from mnemory.maintenance_state import diagnose_operation
+
+        points, cursor = self._client.scroll(
+            collection_name=OPERATIONS_COLLECTION,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="operation_kind", match=MatchValue(value="fsck")
+                    ),
+                    FieldCondition(
+                        key="status",
+                        match=MatchAny(any=["planned", "applying", "failed"]),
+                    ),
+                ]
+            ),
+            offset=offset,
+            limit=16,
+            with_vectors=False,
+            with_payload=[
+                "operation_id",
+                "operation_token",
+                "status",
+                "maintenance_protocol",
+                "recovery_token",
+                "lease_expires_at",
+                "recovery_attempt_count",
+            ],
+        )
+        diagnoses = []
+        for point in points:
+            record = dict(point.payload or {})
+            diagnosis = diagnose_operation(record, datetime.now(timezone.utc))
+            if record.get("operation_token") and record.get("operation_id"):
+                self.diagnose_fsck(record, diagnosis)
+            diagnoses.append(diagnosis)
+        return diagnoses, cursor
+
+    def diagnose_fsck(self, record: dict[str, Any], diagnosis: str) -> None:
+        """Add diagnosis to the observed journal, never alter status or identity."""
+        from mnemory.maintenance_state import DIAGNOSES
+
+        if diagnosis not in DIAGNOSES:
+            raise ValueError("Unknown maintenance diagnosis")
+        self._client.set_payload(
+            collection_name=OPERATIONS_COLLECTION,
+            payload={
+                "maintenance_diagnosis": diagnosis,
+                "maintenance_action": "wait_for_owner"
+                if diagnosis == "active_lease"
+                else "operator_diagnosis",
+                "maintenance_diagnosed_at": datetime.now(timezone.utc).isoformat(),
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[record["operation_id"]]),
+                    FieldCondition(
+                        key="status", match=MatchValue(value=record["status"])
+                    ),
+                    FieldCondition(
+                        key="operation_token",
+                        match=MatchValue(value=record["operation_token"]),
+                    ),
+                ]
+            ),
+            wait=True,
+        )
+
     def list_fsck(
         self,
         check_id: str,
@@ -2260,7 +2356,11 @@ class RevisionService:
                 current_revision=int(payload.get("revision", 1)),
             )
         if kind == "retract":
-            operation = self.operations.get(token) or {}
+            operation = self.operations.get(token)
+            if not operation or self._read_point(point_id) is None:
+                raise RevisionConflictError(
+                    "Retraction recovery requires its existing memory and journal"
+                )
             operation_id = operation.get("operation_id") or _operation_point_id(token)
             key_hash = operation.get("idempotency_key_hash")
             fingerprint = operation.get("request_fingerprint")
@@ -2821,17 +2921,37 @@ class RevisionService:
         expected_child_token: str | None = None,
         transition_operation_token: str | None = None,
     ) -> dict[str, Any]:
+        claim_state = ACTIVE_REVISION_STATE
+        if kind == "privacy_erase":
+            claim_state = payload.get("revision_state", ACTIVE_REVISION_STATE)
+            if claim_state not in {ACTIVE_REVISION_STATE, "retracted"}:
+                self._raise_stale(payload, point_id)
+        token_condition: Any = IsEmptyCondition(
+            is_empty=PayloadField(key="transition_token")
+        )
+        if kind == "privacy_erase" and claim_state == "retracted":
+            # Retraction retains its completed transition token as a tombstone.
+            # Replace that exact fence atomically, never clear it first.
+            previous_token = payload.get("transition_token")
+            if previous_token:
+                previous = self.operations.get(previous_token) or {}
+                if (
+                    payload.get("transition_kind") != "retract"
+                    or previous.get("status") != "committed"
+                ):
+                    self._raise_stale(payload, point_id)
+                token_condition = FieldCondition(
+                    key="transition_token", match=MatchValue(value=previous_token)
+                )
         conditions: list[Any] = [
             HasIdCondition(has_id=[point_id]),
             FieldCondition(key="user_id", match=MatchValue(value=payload["user_id"])),
             FieldCondition(key="owner_id", match=MatchValue(value=payload["owner_id"])),
-            FieldCondition(
-                key="revision_state", match=MatchValue(value=ACTIVE_REVISION_STATE)
-            ),
+            FieldCondition(key="revision_state", match=MatchValue(value=claim_state)),
             FieldCondition(
                 key="revision", match=MatchValue(value=int(payload["revision"]))
             ),
-            IsEmptyCondition(is_empty=PayloadField(key="transition_token")),
+            token_condition,
         ]
         if payload.get("agent_id"):
             conditions.append(
@@ -4064,8 +4184,33 @@ class RevisionService:
         session_agent_id: str | None,
     ) -> dict[str, Any]:
         """Claim a lineage and persist a resumable privacy-erasure plan."""
-        try:
+
+        def resolve_head() -> tuple[Any, dict[str, Any], list[Any]]:
             current, payload, points = self._resolve(memory_id)
+            # Ordinary mutations reject terminal revisions. Erasure may target a
+            # retracted head through an older ID, but must fence the latest head.
+            heads = [
+                point
+                for point in points
+                if self._payload(point).get("revision_state", ACTIVE_REVISION_STATE)
+                in {ACTIVE_REVISION_STATE, "retracted"}
+            ]
+            if not heads:
+                self._raise_stale(payload, str(current.id))
+            current = max(
+                heads, key=lambda point: int(self._payload(point).get("revision", 1))
+            )
+            payload = self._materialize_legacy(current)
+            self._authorize(
+                payload,
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=session_agent_id,
+            )
+            return current, payload, points
+
+        try:
+            current, payload, points = resolve_head()
         except ValueError:
             operation = self.operations.find_privacy_erase(memory_id)
             if operation and self._is_authorized(
@@ -4087,8 +4232,13 @@ class RevisionService:
                 operation = self.operations.get(payload["transition_token"])
                 if operation:
                     return operation
-            self._recover_claimed(current, payload)
-            current, payload, points = self._resolve(memory_id)
+            if not (
+                payload.get("revision_state") == "retracted"
+                and payload.get("transition_kind") == "retract"
+            ):
+                # Do not replay another mutation while establishing an erase
+                # fence; that mutation must finish/recover under its own owner.
+                self._raise_stale(payload, str(current.id))
         revision_ids = [str(point.id) for point in points]
         artifact_ids = list(
             dict.fromkeys(
@@ -4120,6 +4270,7 @@ class RevisionService:
                 token=token,
                 kind="privacy_erase",
                 successor_id=None,
+                expected_artifact_revision=int(payload.get("artifact_revision", 0)),
             )
         except Exception:
             self.operations.write(token, {**operation, "status": "conflict"})

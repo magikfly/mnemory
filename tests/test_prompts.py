@@ -240,27 +240,29 @@ class TestCorrectMemoryType:
             == "context"
         )
 
-    # ── No correction (real facts stay as facts) ─────────────────────
+    # ── No correction (fictional biographies still represent facts) ──
 
     def test_biographical_name_stays_fact(self):
-        assert _correct_memory_type("fact", "User's name is Elena") == "fact"
+        assert _correct_memory_type("fact", "User's name is Morgan Example") == "fact"
 
     def test_biographical_location_stays_fact(self):
-        assert _correct_memory_type("fact", "User lives in Prague") == "fact"
+        assert _correct_memory_type("fact", "User lives in Example Town") == "fact"
 
     def test_biographical_job_stays_fact(self):
         assert (
-            _correct_memory_type("fact", "User works at Google as a software engineer")
+            _correct_memory_type("fact", "User works at Example Books as an editor")
             == "fact"
         )
 
     def test_relationship_stays_fact(self):
-        assert _correct_memory_type("fact", "User's partner is Romana") == "fact"
+        assert (
+            _correct_memory_type("fact", "User's sibling is Taylor Example") == "fact"
+        )
 
     def test_stable_trait_stays_fact(self):
         assert (
             _correct_memory_type(
-                "fact", "User has over 14 years of experience in DevOps"
+                "fact", "User has five years of experience in bookbinding"
             )
             == "fact"
         )

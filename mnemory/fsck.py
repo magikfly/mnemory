@@ -754,6 +754,7 @@ class FsckService:
                 filters=filters,
                 exclude_layers=None if include_raw else ["raw"],
                 exclude_expired=True,
+                include_vectors=False,
             )
             if check.agent_id:
                 shared_memories = self._vector.scroll_with_vectors(
@@ -764,6 +765,7 @@ class FsckService:
                     filters=filters,
                     exclude_layers=None if include_raw else ["raw"],
                     exclude_expired=True,
+                    include_vectors=False,
                 )
                 # Merge and deduplicate by memory ID
                 seen_ids = {m["id"] for m in memories}
@@ -1262,7 +1264,45 @@ class FsckService:
             plan: list[dict[str, Any]] = []
             try:
                 if self._memory_service is not None:
+                    from mnemory.maintenance_state import diagnose_operation
                     from mnemory.revisions import canonical_fingerprint
+
+                    operations = self._memory_service.revisions.operations
+                    saved_operation = operations.get_fsck_issue(
+                        check.check_id, issue.issue_id
+                    )
+                    if isinstance(saved_operation, dict):
+                        # A changed/missing target must never mint another journal.
+                        if saved_operation.get("status") in {
+                            "committed",
+                            "skipped",
+                            "superseded",
+                        }:
+                            skipped += 1
+                            details.append(
+                                {
+                                    "issue_id": issue.issue_id,
+                                    "status": "skipped",
+                                    "actions_executed": 0,
+                                    "actions_skipped": len(issue.actions),
+                                }
+                            )
+                            continue
+                        diagnosis = diagnose_operation(
+                            saved_operation, datetime.now(timezone.utc)
+                        )
+                        operations.diagnose_fsck(saved_operation, diagnosis)
+                        failed += 1
+                        details.append(
+                            {
+                                "issue_id": issue.issue_id,
+                                "status": "blocked",
+                                "actions_executed": 0,
+                                "actions_skipped": 0,
+                                "diagnosis": diagnosis,
+                            }
+                        )
+                        continue
 
                     sources = [
                         self._vector.get_by_id(memory.id)
@@ -1447,6 +1487,7 @@ class FsckService:
                             {
                                 "status": "planned",
                                 "operation_kind": "fsck",
+                                "maintenance_protocol": "mnemory.maintenance.v1",
                                 "actor_kind": "fsck",
                                 "user_id": check.user_id,
                                 "owner_id": audit_owner_id,
@@ -1558,7 +1599,7 @@ class FsckService:
                         operation_token,
                         claimant=claimant,
                         lease_seconds=lease_seconds,
-                        allowed_statuses=("planned", "failed", "applying"),
+                        allowed_statuses=("planned",),
                     ):
                         skipped += 1
                         details.append(
@@ -2350,14 +2391,26 @@ class FsckService:
         corpus_by_id = full_corpus_by_id if full_corpus_by_id is not None else mem_by_id
         total = len(memories)
         neighbor_limit = max(_DUPLICATE_NEIGHBORS, len(corpus_by_id))
+        # Remote Qdrant may use a strict float32 threshold. Retrieve one small
+        # margin below it and keep the canonical inclusive Python check below,
+        # so exact 0.75 ties survive both remote and embedded implementations.
+        query_threshold = _DUPLICATE_SIMILARITY_THRESHOLD - 1e-7
 
         # ── Sub-phase 1a: Build similarity graph ────────────────────
         check.progress.phase = "duplicate_search"
         check.progress.processed = 0
         uf = _UnionFind()
 
+        vectors: dict[str, list[float]] = {}
         for idx, mem in enumerate(memories):
+            if idx % 256 == 0:
+                vectors.clear()
+                vectors = self._vector.get_dense_vectors(
+                    [m["id"] for m in memories[idx : idx + 256] if "vector" not in m]
+                )
             vector = mem.get("vector")
+            if "vector" not in mem:
+                vector = vectors.get(mem["id"])
             if vector is not None:
                 # Search for similar memories using stored vector.
                 # When agent_id is set, also search shared memories
@@ -2368,6 +2421,7 @@ class FsckService:
                     agent_id=check.agent_id,
                     limit=neighbor_limit,
                     exclude_ids=[mem["id"]],
+                    score_threshold=query_threshold,
                 )
                 if check.agent_id:
                     shared_similar = self._vector.search_by_vector_ids(
@@ -2377,6 +2431,7 @@ class FsckService:
                         shared_only=True,
                         limit=neighbor_limit,
                         exclude_ids=[mem["id"]],
+                        score_threshold=query_threshold,
                     )
                     # Merge, deduplicate by ID, keep highest score
                     seen = {s["id"] for s in similar}

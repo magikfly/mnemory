@@ -1588,6 +1588,7 @@ class VectorStore:
         filters: dict | None = None,
         exclude_layers: list[str] | None = None,
         exclude_expired: bool = False,
+        include_vectors: bool = True,
     ) -> list[dict[str, Any]]:
         """Scroll ALL memories for a user, including stored embedding vectors.
 
@@ -1607,6 +1608,7 @@ class VectorStore:
             exclude_layers: Memory layers to exclude (e.g. ["raw"]).
             exclude_expired: If True, exclude memories whose expires_at is
                 in the past (non-pinned). Best-effort Qdrant-side filter.
+            include_vectors: If False, collect eligibility metadata only.
 
         Returns list of memory dicts with an extra "vector" key containing
         the stored embedding.
@@ -1680,17 +1682,18 @@ class VectorStore:
                 limit=_PAGE_SIZE,
                 offset=offset,
                 with_payload=True,
-                with_vectors=True,
+                with_vectors=[""] if include_vectors else False,
             )
             for p in points:
                 mem = self._point_to_memory(p)
                 # Normalize vector format: extract dense vector from named
                 # vectors dict (hybrid mode) or use as-is (legacy unnamed).
-                raw_vector = p.vector
-                if isinstance(raw_vector, dict):
-                    mem["vector"] = raw_vector.get("", raw_vector.get(None))
-                else:
-                    mem["vector"] = raw_vector
+                if include_vectors:
+                    raw_vector = p.vector
+                    if isinstance(raw_vector, dict):
+                        mem["vector"] = raw_vector.get("", raw_vector.get(None))
+                    else:
+                        mem["vector"] = raw_vector
                 results.append(mem)
 
             if next_offset is None:
@@ -1698,6 +1701,24 @@ class VectorStore:
             offset = next_offset
 
         return _collapse_active_revisions(results)
+
+    def get_dense_vectors(self, memory_ids: list[str]) -> dict[str, list[float]]:
+        """Retrieve one bounded batch of dense vectors, without payloads."""
+        if not memory_ids:
+            return {}
+        points = self._client.retrieve(
+            collection_name=self.collection_name,
+            ids=memory_ids,
+            with_payload=False,
+            with_vectors=[""],
+        )
+        return {
+            str(point.id): (
+                point.vector.get("") if isinstance(point.vector, dict) else point.vector
+            )
+            for point in points
+            if point.vector is not None
+        }
 
     def scroll_gc_metadata(self, *, user_id: str) -> list[dict[str, Any]]:
         """Scroll lightweight metadata used by superseded raw-memory GC."""
@@ -1802,6 +1823,7 @@ class VectorStore:
         shared_only: bool = False,
         limit: int = 5,
         exclude_ids: list[str] | None = None,
+        score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """Search for similar memories by vector, returning only IDs and scores.
 
@@ -1843,6 +1865,7 @@ class VectorStore:
             query_filter=Filter(must=must_conditions, must_not=must_not or None),
             limit=limit,
             with_payload=False,
+            score_threshold=score_threshold,
         )
 
         return [{"id": str(point.id), "score": point.score} for point in result.points]
@@ -2151,9 +2174,9 @@ def _session_point_id(
 ) -> str:
     """Convert a session ID string to a deterministic UUID for Qdrant.
 
-    Qdrant point IDs must be UUIDs or unsigned integers. Session IDs
-    (e.g., ``ses_2e3418b72ffe5gG7rHDeU5aOkv``) are neither, so we
-    derive a stable UUID5 from the session ID string.
+    Qdrant point IDs must be UUIDs or unsigned integers. Session IDs use
+    a textual prefix and an opaque suffix rather than either format, so
+    we derive a stable UUID5 from the session ID string.
     """
     import uuid as _uuid
 
@@ -2183,6 +2206,131 @@ class SessionSummaryStore:
 
     def __init__(self, client: QdrantClient):
         self._client = client
+        self._maintenance_indexes_ready = False
+
+    def maintenance_page(
+        self,
+        *,
+        cutoff: datetime,
+        now: datetime,
+        offset: Any = None,
+        diagnostic: bool = False,
+        limit: int = 32,
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """One keyset page; diagnostic sweep also sees legacy/ineligible rows.
+
+        No plans, memory IDs, summaries, or vectors are loaded by this scan.
+        The caller retains separate cursors for due work and the diagnostic sweep.
+        """
+        if not self._maintenance_indexes_ready:
+            for field, schema in {
+                "consolidation_state": "keyword",
+                "updated_at": "datetime",
+                "maintenance_next_at": "datetime",
+                "retry_operation_token": "keyword",
+                "consolidation_token": "keyword",
+            }.items():
+                self._client.create_payload_index(
+                    self.COLLECTION, field, field_schema=schema, wait=True
+                )
+            self._maintenance_indexes_ready = True
+        conditions = [
+            FieldCondition(
+                key="consolidation_state",
+                # LOCAL-PATCH: "failed" stays eligible. Upstream 1.15.1 pages only
+                # "idle" as due work, but consolidation still stamps "failed" (5 sites
+                # in consolidation.py) and update_consolidation_state never re-arms it
+                # and never stamps maintenance_next_at — so under the new paged scan a
+                # failed session goes permanently invisible, which is the exact silent
+                # consolidation stall this fork fixed on 2026-10-05 (see DEPLOYED.md §1).
+                # claim_consolidation already accepts ["idle","failed"], so offering
+                # the row is all that is missing. Cadence is unchanged from production.
+                match=MatchAny(
+                    any=(
+                        ["idle", "consolidating", "failed"]
+                        if diagnostic
+                        else ["idle", "failed"]
+                    )
+                ),
+            ),
+        ]
+        if not diagnostic:
+            conditions.extend(
+                [
+                    FieldCondition(key="updated_at", range=DatetimeRange(lt=cutoff)),
+                    IsEmptyCondition(
+                        is_empty=PayloadField(key="retry_operation_token")
+                    ),
+                    IsEmptyCondition(is_empty=PayloadField(key="consolidation_token")),
+                    Filter(
+                        should=[
+                            IsEmptyCondition(
+                                is_empty=PayloadField(key="maintenance_next_at")
+                            ),
+                            FieldCondition(
+                                key="maintenance_next_at", range=DatetimeRange(lte=now)
+                            ),
+                        ]
+                    ),
+                ]
+            )
+        points, next_offset = self._client.scroll(
+            collection_name=self.COLLECTION,
+            scroll_filter=Filter(must=conditions),
+            limit=max(1, min(limit, 64)),
+            offset=offset,
+            with_vectors=False,
+            with_payload=[
+                "session_id",
+                "user_id",
+                "owner_id",
+                "agent_id",
+                "updated_at",
+                "consolidation_state",
+                "session_revision",
+                "attempt_count",
+                "consolidation_token",
+                "retry_operation_token",
+            ],
+        )
+        return [
+            {**(point.payload or {}), "_point_id": str(point.id)} for point in points
+        ], next_offset
+
+    def diagnose_maintenance(
+        self,
+        record: dict[str, Any],
+        diagnosis: str,
+        *,
+        next_at: datetime | None = None,
+    ) -> None:
+        """Annotate the observed generation only; never change lifecycle state."""
+        from mnemory.maintenance_state import DIAGNOSES
+
+        if diagnosis not in DIAGNOSES:
+            raise ValueError("Unknown maintenance diagnosis")
+        conditions: list[Any] = [HasIdCondition(has_id=[record["_point_id"]])]
+        for key in ("session_revision", "updated_at", "consolidation_state"):
+            value = record.get(key)
+            conditions.append(
+                IsEmptyCondition(is_empty=PayloadField(key=key))
+                if value is None
+                else FieldCondition(key=key, match=MatchValue(value=value))
+            )
+        self._client.set_payload(
+            collection_name=self.COLLECTION,
+            payload={
+                "maintenance_diagnosis": diagnosis,
+                "maintenance_action": "operator_diagnosis"
+                if diagnosis != "empty_inputs"
+                else "wait_for_inputs",
+                "maintenance_next_at": next_at.isoformat() if next_at else None,
+                "maintenance_diagnosed_at": datetime.now(timezone.utc).isoformat(),
+            },
+            points=Filter(must=conditions),
+            wait=True,
+            ordering=WriteOrdering.STRONG,
+        )
 
     def _resolve_point_id(self, session_id: str) -> str:
         """Resolve an unscoped internal session lookup when it is unique."""
@@ -2301,6 +2449,8 @@ class SessionSummaryStore:
                 "consolidation_state": consolidation_state,
                 "attempt_count": existing.get("attempt_count", 0),
                 "session_revision": int(existing.get("session_revision", 1)) + 1,
+                "maintenance_next_at": None,
+                "maintenance_diagnosis": None,
                 "session_update_token": update_token,
             }
             if agent_id:
@@ -2668,6 +2818,7 @@ class SessionSummaryStore:
             "consolidation_state",
             "consolidated_memory_ids",
             "session_revision",
+            "attempt_count",
             "consolidation_token",
             "consolidation_plan",
             "session_update_token",

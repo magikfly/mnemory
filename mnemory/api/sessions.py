@@ -156,7 +156,8 @@ async def list_sessions(
     service = _get_service()
 
     try:
-        result = service._session_summary_store.list_for_user(
+        result = await asyncio.to_thread(
+            service._session_summary_store.list_for_user,
             ctx.user_id,
             owner_id=ctx.owner_id,
             session_agent_id=ctx.agent_id,

@@ -21,7 +21,7 @@ mnemory exposes 17 tools via the [Model Context Protocol](https://modelcontextpr
 | `get_recent_memories` | Get recent activity from the last N days with scope filter (user/agent/all) |
 | `list_memories` | List all/filtered memories (supports `labels` and `memory_layer` filters) |
 | `update_memory` | Create an immutable successor revision. Supports `expected_revision` and `idempotency_key`. |
-| `delete_memory` | Retract by default. Set `privacy_erase=true` only to erase the lineage and artifacts. |
+| `delete_memory` | Retract by default. `privacy_erase=true` requests best-effort lineage/unshared-artifact cleanup; see [limits](deletion.md). |
 | `delete_all_memories` | Delete all memories in scope |
 | `list_categories` | List categories with counts for discoverability |
 

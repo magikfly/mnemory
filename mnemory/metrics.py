@@ -224,12 +224,30 @@ class MetricsCollector:
         )
         self._fsck_operations_nonterminal = Gauge(
             "mnemory_fsck_operations_nonterminal",
-            "Current nonterminal fsck operation count",
+            "Fsck planned/applying/failed rows; not a recoverable job count",
+            registry=self._registry,
+        )
+        self._maintenance_lifecycle = Counter(
+            "mnemory_maintenance_lifecycle_total",
+            "Actual synchronous maintenance worker lifecycle (not await lifecycle)",
+            ["kind", "outcome"],
+            registry=self._registry,
+        )
+        self._maintenance_duration = Histogram(
+            "mnemory_maintenance_worker_duration_seconds",
+            "Elapsed synchronous maintenance worker time",
+            ["kind"],
+            registry=self._registry,
+        )
+        self._maintenance_diagnoses = Counter(
+            "mnemory_maintenance_diagnoses_total",
+            "Bounded maintenance observations, not distinct jobs or replay permission",
+            ["diagnosis"],
             registry=self._registry,
         )
         self._fsck_operations_stranded = Gauge(
             "mnemory_fsck_operations_stranded",
-            "Current stranded fsck operations by bounded age bucket",
+            "Aged fsck planned/applying/failed rows; age does not prove orphanhood",
             ["age_bucket"],
             registry=self._registry,
         )
@@ -271,7 +289,7 @@ class MetricsCollector:
         )
         self._failed_sessions_eligible = Gauge(
             "mnemory_failed_sessions_eligible",
-            "Current legacy failed sessions eligible for bounded retry",
+            "Preliminary legacy failed-session candidates; not an automatic retry queue",
             registry=self._registry,
         )
 
@@ -545,6 +563,28 @@ class MetricsCollector:
         if outcome not in {"committed", "skipped", "failed", "superseded"}:
             outcome = "failed"
         self._fsck_operation_outcomes.labels(outcome=outcome).inc()
+
+    def record_maintenance_lifecycle(
+        self, kind: str, outcome: str, duration: float | None = None
+    ) -> None:
+        """Record only fixed-vocabulary worker events without identity labels."""
+        if kind not in {"fsck", "consolidation"} or outcome not in {
+            "started",
+            "completed",
+            "failed",
+        }:
+            raise ValueError("Unknown maintenance event")
+        self._maintenance_lifecycle.labels(kind=kind, outcome=outcome).inc()
+        if duration is not None:
+            self._maintenance_duration.labels(kind=kind).observe(duration)
+
+    def record_maintenance_diagnosis(self, diagnosis: str) -> None:
+        """Count observations; repeated observations are not distinct operations."""
+        from mnemory.maintenance_state import DIAGNOSES
+
+        if diagnosis not in DIAGNOSES:
+            raise ValueError("Unknown maintenance diagnosis")
+        self._maintenance_diagnoses.labels(diagnosis=diagnosis).inc()
 
     def record_fsck_recovery(self, outcome: str) -> None:
         """Record one bounded fsck recovery outcome."""
@@ -990,6 +1030,23 @@ class MetricsCollector:
         """
         client = self._vector_store._client
         collection = self._vector_store.collection_name
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            IsEmptyCondition,
+            MatchAny,
+            MatchValue,
+            PayloadField,
+        )
+
+        # IsEmpty also admits explicit null/empty values. Keep the Python guard
+        # below to preserve the legacy missing-field-only default exactly.
+        active_filter = Filter(
+            should=[
+                FieldCondition(key="revision_state", match=MatchValue(value="active")),
+                IsEmptyCondition(is_empty=PayloadField(key="revision_state")),
+            ]
+        )
 
         # Aggregation accumulators
         # (user_id, agent_id, memory_type, role) -> count
@@ -1022,7 +1079,7 @@ class MetricsCollector:
         while True:
             points, next_offset = client.scroll(
                 collection_name=collection,
-                scroll_filter=None,
+                scroll_filter=active_filter,
                 limit=batch_size,
                 offset=offset,
                 with_payload=payload_fields,
@@ -1074,8 +1131,6 @@ class MetricsCollector:
                 break
             offset = next_offset
 
-        from qdrant_client.models import FieldCondition, Filter, MatchValue
-
         nonterminal = 0
         stranded = defaultdict(int)
         now = datetime.now(timezone.utc)
@@ -1090,7 +1145,11 @@ class MetricsCollector:
                         must=[
                             FieldCondition(
                                 key="operation_kind", match=MatchValue(value="fsck")
-                            )
+                            ),
+                            FieldCondition(
+                                key="status",
+                                match=MatchAny(any=["planned", "applying", "failed"]),
+                            ),
                         ]
                     ),
                     limit=512,

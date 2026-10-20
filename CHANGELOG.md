@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.15.1] — 2026-10-19
+
+### Fixed
+
+- Allow explicit online erasure of retracted lineages through current or older
+  revision IDs while preserving authorization and ordinary mutation claims.
+- Report partial object-storage cleanup failures instead of returning success.
+- Refuse stale retraction recovery when its memory or audit journal is absent.
+
+### Documentation
+
+- Clarify that online privacy erasure is best effort, not transactional or
+  verified permanent erasure. Concurrent jobs/recovery, derived session content,
+  backups and external logs can retain or recreate information. See
+  [deletion limits](docs/deletion.md). Public interfaces remain compatible.
+- Reconstruct illustrative examples and make qualification notes portable.
+
 ## [1.15.0] — 2026-10-04
 
 ### Added

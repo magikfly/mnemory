@@ -28,8 +28,8 @@ class TestValidateCategories:
         assert validate_categories(["project:myapp"]) == ["project:myapp"]
 
     def test_project_nested_subcategory(self):
-        result = validate_categories(["project:domecek/k8s-manifests"])
-        assert result == ["project:domecek/k8s-manifests"]
+        result = validate_categories(["project:demo/deployment-files"])
+        assert result == ["project:demo/deployment-files"]
 
     def test_case_insensitive(self):
         assert validate_categories(["Personal"]) == ["personal"]

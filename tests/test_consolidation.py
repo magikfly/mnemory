@@ -53,6 +53,7 @@ class TestGlobalConsolidationCandidateScan:
             "consolidation_state",
             "consolidated_memory_ids",
             "session_revision",
+            "attempt_count",
             "consolidation_token",
             "consolidation_plan",
             "session_update_token",
@@ -1316,7 +1317,7 @@ class TestConsolidationPromptWithPrevious:
         from mnemory.prompts import build_consolidation_prompt
 
         messages, _ = build_consolidation_prompt(
-            summary="User recalled a prior pruning plan for the mirobalan tree.",
+            summary="User recalled a prior plan to oil a wooden chair.",
             role="user",
             raw_memories=[],
         )
@@ -1363,12 +1364,12 @@ class TestConsolidationAlwaysRunsBothPasses:
         service = _make_service()
         service._config.memory.consolidation_batch_size = 100
 
-        # Mock LLM to return a user decision extracted from summary
+        # Fictional maintenance decision extracted from a summary.
         service._llm.generate.return_value = json.dumps(
             {
                 "memories": [
                     {
-                        "text": "User decided to prune the maple gently",
+                        "text": "User decided to oil the wooden chair sparingly",
                         "memory_type": "episodic",
                         "categories": ["home"],
                         "importance": "normal",
@@ -1383,7 +1384,7 @@ class TestConsolidationAlwaysRunsBothPasses:
             session_id="ses-1",
             raw_memories=[],  # No user raw memories
             role="user",
-            summary="User decided to prune the maple more gently. Assistant recommended a conservative pruning strategy.",
+            summary="User decided to oil the wooden chair sparingly. Assistant recommended a thin protective coat.",
             artifact_ids=set(),
             previous_consolidated=[],
             session_date="2026-03-24",
@@ -1392,7 +1393,7 @@ class TestConsolidationAlwaysRunsBothPasses:
         # LLM should have been called (summary-only extraction)
         assert service._llm.generate.called
         assert len(facts) == 1
-        assert facts[0]["text"] == "User decided to prune the maple gently"
+        assert facts[0]["text"] == "User decided to oil the wooden chair sparingly"
         assert facts[0]["role"] == "user"
 
     def test_output_resolves_only_its_declared_source_aliases(self):
@@ -1452,7 +1453,7 @@ class TestConsolidationAlwaysRunsBothPasses:
             {
                 "memories": [
                     {
-                        "text": "Assistant recommended conservative maple pruning",
+                        "text": "Assistant recommended a thin protective coat for the wooden chair",
                         "memory_type": "episodic",
                         "categories": ["home"],
                         "importance": "normal",
@@ -1464,7 +1465,7 @@ class TestConsolidationAlwaysRunsBothPasses:
         )
 
         user_facts = [
-            {"text": "User decided to prune the maple gently"},
+            {"text": "User decided to oil the wooden chair sparingly"},
         ]
 
         facts, _ = service._consolidate_role(
@@ -1472,7 +1473,7 @@ class TestConsolidationAlwaysRunsBothPasses:
             raw_memories=[
                 {
                     "id": "m1",
-                    "memory": "Assistant recommended conservative pruning",
+                    "memory": "Assistant recommended a thin protective coat",
                     "metadata": {
                         "memory_type": "episodic",
                         "role": "assistant",
@@ -1494,7 +1495,7 @@ class TestConsolidationAlwaysRunsBothPasses:
         messages = call_args[0][0]
         user_msg = messages[1]["content"]
         assert "Already Consolidated" in user_msg
-        assert "User decided to prune the maple gently" in user_msg
+        assert "User decided to oil the wooden chair sparingly" in user_msg
 
     def test_assistant_pass_skipped_without_agent_id(self):
         """When agent_id is None, assistant pass should not run."""

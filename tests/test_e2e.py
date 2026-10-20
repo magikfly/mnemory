@@ -20,6 +20,7 @@ import time
 import pytest
 
 from mnemory.memory import MemoryService
+from mnemory.revisions import RevisionConflictError
 
 pytestmark = [pytest.mark.e2e, pytest.mark.timeout(120)]
 
@@ -250,32 +251,32 @@ class TestExtractionThirdParty:
     def test_family_member_facts(self, memory_service: MemoryService) -> None:
         """Facts about user's family members should be extracted."""
         result = memory_service.add_memory(
-            "My mom loves Stephen King books, she has a house with "
-            "a garden, and she enjoys knitting and crocheting.",
+            "My uncle loves astronomy books, he has a flat with "
+            "a balcony, and he enjoys drawing and painting.",
             user_id=self.USER,
             infer=True,
         )
         mems = _results(result)
         _assert_count_between(mems, 2, 6)
         combined = _all_text(mems)
-        assert "mother" in combined or "mom" in combined
-        assert "stephen king" in combined
-        assert "garden" in combined
-        assert "knitting" in combined or "crocheting" in combined
+        assert "uncle" in combined
+        assert "astronomy" in combined
+        assert "balcony" in combined
+        assert "drawing" in combined or "painting" in combined
 
     def test_pet_facts(self, memory_service: MemoryService) -> None:
-        """Pet facts with breed and name should be preserved."""
+        """A fictional pet's breed and name should be preserved."""
         result = memory_service.add_memory(
-            "I have a Kurilian Bobtail cat named Micek.",
+            "I have a Welsh Corgi dog named Button.",
             user_id=self.USER,
             infer=True,
         )
         mems = _results(result)
         _assert_count_between(mems, 1, 3)
         combined = _all_text(mems)
-        assert "kurilian bobtail" in combined
+        assert "welsh corgi" in combined
         # Name should be preserved
-        assert "micek" in combined
+        assert "button" in combined
 
     def test_mixed_subjects_extraction(self, memory_service: MemoryService) -> None:
         """Multiple people mentioned should produce separate facts per person."""
@@ -474,21 +475,19 @@ class TestRemember:
     def test_remember_third_party_facts(self, memory_service: MemoryService) -> None:
         """Conversation about family should extract third-party facts.
 
-        This is the original bug scenario -- user describes their mother's
-        preferences and only 1 of ~6 facts was stored.
+        This fictional scenario preserves the regression's multi-fact,
+        third-party attribution invariant.
         """
         conversation = (
-            "User: What birthday gift should I buy for my mom?\n"
-            "She'd like Malibu, she likes sweet drinks. What else?\n"
-            "She likes books, especially Stephen King -- she has almost "
-            "all of them.\n"
-            "She has a house with a garden.\n"
-            "Knitting, crocheting, and sewing.\n"
-            "I have a cat (Kurilian Bobtail).\n"
-            "Assistant: Great options! You could get her a Malibu gift "
-            "set, the latest Stephen King novel, or some premium yarn "
-            "for her crafts. For the garden, maybe some nice plants or "
-            "garden tools."
+            "User: What retirement gift should I buy for my uncle?\n"
+            "He'd like a jigsaw, he likes puzzles. What else?\n"
+            "He likes books, especially astronomy atlases -- he has a "
+            "large collection.\n"
+            "He has a flat with a balcony.\n"
+            "Drawing, painting, and pottery.\n"
+            "I have a dog (Welsh Corgi).\n"
+            "Assistant: You could get him a landscape jigsaw, an astronomy "
+            "atlas, or art supplies. For the balcony, maybe a folding chair."
         )
         result = memory_service.remember(
             content=conversation,
@@ -500,13 +499,13 @@ class TestRemember:
         _assert_count_between(mems, 3, 10)
         combined = _all_text(mems)
         # Key facts that should be extracted
-        assert "stephen king" in combined, (
-            f"Stephen King should be extracted: {_texts(mems)}"
+        assert "astronomy" in combined, (
+            f"Astronomy books should be extracted: {_texts(mems)}"
         )
-        assert "malibu" in combined or "sweet drink" in combined, (
-            f"Malibu/sweet drinks should be extracted: {_texts(mems)}"
+        assert "jigsaw" in combined or "puzzle" in combined, (
+            f"Jigsaws/puzzles should be extracted: {_texts(mems)}"
         )
-        assert "garden" in combined, f"Garden should be extracted: {_texts(mems)}"
+        assert "balcony" in combined, f"Balcony should be extracted: {_texts(mems)}"
 
 
 # ── Search ───────────────────────────────────────────────────────────
@@ -950,15 +949,18 @@ class TestAgentScoping:
 
     def test_sub_agent_access(self, memory_service: MemoryService) -> None:
         """Sub-agents (colon-prefixed) should have independent memories."""
-        # role=assistant requires infer=True (anti-injection safeguard)
-        memory_service.add_memory(
-            "Your name is Bob. You have a cheerful personality "
-            "and you always greet users warmly.",
+        # role=assistant extracts assistant speech, not instructions addressed
+        # to the assistant. Keep first-person input and the inference safeguard.
+        added = memory_service.add_memory(
+            "My name is Bob. I have a cheerful personality "
+            "and I always greet users warmly.",
             user_id=self.USER,
             agent_id="parent:bob",
             role="assistant",
             infer=True,
         )
+        assert not added.get("error")
+        assert any(result.get("event") == "ADD" for result in added["results"])
         time.sleep(0.5)
 
         # Visible via the parent session
@@ -1120,7 +1122,7 @@ class TestCRUD:
     USER = "e2e_crud"
 
     def test_update_memory_content(self, memory_service: MemoryService) -> None:
-        """Updating content should change the stored text."""
+        """Updating content creates an active successor and preserves history."""
         result = memory_service.add_memory(
             "User works at OldCorp.",
             user_id=self.USER,
@@ -1139,15 +1141,28 @@ class TestCRUD:
             content="User works at NewCorp as a CTO.",
         )
         assert update_result["status"] == "updated"
+        successor_id = update_result["revision_id"]
+        assert successor_id == update_result["memory_id"]
+        assert successor_id != mem_id
+        assert update_result["previous_revision_id"] == mem_id
+        assert update_result["revision"] == 2
 
         time.sleep(0.3)
 
         # Verify the update
         mems = memory_service.list_memories(user_id=self.USER)
-        updated = [m for m in mems if m.get("id") == mem_id]
+        assert not any(m.get("id") == mem_id for m in mems)
+        updated = [m for m in mems if m.get("id") == successor_id]
         assert len(updated) == 1
         assert "newcorp" in _mem_text(updated[0]).lower()
         assert "oldcorp" not in _mem_text(updated[0]).lower()
+        history = memory_service.get_memory_history(
+            successor_id, user_id=self.USER, owner_id=self.USER
+        )["revisions"]
+        assert [m["id"] for m in history] == [mem_id, successor_id]
+        assert history[0]["metadata"]["revision_state"] == "superseded"
+        assert history[1]["metadata"]["revision_state"] == "active"
+        assert _mem_text(history[0]) == "User works at OldCorp."
 
     def test_update_memory_metadata(self, memory_service: MemoryService) -> None:
         """Updating metadata should change importance and pinned state."""
@@ -1178,7 +1193,7 @@ class TestCRUD:
         )
 
     def test_delete_memory(self, memory_service: MemoryService) -> None:
-        """Deleting a memory should remove it from list and search."""
+        """Retraction hides active results but preserves historical content."""
         result = memory_service.add_memory(
             "User has a temporary note about xylophone lessons.",
             user_id=self.USER,
@@ -1197,19 +1212,32 @@ class TestCRUD:
 
         # Delete
         del_result = memory_service.delete_memory(mem_id, user_id=self.USER)
-        assert del_result["status"] == "deleted"
+        assert del_result["status"] == "retracted"
+        assert del_result["revision_id"] is None
+        assert del_result["previous_revision_id"] == mem_id
+        assert del_result["revision"] == 1
         time.sleep(0.3)
 
         # Verify it's gone
         mems = memory_service.list_memories(user_id=self.USER)
         assert not any(m.get("id") == mem_id for m in mems), (
-            "Deleted memory should not appear in list"
+            "Retracted memory should not appear in the active list"
+        )
+        results = memory_service.search_memories("xylophone lessons", user_id=self.USER)
+        assert not any(m.get("id") == mem_id for m in results)
+        history = memory_service.get_memory_history(
+            mem_id, user_id=self.USER, owner_id=self.USER
+        )["revisions"]
+        assert len(history) == 1
+        assert history[0]["metadata"]["revision_state"] == "retracted"
+        assert _mem_text(history[0]) == (
+            "User has a temporary note about xylophone lessons."
         )
 
     def test_delete_memory_with_artifacts(self, memory_service: MemoryService) -> None:
-        """Deleting a memory should also delete its artifacts."""
+        """Retraction retains bytes but denies public reads; erasure removes bytes."""
         result = memory_service.add_memory(
-            "Memory with artifact that will be deleted.",
+            "Memory with artifact retained until explicit privacy erasure.",
             user_id=self.USER,
             infer=False,
             memory_type="fact",
@@ -1219,21 +1247,43 @@ class TestCRUD:
         )
         mem_id = _results(result)[0]["id"]
 
-        memory_service.save_artifact(
+        saved = memory_service.save_artifact(
             mem_id,
             user_id=self.USER,
-            content="This artifact should be cleaned up.",
+            content="Synthetic retention evidence.",
             filename="cleanup.md",
         )
+        artifact_id = saved["artifact"]["id"]
+        assert saved["memory_id"] == mem_id
+        assert (
+            memory_service.get_artifact(mem_id, artifact_id, user_id=self.USER)[
+                "content"
+            ]
+            == "Synthetic retention evidence."
+        )
+        metadata = memory_service.list_artifacts(mem_id, user_id=self.USER)
 
         # Delete the parent memory
         del_result = memory_service.delete_memory(mem_id, user_id=self.USER)
-        assert del_result["status"] == "deleted"
+        assert del_result["status"] == "retracted"
+        assert del_result["revision_id"] is None
+        assert del_result["previous_revision_id"] == mem_id
         time.sleep(0.3)
 
         # Memory should be gone
         mems = memory_service.list_memories(user_id=self.USER)
         assert not any(m.get("id") == mem_id for m in mems)
+        with pytest.raises(RevisionConflictError):
+            memory_service.get_artifact(mem_id, artifact_id, user_id=self.USER)
+        raw, _, _ = memory_service.artifact.load_raw(self.USER, artifact_id, metadata)
+        assert raw == b"Synthetic retention evidence."
+        erased = memory_service.privacy_erase_memory(
+            mem_id, user_id=self.USER, owner_id=self.USER
+        )
+        assert erased["status"] == "erased"
+        assert memory_service.vector.get_by_id(mem_id) is None
+        with pytest.raises(FileNotFoundError):
+            memory_service.artifact.load_raw(self.USER, artifact_id, metadata)
 
 
 # ── Role filter ──────────────────────────────────────────────────────
@@ -1386,20 +1436,13 @@ class TestMemoryTypeClassification:
         """
         user = f"{self.USER}_goal"
         conversation = (
-            "User: I've been thinking about our monitoring stack. We "
-            "definitely need to add distributed tracing to our platform, "
-            "it's something we're completely missing right now. I don't "
-            "really understand how OpenTelemetry works yet but I want to "
-            "learn it and implement it across all our microservices.\n"
-            "Assistant: That's a great initiative. OpenTelemetry provides "
-            "a unified framework for collecting traces, metrics, and logs. "
-            "For your microservices architecture, I'd recommend starting "
-            "with automatic instrumentation for your HTTP frameworks, then "
-            "adding custom spans for critical business operations. We can "
-            "use Jaeger or Tempo as the backend for trace storage and "
-            "visualization. The key steps would be adding the OTel SDK to "
-            "each service, configuring exporters, and setting up a collector "
-            "to aggregate and forward traces to your backend."
+            "User: I want to add request tracing to the Example Catalog "
+            "training application. It currently has no tracing. I need to "
+            "learn how trace propagation works before implementing it "
+            "across the example services.\n"
+            "Assistant: Start with instrumentation on the request handlers, "
+            "then propagate the trace context between services. A local "
+            "collector and trace viewer will help you inspect the results."
         )
         memory_service.remember(content=conversation, user_id=user, role="user")
         time.sleep(0.5)
@@ -1428,12 +1471,11 @@ class TestMemoryTypeClassification:
         """
         user = f"{self.USER}_decision"
         conversation = (
-            "User: Přemýšlel jsem o tom a myslím že bychom měli použít "
-            "PostgreSQL místo MySQL pro billing service\n"
-            "Assistant: Dobrá volba, PostgreSQL má lepší podporu pro JSON "
-            "a transakce.\n"
-            "User: Jo, tak to uděláme. Updatni ty configy prosím.\n"
-            "Assistant: Jasně, upravím docker-compose a migration skripty."
+            "User: Pro cvičnou aplikaci Example Catalog chci zvolit "
+            "SQLite místo CSV souborů.\n"
+            "Assistant: SQLite umožní transakce a dotazy nad více tabulkami.\n"
+            "User: Rozhodnuto, uprav prosím konfiguraci a import dat.\n"
+            "Assistant: Připravím importní skript a konfiguraci SQLite."
         )
         memory_service.remember(content=conversation, user_id=user, role="user")
         time.sleep(0.5)
@@ -1448,15 +1490,15 @@ class TestMemoryTypeClassification:
     def test_knowledge_gap_is_not_fact(self, memory_service: MemoryService) -> None:
         """'User doesn't know X' should be episodic or context, not fact.
 
-        Uses Czech input — the real failure was 'nevim odkud se dana
-        vzpominka vznikla' being stored as a permanent fact.
+        Uses a fictional Czech question to guard against treating
+        a temporary knowledge gap as a permanent biographical fact.
         """
         user = f"{self.USER}_knowledge"
         conversation = (
-            "User: Vubec nevim jak funguje ta extrakce vzpominek v mnemory, "
-            "muzes mi to vysvetlit?\n"
-            "Assistant: Extrakce používá jeden LLM call pro extrakci faktů, "
-            "klasifikaci a deduplikaci proti existujícím vzpomínkám."
+            "User: Nerozumím tomu, jak funguje řazení výsledků v cvičné "
+            "aplikaci Example Catalog. Vysvětlíš mi to?\n"
+            "Assistant: Výsledky se nejprve filtrují a potom seřadí "
+            "podle zvoleného sloupce."
         )
         memory_service.remember(content=conversation, user_id=user, role="user")
         time.sleep(0.5)
@@ -1478,24 +1520,13 @@ class TestMemoryTypeClassification:
         """
         user = f"{self.USER}_feature"
         conversation = (
-            "User: I've been reviewing our deployment pipeline and there "
-            "are some big gaps. We have no rollback mechanism at all right "
-            "now, if a deploy goes bad we have to manually revert.\n"
-            "Assistant: That's a significant risk. Having automated rollback "
-            "is critical for production reliability.\n"
-            "User: Yeah, I want to implement canary deployments with "
-            "automatic rollback based on error rate thresholds. I also "
-            "realized I don't fully understand how Argo Rollouts works, "
-            "so I need to study that first before we start implementing.\n"
-            "Assistant: Argo Rollouts is a great choice for progressive "
-            "delivery. It extends Kubernetes deployments with canary and "
-            "blue-green strategies. You define analysis templates that "
-            "query your metrics backend, and if the error rate exceeds "
-            "your threshold during the canary phase, it automatically "
-            "rolls back to the stable version. I would suggest starting "
-            "with a simple canary strategy on one non-critical service "
-            "to get familiar with the workflow before rolling it out "
-            "across all services."
+            "User: The Example Catalog training application currently "
+            "has no import preview. A malformed file fails halfway through.\n"
+            "Assistant: A preview could validate every row before import.\n"
+            "User: I want to add a preview with row-level errors and an "
+            "all-or-nothing import. I need to study transactions first.\n"
+            "Assistant: Start with a validation pass, then write the "
+            "accepted rows in one transaction. Show the errors separately."
         )
         memory_service.remember(content=conversation, user_id=user, role="user")
         time.sleep(0.5)
@@ -1517,10 +1548,9 @@ class TestMemoryTypeClassification:
         """
         user = f"{self.USER}_state"
         conversation = (
-            "User: mnemory zatim nema zadny system pro sledovani odkud "
-            "vzpominky pochazi\n"
-            "Assistant: Ano, provenance tracking zatím chybí. Mohli bychom "
-            "přidat pole source_session_id do metadat."
+            "User: Cvičná aplikace Example Catalog zatím neukazuje, ze "
+            "kterého souboru pochází importovaný řádek.\n"
+            "Assistant: Do metadat bychom mohli přidat název vstupního souboru."
         )
         memory_service.remember(content=conversation, user_id=user, role="user")
         time.sleep(0.5)
@@ -2253,12 +2283,12 @@ class TestAssistantMemoryFiltering:
         extracted as assistant memories."""
         memory_service.remember(
             content=(
-                "User: I'm building a fence and need to figure out "
-                "how many posts I need.\n"
-                "Assistant: How long is each side? Does the 2.5m "
-                "spacing include end posts?\n"
-                "User: Each side is 10 meters, spacing includes ends.\n"
-                "Assistant: Want me to send you the exact positions?"
+                "User: I'm assembling a display rail and need to count "
+                "the support brackets.\n"
+                "Assistant: How long is the rail? Does the 1.5m "
+                "spacing include brackets at both ends?\n"
+                "User: The rail is 6 meters, including both ends.\n"
+                "Assistant: Want me to draw the bracket positions?"
             ),
             user_id=self.USER,
             agent_id=self.AGENT,
@@ -2291,10 +2321,9 @@ class TestAssistantMemoryFiltering:
             role="user",
         )
         user_text = _all_text(user_mems)
-        assert "fence" in user_text or "garden" in user_text or "post" in user_text, (
-            f"User facts about the fence/garden should be extracted: "
-            f"{_texts(user_mems)}"
-        )
+        assert (
+            "display" in user_text or "rail" in user_text or "bracket" in user_text
+        ), f"User facts about the display rail should be extracted: {_texts(user_mems)}"
 
     @pytest.mark.timeout(180)
     def test_substantive_assistant_facts_are_stored(
@@ -2306,15 +2335,15 @@ class TestAssistantMemoryFiltering:
 
         memory_service.remember(
             content=(
-                "User: Can you research the best database for our "
-                "time-series IoT data?\n"
+                "User: Can you compare databases for time-series readings "
+                "from the Example Weather training simulator?\n"
                 "Assistant: I've researched this thoroughly. TimescaleDB "
-                "is the best fit for your IoT use case — it handles "
+                "is a good fit for the simulated readings — it handles "
                 "time-series data natively on top of PostgreSQL, supports "
                 "continuous aggregates, and has excellent compression. "
                 "InfluxDB is faster for simple queries but lacks SQL "
                 "compatibility. I've also sent a comparison report to "
-                "your email at team@acme.com.\n"
+                "the exercise inbox at team@example.com.\n"
                 "User: Great, thanks for the research."
             ),
             user_id=user,
@@ -2356,11 +2385,12 @@ class TestAssistantMemoryFiltering:
 
         memory_service.remember(
             content=(
-                "User: I need CI/CD for my Python project.\n"
+                "User: I need CI/CD for the Example Catalog training project.\n"
                 "Assistant: Which CI platform?\n"
                 "User: GitHub Actions.\n"
                 "Assistant: Done. I set up a GitHub Actions workflow "
-                "with pytest and ruff, and configured branch protection."
+                "with pytest and ruff for the training project, and "
+                "configured branch protection."
             ),
             user_id=user,
             agent_id=self.AGENT,
@@ -2987,8 +3017,8 @@ class TestExtractionCategories:
         agent = "e2e-extraction-agent"
         result = memory_service.remember(
             content=(
-                "User: Deploy the lab-junction service to production.\n"
-                "Assistant: Done. I deployed lab-junction to the production "
+                "User: Deploy the example-catalog service to production.\n"
+                "Assistant: Done. I deployed example-catalog to the production "
                 "Kubernetes cluster and verified the health checks pass."
             ),
             user_id=user,
@@ -3003,7 +3033,7 @@ class TestExtractionCategories:
         # Check for assistant-role memories about the deployment
         all_mems = memory_service.list_memories(user_id=user, agent_id=agent)
         combined = _all_text(all_mems)
-        assert "deploy" in combined or "lab-junction" in combined, (
+        assert "deploy" in combined or "example-catalog" in combined, (
             f"Expected deployment action to be extracted: {_texts(all_mems)}"
         )
 

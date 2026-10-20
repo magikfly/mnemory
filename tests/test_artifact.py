@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -10,8 +11,22 @@ from mnemory.storage.artifact import (
     ArtifactMetadata,
     ArtifactStore,
     FilesystemBackend,
+    S3Backend,
     _validate_path_component,
 )
+
+
+def test_artifact_partial_delete_error_propagates():
+    backend = S3Backend.__new__(S3Backend)
+    backend._bucket = "synthetic-bucket"
+    backend._client = MagicMock()
+    backend._client.list_objects_v2.return_value = {
+        "Contents": [{"Key": "synthetic-user/artifact/data.txt"}]
+    }
+    backend._client.delete_objects.return_value = {"Errors": [{"Code": "AccessDenied"}]}
+    with pytest.raises(RuntimeError, match="cleanup was rejected"):
+        backend.delete_artifact("synthetic-user", "artifact")
+
 
 # ── _validate_path_component ──────────────────────────────────────────
 
@@ -27,7 +42,7 @@ class TestValidatePathComponent:
         _validate_path_component("project:myapp", "category")
 
     def test_valid_with_slashes(self):
-        _validate_path_component("project:domecek/k8s", "category")
+        _validate_path_component("project:demo/deployments", "category")
 
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="must not be empty"):

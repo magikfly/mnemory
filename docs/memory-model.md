@@ -38,7 +38,7 @@ Predefined categories ensure LLM discoverability:
 | `decisions` | Conclusions, choices, reasoning |
 | `project` | Project-specific (use `project:<name>`) |
 
-Dynamic subcategories via prefix: `project:myapp`, `project:domecek/k8s-manifests`.
+Dynamic subcategories via prefix: `project:myapp`, `project:demo/deployment-files`.
 
 ## Importance Levels
 

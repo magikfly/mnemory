@@ -89,6 +89,66 @@ def test_apply_exception_terminalizes_operation_as_failed() -> None:
     assert "sensitive detail" not in str(terminal)
 
 
+@pytest.mark.parametrize("status", ["planned", "applying", "failed", "committed"])
+def test_changed_target_never_mints_new_operation_for_existing_issue(status):
+    service, operations = _service()
+    check = _completed_check(service)
+    record = {
+        "operation_id": "persisted-operation",
+        "operation_token": "persisted-token",
+        "status": status,
+        "plan": [{"expected_revision": 1}],
+    }
+    operations.get_fsck_issue.return_value = record
+    service._vector.get_by_id.return_value = None
+    result = service.apply_check(check.check_id)
+    operations.write.assert_not_called()
+    operations.claim.assert_not_called()
+    service._vector.get_by_id.assert_not_called()
+    assert record["status"] == status
+    assert result["details"][0]["status"] == (
+        "skipped" if status == "committed" else "blocked"
+    )
+
+
+@pytest.mark.parametrize("checkpoint", ["pending", "applying", "committed", "skipped"])
+def test_restart_preserves_journal_at_each_action_boundary(checkpoint):
+    """Every persisted action boundary is blocked, not guessed or replayed."""
+    client = QdrantClient(":memory:")
+    operations = RevisionOperationStore(client, is_remote=False)
+    operations.ensure_collection()
+    service, _ = _service()
+    check = _completed_check(service)
+    operations.write(
+        "stable-token",
+        {
+            "operation_kind": "fsck",
+            "status": "applying",
+            "fsck_check_id": check.check_id,
+            "fsck_issue_id": check.issues[0].issue_id,
+            "plan": [{"expected_revision": 1}],
+            "action_checkpoints": [{"status": checkpoint}],
+            "recovery_attempt_count": 3,
+        },
+    )
+    before = operations.get("stable-token")
+    service._memory_service.revisions.operations = RevisionOperationStore(
+        client, is_remote=False
+    )
+    service._apply_issue = MagicMock()
+    result = service.apply_check(check.check_id)
+    after = operations.get("stable-token")
+    assert result["details"][0]["diagnosis"] == "retry_exhausted"
+    for key, value in before.items():
+        assert after[key] == value
+    service._apply_issue.assert_not_called()
+    diagnoses, cursor = operations.diagnose_fsck_page()
+    assert diagnoses == ["retry_exhausted"]
+    assert cursor is None
+    assert operations.get("stable-token")["status"] == "applying"
+    client.close()
+
+
 def test_fsck_journal_uses_check_owner_when_source_is_missing() -> None:
     service, operations = _service()
     check = _completed_check(service)
@@ -122,7 +182,7 @@ def test_apply_success_persists_action_checkpoint() -> None:
     assert terminal["action_checkpoints"][0]["expected_revision"] == 1
 
 
-def test_retry_runs_only_pending_actions() -> None:
+def test_partial_retry_remains_blocked_without_cross_collection_fencing() -> None:
     service, operations = _service()
     check = _completed_check(service)
     check.issues[0].affected_memories.append(
@@ -181,28 +241,20 @@ def test_retry_runs_only_pending_actions() -> None:
         ],
     }
 
-    def apply(*args, action_indexes, before_action, on_action, **kwargs):
-        assert action_indexes == {1}
-        before_action(1)
-        on_action(1, "committed", "revision-operation-2")
-        return 1, 0
-
-    service._apply_issue = MagicMock(side_effect=apply)
+    operations.get_fsck_issue.return_value = operations.get.return_value
+    service._apply_issue = MagicMock()
 
     result = service.apply_check(check.check_id)
 
-    assert result["applied"] == 1
-    assert operations.claim.call_args.kwargs["allowed_statuses"] == (
-        "planned",
-        "failed",
-        "applying",
-    )
-    terminal = operations.write_claimed.call_args_list[-1].args[2]
-    assert terminal["actions_executed"] == 2
-    assert [checkpoint["status"] for checkpoint in terminal["action_checkpoints"]] == [
-        "committed",
-        "committed",
-    ]
+    assert result["applied"] == 0
+    assert result["details"][0]["status"] == "blocked"
+    service._apply_issue.assert_not_called()
+    operations.claim.assert_not_called()
+    operations.write_claimed.assert_not_called()
+    assert [
+        checkpoint["status"]
+        for checkpoint in operations.get.return_value["action_checkpoints"]
+    ] == ["committed", "pending"]
 
 
 def test_checkpoint_does_not_claim_foreign_revision_transition() -> None:

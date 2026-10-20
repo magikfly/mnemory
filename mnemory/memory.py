@@ -5225,7 +5225,12 @@ class MemoryService:
         owner_id: str,
         session_agent_id: str | None = None,
     ) -> dict[str, Any]:
-        """Physically erase one lineage and its unreferenced artifacts."""
+        """Best-effort cleanup of a lineage and its unshared artifacts.
+
+        Known cleanup failures propagate. Success is not a cross-store atomic
+        guarantee: concurrent writes/recovery may retain or recreate content.
+        Backups, historical object versions and external logs are out of scope.
+        """
         with self._get_user_lock(f"memory:{memory_id}"):
             plan = self.revisions.prepare_privacy_erase(
                 memory_id,
@@ -5740,7 +5745,7 @@ class MemoryService:
         """Expand category prefix patterns into concrete category values.
 
         For example, "project" expands to ["project", "project:myapp",
-        "project:domecek"] based on existing memories. Non-prefix categories
+        "project:demo"] based on existing memories. Non-prefix categories
         are passed through as-is.
 
         This allows Qdrant's MatchAny to handle category filtering natively
