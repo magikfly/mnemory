@@ -1,0 +1,2341 @@
+diff --git a/mnemory/api/fsck.py b/mnemory/api/fsck.py
+index 48365a0..6566e06 100644
+--- a/mnemory/api/fsck.py
++++ b/mnemory/api/fsck.py
+@@ -340,6 +340,10 @@ def apply_fsck(
+     return FsckApplyResponse(
+         applied=result.get("applied", 0),
+         skipped=result.get("skipped", 0),
++        # LOCAL-PATCH: forward the superseded count. FsckService.apply_check reports it
++        # and the schema has the field, but this handler built the response without it,
++        # so the summary read 0 while the per-issue details listed 73 superseded rows.
++        superseded=result.get("superseded", 0),
+         failed=result.get("failed", 0),
+         details=details,
+     )
+@@ -370,3 +374,4 @@ def re_evaluate_fsck_operation(
+     except RuntimeError as exc:
+         raise HTTPException(status_code=503, detail=str(exc)) from exc
+     return FsckReEvaluateResponse(**result)
++
+diff --git a/mnemory/api/schemas.py b/mnemory/api/schemas.py
+index 2d558bc..092aab5 100644
+--- a/mnemory/api/schemas.py
++++ b/mnemory/api/schemas.py
+@@ -880,7 +880,14 @@ class FsckApplyDetail(BaseModel):
+     """Result of applying a single issue."""
+ 
+     issue_id: str
+-    status: str = Field(..., description="Status: applied, skipped, failed")
++    # LOCAL-PATCH: 'superseded' = every target of this issue is gone from the store
++    # (a delete in an earlier apply already merged that row away), so the finding is
++    # resolved and there is nothing left to fix. Reported so the UI can drop the row
++    # instead of showing a fix that can never apply.
++    status: str = Field(
++        ...,
++        description="Status: applied, skipped, superseded, failed",
++    )
+     actions_executed: int = 0
+     actions_skipped: int = 0
+     error: str | None = None
+@@ -891,6 +898,9 @@ class FsckApplyResponse(BaseModel):
+ 
+     applied: int = 0
+     skipped: int = 0
++    # LOCAL-PATCH: surface the superseded count; without it these issues are counted
++    # as plain skips and give the operator no explanation for the stuck rows.
++    superseded: int = 0
+     failed: int = 0
+     details: list[FsckApplyDetail] = Field(default_factory=list)
+ 
+@@ -991,3 +1001,4 @@ def format_memory_item(item: dict) -> MemoryItem:
+         metadata=metadata if metadata else None,
+         has_artifacts=has_artifacts,
+     )
++
+diff --git a/mnemory/categories.py b/mnemory/categories.py
+index 2fc103f..448fa6a 100644
+--- a/mnemory/categories.py
++++ b/mnemory/categories.py
+@@ -11,8 +11,12 @@ requiring configuration changes.
+ 
+ from __future__ import annotations
+ 
++import logging
++
+ from mnemory.sanitize import validate_category_name
+ 
++logger = logging.getLogger("mnemory.categories")
++
+ # Predefined categories with descriptions.
+ # These are always available and returned by list_categories even if empty.
+ PREDEFINED_CATEGORIES: dict[str, str] = {
+@@ -94,6 +98,32 @@ def validate_categories(categories: list[str]) -> list[str]:
+     return validated
+ 
+ 
++def sanitize_categories(categories: list[str] | None) -> list[str]:
++    """Coerce LLM-produced categories into the valid taxonomy.
++
++    LOCAL-PATCH: model output is not a validated API input. The extractor
++    invents tokens outside the taxonomy (observed: 'fact'), and the strict
++    validate_categories() raise in add_memory() aborts an ENTIRE consolidation
++    batch over one bad token. Drop unknown entries with a warning and keep the
++    rest. User-supplied API categories keep going through validate_categories()
++    unchanged, so API strictness is untouched.
++    """
++    if not categories:
++        return []
++
++    valid: list[str] = []
++    for cat in categories:
++        try:
++            valid.extend(validate_categories([cat]))
++        except ValueError:
++            logger.warning(
++                "Dropping invalid category %r (valid: %s)",
++                cat,
++                ", ".join(sorted(PREDEFINED_CATEGORIES)),
++            )
++    return valid
++
++
+ def validate_memory_type(memory_type: str) -> str:
+     """Validate a memory type string."""
+     memory_type = memory_type.strip().lower()
+@@ -157,3 +187,4 @@ def count_categories(memories: list[dict]) -> dict[str, int]:
+                 cat = cat.lower()
+                 counts[cat] = counts.get(cat, 0) + 1
+     return counts
++
+diff --git a/mnemory/consolidation.py b/mnemory/consolidation.py
+index 6776c15..b5e4d93 100644
+--- a/mnemory/consolidation.py
++++ b/mnemory/consolidation.py
+@@ -18,7 +18,18 @@ from collections.abc import Callable
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any
+ 
+-from mnemory.revisions import RevisionService, canonical_fingerprint
++from mnemory.categories import sanitize_categories
++from mnemory.output_guards import (
++    clean_memory_text,
++    noise_enforcing,
++    triage_memory,
++    role_mismatch,
++)
++from mnemory.revisions import (
++    RevisionConflictError,
++    RevisionService,
++    canonical_fingerprint,
++)
+ 
+ if TYPE_CHECKING:
+     from mnemory.config import Config
+@@ -733,14 +744,33 @@ class ConsolidationService:
+                 )
+             )
+             guard_mutation()
+-            self._memory.revisions.mark_source(
+-                source_ids,
+-                operation_id=operation_id,
+-                user_id=user_id,
+-                owner_id=owner_id,
+-                session_agent_id=session.get("agent_id"),
+-                mutation_guard=mutation_guard,
+-            )
++            try:
++                self._memory.revisions.mark_source(
++                    source_ids,
++                    operation_id=operation_id,
++                    user_id=user_id,
++                    owner_id=owner_id,
++                    session_agent_id=session.get("agent_id"),
++                    mutation_guard=mutation_guard,
++                )
++            except RevisionConflictError as exc:
++                # LOCAL-PATCH: the raw evidence this plan consumed moved underneath us -
++                # a fsck apply (or a chat write) merged/deleted those exact revisions
++                # while this recovery was in flight. The consolidated facts are already
++                # stored at this point, so letting the exception fail the whole session
++                # only produced an endless retry loop: the same session re-queued every
++                # 300s cycle, re-stored, and conflicted again (observed on session
++                # c4753181 for hours). Defer the bookkeeping, keep the facts, and let
++                # finalize_consolidation close the session out. The next scan sees the
++                # raws as unmarked and can re-derive them; the normalized-text dedup
++                # guard in _store_consolidated keeps that from duplicating.
++                logger.warning(
++                    "Consolidation: source marking deferred for session %s "
++                    "(revision moved: %s); keeping %d consolidated memories",
++                    sid,
++                    exc,
++                    len(stored_ids),
++                )
+             previous_ids = session.get("consolidated_memory_ids") or []
+             merged_ids = list(dict.fromkeys([*previous_ids, *stored_ids]))
+             guard_mutation()
+@@ -900,7 +930,7 @@ class ConsolidationService:
+             - all_facts: list of consolidated fact dicts (with 'role' set)
+             - raw_ids_map: list of (batch_facts, batch_raw_ids) tuples
+         """
+-        from mnemory.llm import parse_json_response
++        from mnemory.llm import parse_json_response, salvage_json_objects
+         from mnemory.prompts import build_consolidation_prompt
+ 
+         batch_size = self._config.memory.consolidation_batch_size
+@@ -926,7 +956,22 @@ class ConsolidationService:
+         # Accumulated context from prior batches (prevents cross-batch duplication)
+         accumulated: list[dict] = []
+ 
+-        for batch_idx, batch in enumerate(batches):
++        # Normalized texts already consolidated in prior runs. The small
++        # model re-emits the same fact on every re-queued pass, so equality
++        # is checked before any durable write.
++        def _norm(text: str) -> str:
++            return " ".join(text.split()).lower()
++
++        seen_norms = {_norm(m.get("memory", "")) for m in previous_consolidated}
++
++        # Queue-based batches. A truncated LLM answer is salvaged and the
++        # raw memories no fact references are re-queued, so a bad tail can
++        # no longer abort the session and strand everything as raw.
++        queue: list[tuple[int, list[dict], int]] = [
++            (idx, b, 0) for idx, b in enumerate(batches)
++        ]
++        while queue:
++            batch_idx, batch, attempts = queue.pop(0)
+             if len(batches) > 1:
+                 logger.info(
+                     "Consolidation session %s [%s]: batch %d/%d (%d memories)",
+@@ -961,18 +1006,39 @@ class ConsolidationService:
+                 operation="consolidation",
+             )
+ 
+-            parsed = parse_json_response(response_text)
++            try:
++                parsed = parse_json_response(response_text)
++                batch_facts = parsed.get("memories") if parsed else None
++                if not isinstance(batch_facts, list):
++                    batch_facts = None
++            except ValueError:
++                # Output hit max_tokens (finish_reason=length). Keep the
++                # objects that closed before the cut instead of raising.
++                batch_facts = salvage_json_objects(response_text)
++                if batch_facts:
++                    logger.warning(
++                        "Consolidation session %s [%s] batch %d: truncated "
++                        "output, salvaged %d complete facts",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                        len(batch_facts),
++                    )
+ 
+-            if not parsed or not isinstance(parsed.get("memories"), list):
++            if not batch_facts:
+                 logger.warning(
+                     "Consolidation session %s [%s] batch %d: invalid LLM output",
+                     session_id,
+                     role,
+                     batch_idx + 1,
+                 )
++                # Nothing closed before the cut: halve the batch and retry,
++                # a smaller prompt fits inside the output cap.
++                if attempts < 2 and len(batch) > 4:
++                    mid = len(batch) // 2
++                    queue.insert(0, (batch_idx, batch[mid:], attempts + 1))
++                    queue.insert(0, (batch_idx, batch[:mid], attempts + 1))
+                 continue
+-
+-            batch_facts = parsed["memories"]
+             batch_raw_ids = [m["id"] for m in batch]
+             source_aliases = {
+                 f"S{index}": memory_id for index, memory_id in enumerate(batch_raw_ids)
+@@ -1011,6 +1077,85 @@ class ConsolidationService:
+                         batch_idx + 1,
+                     )
+                     continue
++                # Content guards run before dedup, so a fact whose text was only
++                # prompt scaffolding cannot occupy a dedup slot, and the surviving
++                # text is what gets compared. Grammar enforcement is already on;
++                # these catch what a valid string field still allows through.
++                raw_text = f.get("text", "")
++                cleaned = clean_memory_text(raw_text)
++                if cleaned is None:
++                    logger.warning(
++                        "Consolidation session %s [%s] batch %d: "
++                        "output text held only formatting artifacts: %.80r",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                        raw_text,
++                    )
++                    continue
++                if cleaned != raw_text.strip():
++                    logger.info(
++                        "Consolidation session %s [%s] batch %d: stripped prompt "
++                        "artifacts from output text (%d -> %d chars)",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                        len(raw_text),
++                        len(cleaned),
++                    )
++                    f["text"] = cleaned
++                new_text, noise, rewrote = triage_memory(f.get("text", ""))
++                if rewrote:
++                    logger.warning(
++                        "Consolidation session %s [%s] batch %d: stripped "
++                        "speech-act head from memory (%.60s -> %.60s)",
++                        session_id, role, batch_idx + 1,
++                        f.get("text", ""), new_text,
++                    )
++                    f["text"] = new_text
++                if noise:
++                    enforcing = noise_enforcing()
++                    logger.warning(
++                        "Consolidation session %s [%s] batch %d: %s noise memory"
++                        " (%s): %.80s",
++                        session_id, role, batch_idx + 1,
++                        "dropped" if enforcing else "would drop (log only)",
++                        noise, f.get("text", ""),
++                    )
++                    if enforcing:
++                        continue
++                mismatch = role_mismatch(f.get("text", ""), role)
++                if mismatch == "assistant_pass_user_subject":
++                    logger.warning(
++                        "Consolidation session %s [%s] batch %d: dropped "
++                        "user-subject fact from the assistant pass: %.80s",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                        f.get("text", ""),
++                    )
++                    continue
++                if mismatch:
++                    logger.info(
++                        "Consolidation session %s [%s] batch %d: cross-role "
++                        "subject in the %s pass (kept): %.80s",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                        role,
++                        f.get("text", ""),
++                    )
++                norm = _norm(f.get("text", ""))
++                if norm in seen_norms:
++                    logger.info(
++                        "Consolidation session %s [%s] batch %d: "
++                        "duplicate fact skipped",
++                        session_id,
++                        role,
++                        batch_idx + 1,
++                    )
++                    continue
++                seen_norms.add(norm)
+                 f["derived_from"] = list(
+                     dict.fromkeys(source_aliases[alias] for alias in aliases)
+                 )
+@@ -1045,6 +1190,24 @@ class ConsolidationService:
+                     }
+                 )
+ 
++            # Coverage check: raw memories that no accepted fact references
++            # are re-queued (bounded), so truncation degrades to smaller
++            # batches instead of an unconsolidated remainder.
++            covered = {
++                rid for fact in batch_facts for rid in fact.get("derived_from", [])
++            }
++            leftover = [m for m in batch if m["id"] not in covered]
++            if leftover and len(leftover) < len(batch) and attempts < 2:
++                logger.info(
++                    "Consolidation session %s [%s] batch %d: %d raw uncovered, "
++                    "re-queueing",
++                    session_id,
++                    role,
++                    batch_idx + 1,
++                    len(leftover),
++                )
++                queue.append((batch_idx, leftover, attempts + 1))
++
+         return all_facts, raw_ids_map
+ 
+     def _validate_output(self, facts: list[dict], raw_count: int) -> str | None:
+@@ -1110,7 +1273,14 @@ class ConsolidationService:
+ 
+                 # Use LLM-assigned categories, fall back to raw memory
+                 # categories if the LLM returned an empty list
+-                categories = fact.get("categories") or fallback_categories
++                # LOCAL-PATCH: sanitize first. The extractor emits categories
++                # outside the taxonomy (observed: 'fact'); add_memory() validates
++                # strictly and raises, and this loop re-raises, so ONE bad token
++                # aborted the whole session recovery. Unknown tokens are now
++                # dropped with a warning and the rest of the batch survives.
++                categories = sanitize_categories(
++                    fact.get("categories") or fallback_categories
++                )
+ 
+                 memory_id = fact["memory_id"]
+                 revision_metadata = RevisionService.initial_metadata(
+@@ -1173,3 +1343,4 @@ class ConsolidationService:
+                 )
+                 raise
+         return stored_ids
++
+diff --git a/mnemory/fsck.py b/mnemory/fsck.py
+index c470b88..f8bdd73 100644
+--- a/mnemory/fsck.py
++++ b/mnemory/fsck.py
+@@ -27,15 +27,18 @@ from typing import TYPE_CHECKING, Any
+ 
+ from qdrant_client.models import PointStruct
+ 
++from mnemory.output_guards import clean_memory_text
++
+ from mnemory.categories import (
+     PREDEFINED_CATEGORIES,
++    sanitize_categories,
+     validate_categories,
+     validate_importance,
+     validate_memory_type,
+ )
+ from mnemory.config import Config
+ from mnemory.embeddings import EmbeddingClient
+-from mnemory.llm import LLMClient, parse_json_response
++from mnemory.llm import LLMClient, parse_json_response, salvage_json_objects
+ from mnemory.prompts import (
+     build_fsck_content_quality_prompt,
+     build_fsck_duplicate_prompt,
+@@ -62,7 +65,42 @@ logger = logging.getLogger(__name__)
+ _DUPLICATE_SIMILARITY_THRESHOLD = 0.75
+ 
+ # Maximum memories per LLM quality-check batch.
++# LOCAL-PATCH 2026-10-07: raised to 30, measured it, reverted to 20. Batch size *is*
++# the call count, so 30 cuts calls by a third - but Pass B (metadata normalization)
++# echoes per-memory metadata, so its reply scales with the batch. On check 09ddb66d
++# (1034 memories, batch 30, ceiling 12288) it truncated 10 times at 43,489-49,003
++# chars = exactly 12288 tokens, the split retry fired 8 times, and 10 batches ended
++# unparseable: ~300 memories lost their metadata pass. Measured ~15k chars per memory
++# = ~12,200 tokens for a 30-batch, right at the ceiling. At 20 the same pass needs
++# ~8,100 tokens, which the 12288 ceiling below clears with ~34% headroom. Cutting
++# calls is only a win when the reply survives.
+ _QUALITY_BATCH_SIZE = 20
++# Ceiling for the content-quality pass (Pass A) and the security re-eval - both emit
++# only the issues they find, so replies stay small (measured clean even at batch 30).
++# LOCAL-PATCH 2026-10-07: 4096 -> 6144 after 168h of logs showed truncations
++# bottoming at 14,226 chars = 4096 tokens at ~3.5 chars/token, i.e. hitting the
++# ceiling. The original 16384 default was the opposite failure - a looping model
++# burned 74s and 16k tokens before the parse failed. Pool cost: ~5k prompt + 6144 gen
++# = ~11k of the 65536-token kv-unified pool per slot.
++_FSCK_MAX_TOKENS = 6144
++# LOCAL-PATCH 2026-10-07: Pass B (metadata normalization) needs its own ceiling.
++# Measured on check b8c5df58 with batch 30: Pass A (content quality) returned in
++# 2.7-5.1s inside 6144, while Pass B truncated at 23,040 chars = exactly 6144
++# tokens, salvage found no closed objects, and the whole 30-memory batch was
++# skipped. Pass B echoes per-memory metadata, so its output scales with batch
++# size; Pass A emits only the issues it found. 12288 tokens ~ 46k chars covers a
++# 30-memory echo (prompt ~6k + 12288 gen ~ 18k of the 65536 pool per slot).
++_FSCK_METADATA_MAX_TOKENS = 12288
++# LOCAL-PATCH 2026-10-07: same asymmetry in phase 1. Check 3710afac: fsck_dedup
++# truncated at 18,480 chars = 6144 tokens (3.0 chars/token - it echoes the cluster
++# content it is merging) and the cluster's decision was skipped. Dedup is the only
++# phase whose reply scales with cluster size, so it gets the metadata ceiling too.
++# Pool: 15-memory cluster prompt ~5k + 12288 gen ~ 18k per slot.
++_FSCK_DEDUP_MAX_TOKENS = 12288
++# Floor for the Pass B recovery split: a batch at least this big is halved once
++# when its reply is unparseable after salvage. Bounded - sub-batches never split
++# again - so the cost is 2 extra calls on a failure that happened ~1x/week.
++_METADATA_RETRY_MIN_BATCH = 16
+ 
+ # Maximum memories per duplicate cluster sent to LLM.
+ _MAX_CLUSTER_SIZE = 15
+@@ -70,6 +108,20 @@ _MAX_CLUSTER_SIZE = 15
+ # Maximum similar neighbors to check per memory during duplicate detection.
+ _DUPLICATE_NEIGHBORS = 5
+ 
++# LOCAL-PATCH: action classes used to order apply (see _apply_priority).
++_DESTRUCTIVE_ACTIONS = frozenset({"delete"})
++
++
++def _apply_priority(issue: "FsckIssue") -> int:
++    """Order issues for apply: 0 = writes only, 1 = contains a delete.
++
++    All phases are computed against one corpus snapshot. Duplicate findings delete
++    rows that reclassify/contradiction findings also reference, so running them in
++    scan order makes those later issues unapplicable - permanently. Writes first
++    keeps their targets alive.
++    """
++    return 1 if any((a.action in _DESTRUCTIVE_ACTIONS) for a in issue.actions) else 0
++
+ 
+ # ── Data structures ──────────────────────────────────────────────────
+ 
+@@ -911,6 +963,34 @@ class FsckService:
+ 
+             self._stamp_clean_memories(check, memories, check_id)
+ 
++            # LOCAL-PATCH: drop findings whose target memories vanished while this check was
++            # running. Every phase is computed against the snapshot taken at scan start, and
++            # the store keeps moving underneath it (dedup merges, consolidation, chat
++            # writes). Last night that produced 76 queued rows, 71 pointing at deleted
++            # memories; today check d91db252 reproduced the identical shape - it queued a
++            # reclassify of 81316e1d, which was gone from the store by the time the UI
++            # rendered it. Marking such rows superseded at apply time hides them inside one
++            # check, so the next scan shows them again. Dropping them when the check is built
++            # leaves a review list of findings that can actually be actioned.
++            kept_issues: list[FsckIssue] = []
++            stale_issues = 0
++            for issue in check.issues:
++                if self._targets_all_absent(issue):
++                    stale_issues += 1
++                    continue
++                kept_issues.append(issue)
++            if stale_issues:
++                check.issues = kept_issues
++                check.summary = self._build_summary(kept_issues)
++                check.progress.issues_found = len(kept_issues)
++                logger.info(
++                    "Fsck check %s: dropped %d finding(s) whose target memories are gone "
++                    "from the store (%d actionable left)",
++                    check_id,
++                    stale_issues,
++                    len(kept_issues),
++                )
++
+             # Build summary
+             check.progress.phase = "done"
+             check.summary = self._build_summary(check.issues)
+@@ -1053,6 +1133,50 @@ class FsckService:
+             session_agent_id + ":"
+         )
+ 
++    def _finding_is_stale(self, issue: FsckIssue) -> bool:
++        """True when no target is in the state the scan described any more.
++
++        A finding is obsolete (not pending) when every target has either been
++        deleted, or has a revision different from the one recorded at scan time -
++        the memory was rewritten by consolidation/chat writes after the plan was
++        built. The apply journal already encodes this: those operations are stored
++        as 'superseded', and apply_check refuses to replay a superseded operation.
++        That is correct behaviour, but it left the row on the review list with no
++        explanation. Staleness is what 'nothing left to fix' means here.
++        """
++        expected = {
++            memory.id: (memory.metadata or {}).get("revision")
++            for memory in issue.affected_memories
++        }
++        ids = {a.memory_id for a in issue.actions if a.memory_id} or set(expected)
++        if not ids:
++            return False
++        id_list = list(ids)
++        live = {m["id"]: m for m in self._vector.get_by_ids_strict(id_list) if m}
++        for memory_id in ids:
++            memory = live.get(memory_id)
++            if memory is None:
++                continue  # gone counts as moved on
++            exp = expected.get(memory_id)
++            current = (memory.get("metadata") or {}).get("revision")
++            if exp is None or current == exp:
++                return False  # this target is exactly as scanned - fix is live
++        return True
++
++    def _targets_all_absent(self, issue: FsckIssue) -> bool:
++        """True when every memory this issue targets is gone from the store.
++
++        LOCAL-PATCH companion to the superseded status in apply_check: such an
++        issue cannot ever apply, because the row it referred to has already been
++        merged away by a delete.
++        """
++        ids = {a.memory_id for a in issue.actions if a.memory_id}
++        if not ids:
++            ids = {m.id for m in issue.affected_memories if m.id}
++        if not ids:
++            return False
++        return all(self._vector.get_by_id(memory_id) is None for memory_id in ids)
++
+     def apply_check(
+         self,
+         check_id: str,
+@@ -1104,9 +1228,20 @@ class FsckService:
+         else:
+             issues = list(check.issues)
+ 
++        # LOCAL-PATCH: apply non-destructive fixes before deletes.
++        # Every phase is computed against one corpus snapshot, and duplicate issues
++        # delete rows that reclassify/contradiction issues also reference. In scan
++        # order the deletes run first, so those later issues find their target gone,
++        # execute zero actions, and stay on the review list forever (observed: 76 of
++        # 646 stuck, 71 of them pointing at deleted memories). Doing the writes
++        # first means a reclassify lands while its target still exists. Python's
++        # sort is stable, so scan order is preserved within each class.
++        issues.sort(key=_apply_priority)
++
+         applied = 0
+         skipped = 0
+         failed = 0
++        superseded = 0
+         details: list[dict] = []
+ 
+         for issue in issues:
+@@ -1178,6 +1313,30 @@ class FsckService:
+                         for memory in issue.affected_memories
+                     }
+                     for index, action in enumerate(issue.actions):
++                        # LOCAL-PATCH: the LLM proposes categories, and it invents
++                        # tokens outside the taxonomy (observed: 'news_briefing_flashcard',
++                        # 'weather'). Strict validation then aborts the write, so the
++                        # issue never applies and the row is stuck. Sanitize the
++                        # proposal here - before the plan and its fingerprints are
++                        # computed - so _apply_issue writes validated categories.
++                        if (
++                            isinstance(action.new_metadata, dict)
++                            and action.new_metadata.get("categories")
++                        ):
++                            proposed = action.new_metadata["categories"]
++                            cleaned = sanitize_categories(proposed)
++                            if cleaned != proposed:
++                                logger.info(
++                                    "Fsck apply: reclassifying with sanitized categories "
++                                    "%s -> %s (issue %s)",
++                                    proposed,
++                                    cleaned,
++                                    issue.issue_id,
++                                )
++                                action.new_metadata = {
++                                    **action.new_metadata,
++                                    "categories": cleaned,
++                                }
+                         source = (
+                             self._vector.get_by_id(action.memory_id)
+                             if action.memory_id
+@@ -1233,6 +1392,55 @@ class FsckService:
+                         "skipped",
+                         "superseded",
+                     }:
++                        # LOCAL-PATCH: this journal short-circuit is the reason an
++                        # "apply fix" row never disappears. The first apply recorded a
++                        # terminal 'skipped' operation for every issue whose targets were
++                        # gone, so every later click re-skips it here and the row stays
++                        # on the review list for the life of the check. When every target
++                        # is absent the finding is already resolved - the row was deleted
++                        # and merged into a survivor - so record it as superseded and let
++                        # it leave the list. Issues that still have a live target stay
++                        # visible and retryable through the normal path below (their
++                        # journal checkpoints are terminal, so re-executing them needs
++                        # the re-evaluate/terminalize flow, not a silent bypass).
++                        journal_status = existing_operation.get("status")
++                        # A journal entry of 'superseded' means the revision system
++                        # closed this operation - a newer operation on the same lineage
++                        # replaced it, and replaying it is refused by design. The finding
++                        # is therefore closed, not pending, so it must leave the review
++                        # list; the next scheduled scan re-raises it from current data if
++                        # the problem is still real. 'skipped' stays retryable (upstream
++                        # treats those as transient).
++                        if self._targets_all_absent(issue) or (
++                            journal_status == "superseded"
++                            or self._finding_is_stale(issue)
++                        ):
++                            check.applied_issue_ids.add(issue.issue_id)
++                            superseded += 1
++                            logger.info(
++                                "Fsck apply: issue %s (%s) marked superseded - journal=%s "
++                                "and no target is in the scanned state any more",
++                                issue.issue_id,
++                                issue.type,
++                                journal_status,
++                            )
++                            details.append(
++                                {
++                                    "issue_id": issue.issue_id,
++                                    "status": "superseded",
++                                    "actions_executed": 0,
++                                    "actions_skipped": len(plan),
++                                }
++                            )
++                            continue
++                        if journal_status != "committed":
++                            logger.info(
++                                "Fsck apply: issue %s (%s) journal=%s with live targets "
++                                "remaining - left for re-evaluate/terminalize",
++                                issue.issue_id,
++                                issue.type,
++                                journal_status,
++                            )
+                         skipped += 1
+                         details.append(
+                             {
+@@ -1547,6 +1755,24 @@ class FsckService:
+                     check.applied_issue_ids.add(issue.issue_id)
+                     applied += 1
+                     status = "applied"
++                elif self._targets_all_absent(issue):
++                    # LOCAL-PATCH: every target of this issue is gone from the store.
++                    # A delete in this run (or an earlier apply) already resolved the
++                    # finding by merging the row into a survivor, so there is nothing
++                    # left to fix - yet the original code deliberately left such issues
++                    # retryable "so transient misses don't permanently block fixes".
++                    # For a deleted target it is not transient, so the row sat on the
++                    # dashboard permanently. Mark it superseded so it leaves the list.
++                    check.applied_issue_ids.add(issue.issue_id)
++                    superseded += 1
++                    status = "superseded"
++                    logger.info(
++                        "Fsck apply: issue %s (%s) superseded - all %d target(s) are "
++                        "no longer in the store",
++                        issue.issue_id,
++                        issue.type,
++                        len({a.memory_id for a in issue.actions if a.memory_id}),
++                    )
+                 else:
+                     skipped += 1
+                     status = "skipped"
+@@ -1635,6 +1861,7 @@ class FsckService:
+         return {
+             "applied": applied,
+             "skipped": skipped,
++            "superseded": superseded,
+             "failed": failed,
+             "details": details,
+         }
+@@ -2050,6 +2277,7 @@ class FsckService:
+             temperature=0.1,
+             reasoning_effort=self._reasoning_effort,
+             operation="fsck_security",
++            max_tokens=_FSCK_MAX_TOKENS,
+         )
+ 
+         try:
+@@ -2332,9 +2560,10 @@ class FsckService:
+             temperature=0.1,
+             reasoning_effort=self._reasoning_effort,
+             operation="fsck_dedup",
++            max_tokens=_FSCK_DEDUP_MAX_TOKENS,
+         )
+ 
+-        parsed = parse_json_response(response)
++        parsed = self._parse_llm_json(response, "duplicate check")
+         if not parsed or "issues" not in parsed:
+             return []
+ 
+@@ -2511,6 +2740,7 @@ class FsckService:
+             temperature=0.1,
+             reasoning_effort=self._reasoning_effort,
+             operation="fsck_content_quality",
++            max_tokens=_FSCK_MAX_TOKENS,
+         )
+ 
+         return self._parse_quality_response(
+@@ -2522,6 +2752,7 @@ class FsckService:
+         batch: list[dict],
+         *,
+         available_categories: list[str] | None = None,
++        allow_split: bool = True,
+     ) -> list[FsckIssue]:
+         """Pass B: check a batch of memories for metadata issues."""
+         messages, schema, id_mapping = build_fsck_metadata_normalization_prompt(
+@@ -2534,12 +2765,69 @@ class FsckService:
+             temperature=0.1,
+             reasoning_effort=self._reasoning_effort,
+             operation="fsck_metadata_normalization",
++            max_tokens=_FSCK_METADATA_MAX_TOKENS,
+         )
+ 
+-        return self._parse_quality_response(
+-            response, id_mapping, batch, default_type="reclassify"
++        parsed = self._parse_llm_json(response, "metadata normalization")
++        if parsed is None and allow_split and len(batch) >= _METADATA_RETRY_MIN_BATCH:
++            # LOCAL-PATCH: see the constant block - at batch 30 this pass truncated and
++            # salvage recovered nothing, so 30 memories silently lost their metadata
++            # pass. Halving halves the echoed output. One level only (sub-batches pass
++            # allow_split=False), and it fires solely on an unparseable reply.
++            mid = len(batch) // 2
++            logger.info(
++                "Fsck metadata normalization: batch of %d unparseable after salvage - "
++                "retrying as %d + %d",
++                len(batch),
++                mid,
++                len(batch) - mid,
++            )
++            issues: list[FsckIssue] = []
++            for sub in (batch[:mid], batch[mid:]):
++                issues.extend(
++                    self._evaluate_metadata_normalization_batch(
++                        sub,
++                        available_categories=available_categories,
++                        allow_split=False,
++                    )
++                )
++            return issues
++
++        return self._issues_from_parsed(
++            parsed, id_mapping, batch, default_type="reclassify"
+         )
+ 
++    def _parse_llm_json(self, response: str, context: str) -> dict[str, Any] | None:
++        """Parse an fsck reply, salvaging the issues that closed before a cut.
++
++        Truncation must not raise: the batch is skipped and the run continues.
++        Salvaged objects still pass the alias/ID validation downstream, so a
++        whitespace or unknown memory_id cannot reach an UPDATE.
++        """
++        try:
++            parsed = parse_json_response(response)
++            if isinstance(parsed, dict) and isinstance(parsed.get("issues"), list):
++                return parsed
++            return None
++        except ValueError:
++            salvaged = salvage_json_objects(response, "issues")
++            if salvaged:
++                # LOCAL-PATCH 2026-10-07: salvage_json_objects returns a flat list of the
++                # closed array items. The old code called .get("issues") on that list
++                # (AttributeError) and returned the bare list, which _issues_from_parsed
++                # then silently discarded. Wrap it in the envelope callers expect.
++                logger.warning(
++                    "Fsck %s: truncated response, salvaged %d complete issues",
++                    context,
++                    len(salvaged),
++                )
++                return {"issues": salvaged}
++            logger.warning(
++                "Fsck %s: unparseable response after salvage, skipping batch",
++                context,
++            )
++            return None
++
+     def _parse_quality_response(
+         self,
+         response: str,
+@@ -2549,7 +2837,24 @@ class FsckService:
+         default_type: str = "quality",
+     ) -> list[FsckIssue]:
+         """Parse an LLM quality/metadata response into ``FsckIssue`` objects."""
+-        parsed = parse_json_response(response)
++        parsed = self._parse_llm_json(response, "quality check")
++        return self._issues_from_parsed(
++            parsed, id_mapping, batch, default_type=default_type
++        )
++
++    def _issues_from_parsed(
++        self,
++        parsed: dict[str, Any] | None,
++        id_mapping: dict[str, str],
++        batch: list[dict],
++        *,
++        default_type: str = "quality",
++    ) -> list[FsckIssue]:
++        """Build ``FsckIssue`` objects from an already-parsed reply.
++
++        LOCAL-PATCH: split out of _parse_quality_response so Pass B can parse once,
++        decide on a recovery split, and then build issues without a second parse.
++        """
+         if not parsed or "issues" not in parsed:
+             return []
+ 
+@@ -2557,10 +2862,27 @@ class FsckService:
+         mem_lookup = {m["id"]: m for m in batch}
+ 
+         issues: list[FsckIssue] = []
++        noop_dropped = 0
+         for raw_issue in parsed["issues"]:
+             actions, action_target_ids = self._parse_issue_actions(
+                 raw_issue, id_mapping, mem_lookup
+             )
++            # LOCAL-PATCH: drop actions that propose the state the memory already has, and
++            # drop the issue when that was its only action. The metadata pass is told the
++            # current type/categories/importance in the prompt and still prescribes them
++            # back unchanged - seen in the UI: a reclassify of an episodic/#technical memory
++            # proposing type=episodic, categories=#technical. Applying that changes nothing,
++            # so the memory never moves and the next scan flags it again: the permanent
++            # 59-row "misclassified" pile. A finding that changes nothing is not a finding.
++            live_actions = [
++                action
++                for action in actions
++                if not self._action_matches_stored_state(action, mem_lookup)
++            ]
++            if actions and not live_actions:
++                noop_dropped += 1
++                continue
++            actions = live_actions
+             affected_mems = self._resolve_affected_memories(
+                 raw_issue, id_mapping, mem_lookup, action_target_ids
+             )
+@@ -2603,8 +2925,54 @@ class FsckService:
+                 )
+             )
+ 
++        if noop_dropped:
++            logger.info(
++                "Fsck quality check: dropped %d no-op finding(s) - proposed metadata "
++                "already matches the stored memory",
++                noop_dropped,
++            )
+         return issues
+ 
++    # Metadata fields a reclassify/normalization action can change.
++    _METADATA_NOOP_FIELDS = ("memory_type", "categories", "importance", "pinned", "role")
++
++    def _action_matches_stored_state(
++        self, action: FsckAction, mem_lookup: dict[str, dict[str, Any]]
++    ) -> bool:
++        """True when this update action would not change the stored memory at all."""
++        if action.action != "update":
++            return False
++        proposed = action.new_metadata or {}
++        if not proposed:
++            return False
++        memory = mem_lookup.get(action.memory_id or "")
++        if memory is None:
++            return False
++        current = memory.get("metadata") or {}
++        if action.new_content:
++            stored_text = memory.get("memory") or memory.get("content") or ""
++            if action.new_content.strip() != stored_text.strip():
++                return False
++        compared = 0
++        for field in self._METADATA_NOOP_FIELDS:
++            if field not in proposed:
++                continue
++            want = proposed[field]
++            have = current.get(field)
++            if field == "categories":
++                if sorted(str(x) for x in (want or [])) != sorted(
++                    str(x) for x in (have or [])
++                ):
++                    return False
++            elif field == "pinned":
++                if bool(want) != bool(have):
++                    return False
++            else:
++                if str(want).strip().lower() != str(have).strip().lower():
++                    return False
++            compared += 1
++        return compared > 0
++
+     @staticmethod
+     def _get_memory_agent_id(mem: dict[str, Any]) -> str | None:
+         """Return the memory agent ID from the normalized memory shape."""
+@@ -2907,6 +3275,15 @@ class FsckService:
+                     kwargs.update(meta)
+                     if action.new_content is None:
+                         kwargs.pop("content")
++                    else:
++                        # action.new_content is model output. This path had no
++                        # content guard, so prompt formatting written by the
++                        # dedup model was persisted verbatim; clean it, and keep
++                        # the original only if the guard finds nothing usable
++                        # (never fail an fsck action over formatting).
++                        cleaned = clean_memory_text(action.new_content)
++                        if cleaned:
++                            kwargs["content"] = cleaned
+                     start_action(index)
+                     mutation = self._memory_service.update_memory(
+                         action.memory_id, **kwargs
+@@ -3099,7 +3476,10 @@ class FsckService:
+ 
+                     start_action(index)
+                     self._memory_service.add_memory(
+-                        content=action.new_content,
++                        # Same guard as the update path above: fsck-authored
++                        # text is model output, not trusted content.
++                        content=clean_memory_text(action.new_content)
++                        or action.new_content,
+                         user_id=user_id,
+                         owner_id=source_owner_id,
+                         agent_id=source_agent_id or meta.get("agent_id"),
+@@ -3189,3 +3569,4 @@ class FsckService:
+                 summary.security += 1
+             summary.total += 1
+         return summary
++
+diff --git a/mnemory/llm.py b/mnemory/llm.py
+index 3840ea2..f0854e6 100644
+--- a/mnemory/llm.py
++++ b/mnemory/llm.py
+@@ -46,7 +46,15 @@ class LLMClient:
+         *,
+         json_schema: dict[str, Any] | None = None,
+         temperature: float | None = None,
+-        max_tokens: int = 16384,
++        # LOCAL-PATCH 2026-10-07: 16384 -> 12288. The extractor profile is
++        # --ctx-size 65536 --parallel 2 --kv-unified, so 65536 tokens is the whole
++        # shared KV pool, not a per-slot allowance. A long-chat extraction request
++        # (20k-token history + 16384 generation = ~36k) means two slots need ~72k,
++        # which exceeds the pool and forces prompt-cache eviction. Measured: the
++        # 59,602-char truncation in the last week came from this ceiling. 12288
++        # keeps headroom for the big-prompt path; fsck and consolidation pass their
++        # own ceilings (6144 / 8192) and are unaffected.
++        max_tokens: int = 12288,
+         reasoning_effort: str | None = None,
+         operation: str = "unknown",
+     ) -> str:
+@@ -361,3 +369,60 @@ def parse_json_response(text: str) -> dict[str, Any]:
+             pass
+ 
+     raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}")
++
++
++def salvage_json_objects(text: str, key: str = "memories") -> list[dict[str, Any]] | None:
++    """Recover complete objects from a truncated JSON array in an LLM reply.
++
++    A response cut off by the token cap keeps every fully closed object
++    before the cut. Walk the array, collect complete objects, ignore the
++    trailing fragment. Returns None when nothing is recoverable.
++    """
++    cleaned = _clean_response(text)
++    anchor = cleaned.find(f'"{key}"')
++    start = cleaned.find("[", anchor + 1) if anchor != -1 else -1
++    if start == -1:
++        return None
++
++    objects: list[dict[str, Any]] = []
++    depth = 0
++    obj_start = None
++    in_str = False
++    escaped = False
++
++    for i in range(start, len(cleaned)):
++        char = cleaned[i]
++        if in_str:
++            if escaped:
++                escaped = False
++            elif char == "\\":
++                escaped = True
++            elif char == '"':
++                in_str = False
++            continue
++        if char == '"':
++            in_str = True
++        elif char == "{":
++            if depth == 0:
++                obj_start = i
++            depth += 1
++        elif char == "}":
++            depth -= 1
++            if depth == 0 and obj_start is not None:
++                try:
++                    obj = json.loads(cleaned[obj_start : i + 1])
++                    # LOCAL-PATCH 2026-10-07: was `obj.get("text")`, which hardcoded the
++                    # remember-extraction shape. fsck calls this with key="issues" and
++                    # issue objects carry type/severity/actions - no "text" - so the
++                    # filter rejected every object and fsck truncation recovery never
++                    # recovered anything (46 truncations in one run, 46 dead skips).
++                    # The walk only collects depth-0 items of the anchored array, i.e.
++                    # exactly the payload entries, so accept any object.
++                    if isinstance(obj, dict):
++                        objects.append(obj)
++                except json.JSONDecodeError:
++                    pass
++                obj_start = None
++
++    return objects or None
++
+diff --git a/mnemory/maintenance.py b/mnemory/maintenance.py
+index ac0b185..1c28659 100644
+--- a/mnemory/maintenance.py
++++ b/mnemory/maintenance.py
+@@ -184,10 +184,11 @@ class MaintenanceService:
+         min_confidence = self._config.memory.fsck_auto_min_confidence
+         min_severity = self._config.memory.fsck_auto_min_severity
+ 
+-        # Auto-fsck is durable-only by design. Raw memories are handled by the
+-        # separate session/consolidation lifecycle.
+-        # Manual run-now is always a full scan (incremental=False).
+-        self._fsck.run_check(check_id, include_raw=False, incremental=False)
++        # LOCAL-PATCH: raws are included. The session/consolidation lifecycle
++        # writes raw notes that fsck never saw in durable-only mode, so
++        # duplicate/garbled raws accumulated un-checked. Manual run-now stays
++        # a full scan (incremental=False).
++        self._fsck.run_check(check_id, include_raw=True, incremental=False)
+ 
+         check = self._fsck.get_check(check_id)
+         if check is None or check.status != "completed":
+@@ -224,11 +225,16 @@ class MaintenanceService:
+             result = self._fsck.apply_check(check_id, qualifying_ids)
+             fixes_applied = result.get("applied", 0)
+             fixes_failed = result.get("failed", 0)
++            # LOCAL-PATCH: log the two counts the old line swallowed. apply_check
++            # returns applied/skipped/superseded/failed, and skips were invisible -
++            # 635 queued with applied=559, failed=5 meant 71 silently stuck rows.
+             logger.info(
+-                "Auto-fsck (manual): user %s — applied=%d, failed=%d",
++                "Auto-fsck (manual): user %s — applied=%d, failed=%d, skipped=%d, superseded=%d",
+                 user_id,
+                 fixes_applied,
+                 fixes_failed,
++                result.get("skipped", 0),
++                result.get("superseded", 0),
+             )
+         else:
+             logger.debug(
+@@ -336,7 +342,10 @@ class MaintenanceService:
+             session = await asyncio.to_thread(
+                 store.get, record["session_id"], point_id=record["_point_id"]
+             )
+-            if not session or session.get("consolidation_state") != "idle":
++            # LOCAL-PATCH: accept "failed" alongside "idle" — see maintenance_page.
++            # Ownership guards below (consolidation_token / retry_operation_token)
++            # still fence anything another worker holds.
++            if not session or session.get("consolidation_state") not in ("idle", "failed"):
+                 continue
+             if session.get("consolidation_token") or session.get(
+                 "retry_operation_token"
+@@ -478,8 +487,11 @@ class MaintenanceService:
+ 
+         # run_check() is synchronous and CPU/IO-bound (LLM calls via requests).
+         # Run in a thread pool to avoid blocking the event loop.
+-        # Auto-fsck is durable-only by design. Raw memories are handled by the
+-        # separate session/consolidation lifecycle.
++        # LOCAL-PATCH: raws included (see _run_fsck_worker). incremental=True keeps
++        # the cost bounded — only memories changed since their checked_at stamp are
++        # re-examined, so a cycle pays for new raw notes, not the whole store.
++        # Upstream 1.15.1 route: go through the worker so fsck lifecycle telemetry
++        # is recorded even when this await is cancelled.
+         await asyncio.to_thread(self._run_fsck_worker, check_id)
+ 
+         check = self._fsck.get_check(check_id)
+@@ -521,11 +533,14 @@ class MaintenanceService:
+                 )
+                 fixes_applied = result.get("applied", 0)
+                 fixes_failed = result.get("failed", 0)
++                # LOCAL-PATCH: see the manual-run site above.
+                 logger.info(
+-                    "Auto-fsck: user %s — applied=%d, failed=%d",
++                    "Auto-fsck: user %s — applied=%d, failed=%d, skipped=%d, superseded=%d",
+                     user_id,
+                     fixes_applied,
+                     fixes_failed,
++                    result.get("skipped", 0),
++                    result.get("superseded", 0),
+                 )
+             else:
+                 logger.debug(
+@@ -554,7 +569,10 @@ class MaintenanceService:
+         if self._collector is not None:
+             self._collector.record_maintenance_lifecycle("fsck", "started")
+         try:
+-            self._fsck.run_check(check_id, include_raw=False, incremental=True)
++            # LOCAL-PATCH: include_raw=True. The session/consolidation lifecycle
++            # writes raw notes that durable-only fsck never saw, so duplicate and
++            # garbled raws accumulated un-checked. incremental=True bounds the cost.
++            self._fsck.run_check(check_id, include_raw=True, incremental=True)
+             check = self._fsck.get_check(check_id)
+             if check is not None and check.status == "completed":
+                 outcome = "completed"
+@@ -590,3 +608,4 @@ class MaintenanceService:
+         issue_sev_order = _SEVERITY_ORDER.get(severity.lower(), 0)
+         min_sev_order = _SEVERITY_ORDER.get(min_severity.lower(), 0)
+         return issue_sev_order >= min_sev_order
++
+diff --git a/mnemory/memory.py b/mnemory/memory.py
+index bf68754..7b0da15 100644
+--- a/mnemory/memory.py
++++ b/mnemory/memory.py
+@@ -37,6 +37,7 @@ from mnemory.categories import (
+ )
+ from mnemory.config import Config
+ from mnemory.llm import LLMClient, parse_json_response
++from mnemory.output_guards import noise_enforcing, triage_memory
+ from mnemory.prompts import (
+     build_answer_prompt,
+     build_classification_prompt,
+@@ -1317,6 +1318,34 @@ class MemoryService:
+             if not facts:
+                 return []
+ 
++        # Write-side noise guard (see output_guards.noise_memory). Runs before
++        # embedding so a noise row costs neither a vector nor a dedup slot.
++        # Narration is unwrapped rather than dropped where the clause is a
++        # real statement (see output_guards.triage_memory).
++        flagged = []
++        for f in facts:
++            new_text, reason, rewrote = triage_memory(f.get("text", ""))
++            if rewrote:
++                logger.info(
++                    "Remember speech-act rewrite: %.80s -> %.80s",
++                    f.get("text", ""), new_text,
++                )
++                f["text"] = new_text
++            flagged.append((f, reason))
++        if any(reason for _, reason in flagged):
++            enforcing = noise_enforcing()
++            for fact, reason in flagged:
++                if reason:
++                    logger.info(
++                        "Remember noise guard: %s (%s): %.80s",
++                        "dropped" if enforcing else "would drop (log only)",
++                        reason, fact.get("text", ""),
++                    )
++            if enforcing:
++                facts = [f for f, reason in flagged if not reason]
++                if not facts:
++                    return []
++
+         # 1. Batch embed all fact texts
+         fact_texts = [f["text"] for f in facts]
+         try:
+@@ -1344,13 +1373,15 @@ class MemoryService:
+             # shared memories, so both user and assistant facts are deduped
+             # against the full visible set (agent-scoped + shared).
+             # Exclude consolidated memories — remember dedup only touches raw layer.
++            # Candidate pool widened 5 -> 10: rephrased near-duplicates
++            # were ranking below the top-5 and slipping through as ADDs.
+             existing_raw = self.vector.search_similar(
+                 vector,
+                 user_id=user_id,
+                 owner_id=owner_id,
+                 subject_user_id=user_id,
+                 agent_id=agent_id,
+-                limit=5,
++                limit=10,
+                 exclude_layers=["consolidated"],
+             )
+             # Dual-scope: also check shared memories when agent_id is set
+@@ -1366,7 +1397,7 @@ class MemoryService:
+                         owner_id=owner_id,
+                         agent_id=None,
+                         shared_only=True,
+-                        limit=5,
++                        limit=10,
+                         exclude_layers=["consolidated"],
+                     )
+                 seen_ids: set[str] = set()
+@@ -1380,7 +1411,7 @@ class MemoryService:
+                     if mid and mid not in seen_ids:
+                         seen_ids.add(mid)
+                         merged.append(mem)
+-                existing_raw = merged[:5]
++                existing_raw = merged[:10]
+ 
+             # Filter by dedup threshold
+             candidates = [
+diff --git a/mnemory/output_guards.py b/mnemory/output_guards.py
+new file mode 100644
+index 0000000..344d602
+--- /dev/null
++++ b/mnemory/output_guards.py
+@@ -0,0 +1,485 @@
++"""Deterministic content guards for LLM-written memory text.
++
++Why this exists: structured output IS enforced against the extraction endpoint
++(verified against llama-swap build b1-847f447: a json_schema request returns
++the exact schema shape, three times running). Grammar cannot help therefore, because the
++artifacts below are perfectly valid strings inside an allowed ``text`` field.
++Two independent reproductions in a production store on 2026-10-08:
++
++  "- id=0: Assistant recommended explicitly disabling the healthcheck ..."
++  "- [type: fact | categories: technical, project:mnemory | importance: high |
++     role: assistant] Assistant decided to enable automatic merge ..."
++
++Those are the consolidation prompt's own alias and metadata-tag formats leaking
++into stored text, and the second reproduced leak is a user-subject fact emitted
++by the assistant pass, which then becomes ``role=assistant`` and lands in the
++agent-identity section of every future prompt. A prompt rule was tried first and
++does not hold a 4B model, so the fix is here: strip what is formatting, drop what
++is not the writer's role to write.
++
++No third-party imports, so this module is unit-testable without the service.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++
++__all__ = [
++    "clean_memory_text",
++    "noise_enforcing",
++    "noise_memory",
++    "pin_allowed",
++    "role_mismatch",
++    "triage_memory",
++]
++
++#: Below this length, cleaned text carries no usable statement.
++MIN_CLEAN_LENGTH = 12
++
++#: Apostrophe, either form.  The extractor writes typographic punctuation into
++#: its facts as a matter of course, so an ASCII-only apostrophe in a guard
++#: pattern silently misses most real rows.  Defined here, above every pattern
++#: that uses it.  tests/test_output_guards_punctuation.py enforces the twin for
++#: all patterns in this module, so the next one added cannot repeat the mistake.
++_APOS = r"['\u2019]"
++
++# Leading markdown/list noise, including the doubled "- - " form.
++_LIST_MARKER_RE = re.compile(r"^\s*(?:[-*\u2022]\s+)+")
++
++# The consolidation prompt numbers its sources S0..Sn and its fsck/dedup prompts
++# number memories id=0, id=1. Neither belongs in user-facing memory text.
++# The optional " (pinned)" group matches the flag build_fsck_duplicate_prompt has
++# emitted since 2026-10-09; without it, "- id=0 (pinned): " survives into stored
++# text and the guard that exists to catch prompt echoes would miss this one.
++_ALIAS_PREFIX_RE = re.compile(
++    r"^\s*(?:\(\s*)?id\s*=\s*\d+\s*(?:\))?\s*(?:\(\s*pinned\s*\))?\s*[:\-\u2013]\s*",
++    re.IGNORECASE,
++)
++# Punctuation is required: without it, real text such as "S3 lifecycle rules
++# were configured" would be mistaken for a source alias and have its subject cut.
++_SOURCE_PREFIX_RE = re.compile(r"^\s*(?:\(\s*)?\[?\s*S\d{1,3}\s*\)?\s*\]?\s*[:\-]\s+")
++
++# A metadata tag block. Two flavours reproduced in the production store:
++#   "[type: fact | categories: ... | importance: high]"      consolidation
++#   "[scope: open-webui | type: ... | created: 2026-10-08]"  fsck dedup
++# Measured 2026-10-09 over 116 stored blocks: 75 open with "scope:", 41 with
++# "type:". Keying on "type" alone - the original form of this regex - missed
++# 65% of them, including the whole fsck flavour. Both keys are specific enough
++# that ordinary brackets ("[S1]", "[10]", "[[nested]]") are still left alone.
++_METADATA_BLOCK_RE = re.compile(r"\[\s*(?:scope|type)\s*:[^\]]{0,400}?\]", re.IGNORECASE)
++
++# mnemory's boundary tags (U+27E8 / U+27E9) used by wrap_with_boundary(). The
++# whole tag goes, not just the brackets: a test showed stripping only the
++# brackets left "memory_item" embedded in the sentence.
++_BOUNDARY_TAG_RE = re.compile(r"\u27e8/?[a-z_]*\u27e9")
++
++# Prompt scaffolding that must never survive into stored text.
++_SCHEMA_WORD_RE = re.compile(
++    r"^\s*(?:store_artifact|source_ids|memory_type|event_date)\s*[:=].*$", re.IGNORECASE
++)
++
++_WHITESPACE_RE = re.compile(r"\s{2,}")
++
++
++def clean_memory_text(text: str | None, min_length: int = MIN_CLEAN_LENGTH) -> str | None:
++    """Strip prompt/format artifacts from a memory text.
++
++    Returns the cleaned text, or ``None`` when nothing usable survives. Never
++    rewrites wording: it only removes framing, so a real fact cannot be
++    silently rephrased into a different claim.
++    """
++    if not text:
++        return None
++    cleaned = text
++    for pattern in (_LIST_MARKER_RE, _ALIAS_PREFIX_RE):
++        cleaned = pattern.sub("", cleaned, count=1)
++    cleaned = _METADATA_BLOCK_RE.sub(" ", cleaned)
++    cleaned = _BOUNDARY_TAG_RE.sub("", cleaned)
++    if _SCHEMA_WORD_RE.match(cleaned.strip()):
++        return None
++    # Retry the source alias prefix after list markers were removed.
++    cleaned = _LIST_MARKER_RE.sub("", cleaned, count=1)
++    cleaned = _SOURCE_PREFIX_RE.sub("", cleaned, count=1)
++    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip().strip("-—").strip()
++    if len(cleaned) < min_length:
++        return None
++    return cleaned
++
++
++def role_mismatch(text: str | None, role: str) -> str | None:
++    """Return a machine-readable reason when a memory is in the wrong pass.
++
++    Only one direction is actionable. The assistant pass reads a session summary
++    that also describes the user's decisions, so it re-emits them with an
++    assistant subject; those are safe to drop, because the same summary drives
++    the user pass and the underlying raw memories stay until superseded. The
++    reverse direction is reported but never dropped: an assistant-subject fact
++    in the user pass has no second writer, so removing it would lose information.
++    """
++    if not text:
++        return None
++    probe = _LIST_MARKER_RE.sub("", text, count=1).strip()
++    if role == "assistant" and re.match(r"^(?:User|The user)\b", probe, re.IGNORECASE):
++        return "assistant_pass_user_subject"
++    if role == "user" and re.match(r"^Assistant\b", probe, re.IGNORECASE):
++        return "user_pass_assistant_subject"
++    return None
++
++
++# ── write-side noise guard ────────────────────────────────────────────────
++# Why: the extractor and the consolidator both store the *act* of asking or
++# answering as though it were a durable statement, and both store housekeeping
++# counts about this very store. None of those carry information a future turn
++# can use, yet each one occupies a retrieval slot for the life of the store.
++# Measured 2026-10-15 on a 2705-row store: 15 such rows in one probe pass, and
++# every probe ("user asked", "assistant offered") surfaced more of the species.
++# Two of them were injected into a live turn within minutes of being written,
++# which is how this became worth blocking at the writer instead of purging.
++#
++# Deliberately narrow. The failure mode that matters is dropping a real fact,
++# so the patterns key on a speech-act or question *head* (subject + verb in
++# clause-initial position), never on a topic word: "User's maximum heart rate
++# is 188 BPM" and "The fsck dedup call site echoes cluster content" must both
++# survive, and both are covered by MUST_KEEP in tests/test_output_guards_noise.py.
++# Bare domain words ("mnemory", "dedup", "knee") are never sufficient on their
++# own, because this user's real work and health facts contain them.
++
++#: "User is asking who the assistant is" / "User asked how old they are"
++_QUESTION_PROGRESS_RE = re.compile(
++    r"^\s*(?:the\s+)?user\s+(?:is|was|has\s+been|keeps)\s+"
++    r"(?:asked|asking|inquir(?:e|ed|ing)|wonder(?:ed|ing)|wants\s+to\s+know)"
++    r"\b",
++    re.IGNORECASE,
++)
++
++#: "User asked how proficient I am in COBOL." - a question, stored as a fact.
++_QUESTION_PAST_RE = re.compile(
++    r"^\s*(?:the\s+)?user\s+(?:inquired|wondered)\b|"
++    r"^\s*(?:the\s+)?user\s+asked\s+(?:how|what|why|whether|if|who|when|"
++    r"where)\b",
++    re.IGNORECASE,
++)
++
++# ── assistant narration: anchored head, verb list, rewriter split ───────────
++#
++# PRECEDENCE BUG CLOSED 2026-10-18. The rule used to read:
++#
++#     r"^\s*assistant(?:'s)?\s+(?:is\s+|...)*(?:will|shall)\s+[a-z]+|"
++#     r"(?:offer|explain|note|agree|report|advis|recommend|...)\b"
++#
++# The `|` between those alternatives is TOP LEVEL, so the second branch was
++# never anchored to "^\s*assistant". Any sentence containing note / agree /
++# report / offer / explain / recommend anywhere at all was classified as
++# assistant narration -- and under MEMORY_NOISE_GUARD=drop, deleted. Measured
++# against five ordinary user facts, all five dropped:
++#
++#   "User's wife Lisandra agreed to the move to Zoetermeer"
++#   "User's note about knee pain says it started in August"
++#   "User keeps a training log and reports it weekly to his coach"
++#
++# It shipped 2026-10-15 and logged 47 hits in the following 24h, which read as
++# a writer producing a great deal of narration. It was mostly the word "note"
++# appearing in prose. Both alternatives now share one anchored head, built once
++# so the noise rule and triage_memory() below cannot drift apart.
++
++#: Clause-initial narration head: subject + optional perfect/progressive modal.
++_ACT_HEAD = (
++    r"^\s*(?:the\s+)?assistant(?:" + _APOS + r"s)?\s+"
++    r"(?:(?:is|was|has|have|had)\s+)*"
++)
++
++#: Reporting verbs that introduce narration rather than a proposition. Outcome
++#: verbs (fixed, added, changed, removed, patched) stay out on purpose, and
++#: "identified" belongs to _ASSISTANT_META_OBJECT_RE, not here.
++_ACT_VERBS = (
++    r"offer(?:s|ed)?|explain(?:s|ed)?|not(?:e|es|ed)|mention(?:s|ed)?|"
++    r"clarif(?:y|ies|ied)|agree[sd]?|declin(?:e|es|ed)|demonstrat(?:e|es|ed)|"
++    r"advis(?:e|es|ed)|warn(?:s|ed)?|recommend(?:s|ed)?|suggest(?:s|ed)?|"
++    r"report(?:s|ed)?|stat(?:e|es|ed)|confirm(?:s|ed)?|said|told|urge[sd]?"
++)
++
++#: "Assistant explained that ..." / "Assistant recommended using ..." /
++#: "Assistant will dump the tokenizer keys".
++_ASSISTANT_ACT_RE = re.compile(
++    # _APOS keeps the module-wide punctuation invariant intact
++    # (tests/test_output_guards_punctuation.py): the extractor writes U+2019.
++    _ACT_HEAD + r"(?:will|shall|would|can|could)\s+[a-z]+"
++    r"|" + _ACT_HEAD + r"(?:" + _ACT_VERBS + r")\b",
++    re.IGNORECASE,
++)
++
++#: Head + reporting verb + everything after it, so triage_memory() can recover
++#: the proposition the narration was wrapped around.
++_ACT_SPLIT_RE = re.compile(
++    _ACT_HEAD + r"(?P<verb>" + _ACT_VERBS + r")\b(?P<rest>.*)\Z",
++    re.IGNORECASE | re.DOTALL,
++)
++
++#: Verbs where the act IS the content; what follows says nothing a later reader
++#: can use ("Assistant offered to adapt it", "agreed to the plan").
++_ACT_ONLY_VERBS = ("offer", "agree", "decline", "apolog")
++
++#: A clause after one of these is an instruction, so when it has no subject of
++#: its own it is labelled as advice instead of being left a floating fragment.
++_ADVICE_VERBS = ("advis", "recommend", "suggest", "urge", "warn", "told",
++                 "tell", "said")
++
++#: A recovered clause shorter than this is not worth keeping.
++MIN_REWRITE_CLAUSE = 20
++
++
++
++#: A pointer to where a fact lives, instead of the fact. Retrieval returns the
++#: pointer and the caller still has to find the real row.
++_POINTER_RE = re.compile(
++    r"^\s*(?:the\s+)?user\s+wants\s+to\s+have\s+.{0,48}\bstored\b|"
++    r"\b(?:real\s+)?name\s+is\s+stored\s+(?:as|at|in)\b",
++    re.IGNORECASE,
++)
++
++#: Housekeeping state of the store itself, e.g. "store contains 408 rows
++#: classified as delete_safe" or "purge: 442 rows retracted, 104 stripped".
++#: Needs a count AND a housekeeping verb, so "grows at 40-60 rows per day"
++#: (a real capacity metric) is not caught.
++_STORE_HOUSEKEEPING_RE = re.compile(
++    r"\b\d[\d,.]*\s*(?:rows?|memories|records|entries)\b"
++    r"[^.]{0,80}\b(?:retract|delet|strip|dedup|purge|classif|archiv|merge)"
++    r"[a-z]*",
++    re.IGNORECASE,
++)
++
++#: Indexical reference into a numbered list the extractor was reading, e.g.
++#: "Fact 5 identifies a specific data corruption issue".  Unresolvable once the
++#: producing chat is gone, so it is information-free to every later reader.
++#: Observed as a cluster of six such rows written on 2026-10-07/08.
++_META_INDEXICAL_RE = re.compile(
++    r"^\s*(?:fact|item|point|entry|row|note|issue|number)\s+\d+\b",
++    re.IGNORECASE,
++)
++
++#: The session clock stored as durable knowledge: "Today's date is Wednesday, 7
++#: October 2026.", and the "user indicated today's date is ..." framing.  Both
++#: were sitting in the store classified as type=fact, i.e. never decaying.
++_DATE_ECHO_RE = re.compile(
++    r"^(?:today|yesterday|tomorrow)(?:" + _APOS + r"s)?\s+date\s+is\b"
++    r"|\btoday(?:" + _APOS + r"s|s)\s+date\b"
++    # Deliberately narrow: only the two shapes actually observed in the store.
++    # A general "the date is ..." rule would drop legitimate facts such as "The
++    # date is August 13, my birthday", and there is no evidence broadening it.
++    r"|^(?:the\s+current\s+)?date\s+(?:is|was)\s+\d",
++    re.IGNORECASE,
++)
++
++#: Literal transcript form -- a bare quoted utterance with no proposition
++#: attached: 'Assistant: "That settles it — lock in 512"'.  _ASSISTANT_ACT_RE
++#: matches narration of the "Assistant explained that ..." kind; it does not
++#: match this quoting shape, which is the same defect wearing different clothes.
++_SPEAKER_QUOTE_RE = re.compile(
++    r'^\s*(?:assistant|user|ai|model)\s*:\s*["\u201c\u2018].*["\u201d\u2019]\s*$',
++    re.IGNORECASE | re.DOTALL,
++)
++
++#: The only subjects a *newly extracted* memory may earn a permanent pin for:
++#: identity, medical, location, role.  The extraction schema makes ``pinned`` a
++#: REQUIRED field, so the model must emit a value on every single fact; without
++#: a server-side allowlist it guesses, and the guesses land in core context.
++#: Measured cost of guessing, from the live store: a Planck-constant
++#: explanation, a resting-HR reading and two credential-audit counts all arrived
++#: pinned=true.  Explicit add_memory/update calls bypass this -- a user asking
++#: to pin something is a different act from a model guessing.
++_PIN_ALLOW_RE = re.compile(
++    r"^(?:user|assistant)(?:" + _APOS + r"s|s)?\s+(?:full\s+)?name\s+is\b"
++    r"|\b(?:born|birthday|date of birth)\b"
++    r"|\b(?:metformin|semaglutide|ozempic|empagliflozin|jardiance|insulin|"
++    r"diabetes|t2d|allerg(?:y|ic)|anaphylaxis|coeliac|celiac|asthma|"
++    r"sulfonylurea|glp-1|sglt2)\b"
++    r"|\b(?:lives|located|resides|based)\s+in\b"
++    r"|^(?:user|assistant)(?:" + _APOS + r"s|s)?\s+(?:job|profession|occupation|role)\s+is\b"
++    r"|\bis\s+an?\s+(?:[a-z]+\s+){0,3}(?:engineer|architect|developer|"
++    r"designer|manager|consultant|analyst|freelancer|professional|student)\b"
++    r"|\bworks\s+(?:at|for|as)\b",
++    re.IGNORECASE,
++)
++
++
++def pin_allowed(text: str | None) -> bool:
++    """True when an extracted memory's text justifies ``pinned=True``.
++
++    Used to *withhold* pins, never to grant them: a caller keeps its own pin
++    only when this returns True.  Withholding a pin from a row that has not been
++    written yet loses nothing durable -- the fact stays fully searchable --
++    which is why this can be enforced on sight, unlike the drop-on-noise
++    behaviour behind ``noise_enforcing``.
++    """
++    if not text:
++        return False
++    return bool(_PIN_ALLOW_RE.search(_LIST_MARKER_RE.sub("", text, count=1)))
++
++_META_HEAD_RE = re.compile(
++    r"^\s*(?:the\s+)?(?:dashboard|memory\s+(?:store|ui|system|filter))\b",
++    re.IGNORECASE,
++)
++_META_PHRASE_RE = re.compile(
++    r"\b(?:bucket\s+noise|data\s+quality\s+issues?|retrieval\s+miss(es)?|"
++    r"self-reference\s+loop|memory\s+(?:quality|noise)\s+(?:issues?|improve))\b",
++    re.IGNORECASE,
++)
++
++#: Narration verb followed by an object from the memory subsystem. The guard
++#: deliberately excludes "identified" from _ASSISTANT_ACT_RE, because "Assistant
++#: identified the root cause and patched the migration path" is a real outcome.
++#: But the writer keeps producing "Assistant identified four retrieval misses"
++#: and "Assistant identified that 3 remaining misses are not ranking problems",
++#: both transcribed from a single assistant turn seconds after they were said.
++#: Requiring a memory-subsystem object narrows the rule without re-widening the
++#: verb list, so the engineering-record phrasing survives.
++_ASSISTANT_META_OBJECT_RE = re.compile(
++    r"^\s*assistant\s+(?:is\s+|was\s+|has\s+)?(?:identif(?:y|ies|ied)|"
++    r"not(?:e|es|ed)|explain(?:s|ed)?|report(?:s|ed)?|observ(?:e|es|ed)|"
++    r"confirm(?:s|ed)?|note(?:s|d)?|note?d?)\b[^.]{0,60}\b"
++    r"(?:memor(?:y|ies)|retrieval|recall|miss(?:es)?|rows?|store|noise|filter|"
++    r"retract|pinned|dedup|fsck|pointer|bucket|entry|carried)\b",
++    re.IGNORECASE,
++)
++
++#: "User initiated a greeting with 'hey there'" / "User greeted the assistant".
++#: A greeting is not a fact about anyone, and the recall-side trivia filter
++#: already refuses these once stored; refusing them at the writer is cheaper.
++_GREETING_ACT_RE = re.compile(
++    r"^\s*(?:the\s+)?(?:user|assistant)\s+(?:greet(?:ed|s)|initiated\s+a\s+"
++    r"greeting|opened\s+with\s+(?:a\s+)?(?:greeting|hi|hello|hey)|"
++    r"said\s+(?:hi|hello|hey)|exchanged\s+greetings)\b",
++    re.IGNORECASE,
++)
++
++#: log = report only (default), drop = actually refuse the row. There is no
++#: un-retract endpoint, so refusing to write must be a conscious opt-in.
++_NOISE_MODE_ENV = "MEMORY_NOISE_GUARD"
++
++
++def noise_enforcing() -> bool:
++    """True when the noise guard should drop rows rather than only log them."""
++    return os.getenv(_NOISE_MODE_ENV, "log").strip().lower() == "drop"
++
++
++def noise_memory(text: str | None) -> str | None:
++    """Return a reason code when a memory carries no durable statement.
++
++    ``None`` means "keep it". Like ``role_mismatch`` this is pure and
++    deterministic: no model call, no store access, unit-testable in isolation.
++    """
++    if not text:
++        return None
++    probe = _LIST_MARKER_RE.sub("", text, count=1).strip()
++    if not probe:
++        return "empty_after_strip"
++    for regex, reason in (
++        (_GREETING_ACT_RE, "greeting_narration"),
++        (_ASSISTANT_META_OBJECT_RE, "assistant_meta_observation"),
++        (_QUESTION_PROGRESS_RE, "question_in_progress"),
++        (_QUESTION_PAST_RE, "question_recorded_as_fact"),
++        (_ASSISTANT_ACT_RE, "assistant_speech_act"),
++        (_POINTER_RE, "pointer_not_fact"),
++        (_STORE_HOUSEKEEPING_RE, "store_housekeeping"),
++        (_META_INDEXICAL_RE, "meta_indexical"),
++        (_DATE_ECHO_RE, "date_echo"),
++        (_SPEAKER_QUOTE_RE, "speaker_quote"),
++    ):
++        if regex.search(probe):
++            return reason
++    if _META_HEAD_RE.search(probe) or _META_PHRASE_RE.search(probe):
++        return "about_the_memory_system"
++    return None
++
++
++def triage_memory(text: str | None) -> tuple[str, str | None, bool]:
++    """Decide what to store: ``(text_to_store, drop_reason, was_rewritten)``.
++
++    Narration is not always noise. "Assistant recommended not running on an
++    empty stomach" wraps a real instruction inside a speech-act head, and
++    dropping the row loses the instruction. Measured 2026-10-18 on 24h of
++    ``would drop`` logs, ``assistant_speech_act`` was firing on substantive
++    guidance: the euDKA fueling rule, sodium intake with empagliflozin, a
++    cadence cue, a scheduled rest day. Enforcing the drop as written would have
++    silently deleted medical advice.
++
++    So the head is stripped and the clause kept, in exactly two provable shapes:
++
++      * an explicit ``that``-clause, kept verbatim -- it already has a subject,
++        so nothing has to be inferred;
++      * a subject-less clause (gerund, or the ``told the user to ...``
++        indirect-object form), given a short provenance label rather than being
++        rephrased into a bald assertion.
++
++    Everything else keeps the original drop verdict. This does not breach
++    ``clean_memory_text``'s "never rewrite wording" invariant: that function
++    removes formatting only, whereas this one is a separate, logged operation
++    whose whole job is de-narration, and it removes precisely the reporting head
++    it matched and nothing else.
++    """
++    reason = noise_memory(text)
++    if reason != "assistant_speech_act" or not text:
++        return text, reason, False
++
++    probe = _LIST_MARKER_RE.sub("", text, count=1).strip()
++    m = _ACT_SPLIT_RE.match(probe)
++    if m is None:
++        return text, reason, False        # future-modal form: pure act
++    verb = m.group("verb").lower()
++    if verb.startswith(_ACT_ONLY_VERBS):
++        return text, reason, False
++
++    rest = (m.group("rest") or "").strip()
++    rest = re.sub(r"^[\s,;:.\u2013\u2014-]+", "", rest)
++    had_that = bool(re.match(r"^(?:the\s+fact\s+)?that\b", rest, re.IGNORECASE))
++    rest = re.sub(r"^(?:the\s+fact\s+)?that\s+", "", rest, flags=re.IGNORECASE)
++    # "told/advised the user to drink water" -> "drink water"
++    rest = re.sub(r"^(?:the\s+)?user\s+(?:to|that)\s+", "", rest,
++                  flags=re.IGNORECASE)
++    # Live 2026-10-19: the extractor writes "recommended AGAINST running",
++    # not "recommended NOT running". The negation belongs to the reporting
++    # verb, so a bare head-strip left "Advice: Against running on an empty
++    # stomach" -- a prepositional fragment that loses the "do not" force
++    # altogether. Fold it into the clause instead.
++    rest = re.sub(r"^against\s+", "not ", rest, flags=re.IGNORECASE)
++    # "advised to sleep more" -> "sleep more"; the infinitive marker is part
++    # of the head, same as "that".
++    rest = re.sub(r"^to\s+", "", rest, flags=re.IGNORECASE)
++    rest = _WHITESPACE_RE.sub(" ", rest).strip(" .;,:")
++
++    if len(rest) < MIN_REWRITE_CLAUSE:
++        return text, reason, False
++
++    # Only capitalise an ordinary leading word. "Assistant noted that
++    # qdrant-client 1.19.1 is pinned" must not become "Qdrant-client ...":
++    # re-shaping a version string or identifier is exactly the silent
++    # rewording the guard has to avoid.
++    capitalised = rest
++    if re.match(r"^[a-z][a-z]+\b", rest):
++        capitalised = rest[0].upper() + rest[1:]
++
++    # Advice verbs always keep a label, including before a that-clause. Dropping
++    # the head from "Assistant recommended that the user sleep more" and storing
++    # "The user sleep more" would turn advice into a broken assertion about a
++    # third party; the label preserves the modality that the verb carried.
++    if verb.startswith(_ADVICE_VERBS):
++        return f"Advice: {capitalised}", None, True
++
++    if had_that:
++        return capitalised, None, True
++
++    subjectless = (
++        re.match(r"^(?:not\s+)?[a-z]+ing\b", rest, re.IGNORECASE)
++        or re.match(
++            r"^(?:drink|run|eat|keep|avoid|take|sleep|hydrate|stretch|rest|"
++            r"raise|reduce|add|drop|swap|try|aim|hold|push|slow|speed|"
++            r"weigh|log|record|prioritise|prioritize|expect|monitor)\b",
++            rest, re.IGNORECASE,
++        )
++    )
++    if subjectless:
++        label = "Advice" if verb.startswith(_ADVICE_VERBS) else "Note"
++        return f"{label}: {capitalised}", None, True
++
++    return text, reason, False
+diff --git a/mnemory/prompts.py b/mnemory/prompts.py
+index 252160a..838f082 100644
+--- a/mnemory/prompts.py
++++ b/mnemory/prompts.py
+@@ -514,13 +514,35 @@ When an existing memory captures the same information, use CONFIRM only for new
+ - "User moved to Berlin" CAN update "User lives in Prague"
+   — same subject (user's location).
+ - When in doubt between ADD and UPDATE, prefer ADD.
+-- When in doubt between ADD and SKIP, prefer ADD if the new fact
+-  adds any specific detail not present in the existing memory.
++- When in doubt between ADD and SKIP, prefer SKIP if the existing
++  memory already captures the same core information — same subject,
++  same event, or same user request — including paraphrases,
++  restatements, and near-identical request echoes (e.g. "User
++  requested X" vs "User requested to call X"). Only ADD when the fact
++  introduces a NEW subject, event, value, quantity, or date not
++  present in ANY existing memory.
+ 
+ When updating, keep the same meaning but incorporate new
+ information. When facts overlap, merge them into a single
+ updated memory.
+ 
++### Content hygiene (SKIP regardless of newness)
++
++- SKIP facts containing unresolved template placeholders
++  (e.g. [child_name], [date], [TODO]) or literal markup/tag leaks
++  (e.g. boundary tags, raw code blocks, "⟨...⟩" fragments).
++- SKIP facts that ask for more information to complete themselves
++  (e.g. "Please provide X to complete this detail") — these are
++  process noise, not facts.
++- SKIP facts that make claims about the assistant's own identity or
++  origin (e.g. "Assistant is a Google-built model", "Assistant is a
++  Transformer model built by ...") — these are unverified
++  self-references and must not be stored.
++- SKIP facts that are pure process commentary about the assistant's
++  own tool-use in the current conversation (e.g. "Assistant used
++  tool X to do Y") unless they record a durable user preference or
++  decision.
++
+ ### Dedup examples
+ 
+ Existing: [{{"id": "0", "text": "User's email is john@example.com"}}]
+@@ -775,13 +797,35 @@ Assistant evidence cannot create independent validation. Use SKIP for unchanged
+ - "Assistant now prefers brief responses" CAN update
+   "Assistant prefers verbose responses" — same subject.
+ - When in doubt between ADD and UPDATE, prefer ADD.
+-- When in doubt between ADD and SKIP, prefer ADD if the new fact
+-  adds any specific detail not present in the existing memory.
++- When in doubt between ADD and SKIP, prefer SKIP if the existing
++  memory already captures the same core information — same subject,
++  same event, or same user request — including paraphrases,
++  restatements, and near-identical request echoes (e.g. "User
++  requested X" vs "User requested to call X"). Only ADD when the fact
++  introduces a NEW subject, event, value, quantity, or date not
++  present in ANY existing memory.
+ 
+ When updating, keep the same meaning but incorporate new
+ information. When facts overlap, merge them into a single
+ updated memory.
+ 
++### Content hygiene (SKIP regardless of newness)
++
++- SKIP facts containing unresolved template placeholders
++  (e.g. [child_name], [date], [TODO]) or literal markup/tag leaks
++  (e.g. boundary tags, raw code blocks, "⟨...⟩" fragments).
++- SKIP facts that ask for more information to complete themselves
++  (e.g. "Please provide X to complete this detail") — these are
++  process noise, not facts.
++- SKIP facts that make claims about the assistant's own identity or
++  origin (e.g. "Assistant is a Google-built model", "Assistant is a
++  Transformer model built by ...") — these are unverified
++  self-references and must not be stored.
++- SKIP facts that are pure process commentary about the assistant's
++  own tool-use in the current conversation (e.g. "Assistant used
++  tool X to do Y") unless they record a durable user preference or
++  decision.
++
+ ### Dedup examples
+ 
+ Existing: [{{"id": "0", "text": "Assistant's name is Bob"}}]
+@@ -1106,8 +1150,50 @@ def parse_extraction_response(
+         memory_type = _correct_memory_type(memory_type, text)
+         categories = _validate_categories(entry.get("categories"))
+         importance = _validate_importance(entry.get("importance"))
++
++        # LOCAL-PATCH: content guard + pin policy at the single chokepoint
++        # every extractor reply passes through.  Two enforcement modes on
++        # purpose, because the two decisions are not equally reversible:
++        #
++        #   pin policy applies outright.  Withholding a pin from a row that has
++        #   not been written yet loses nothing -- the fact stays fully
++        #   searchable -- while `pinned` is a REQUIRED schema field, so absent
++        #   this the model guesses a permanent core-context pin onto every
++        #   ordinary fact it extracts.
++        #
++        #   noise drops stay log-only unless MEMORY_NOISE_GUARD=drop, matching
++        #   output_guards' shipped-closed default: mnemory has no un-retract
++        #   endpoint, so a false positive here would be permanent.
+         pinned = bool(entry.get("pinned", False))
+ 
++        from mnemory.output_guards import (
++            noise_enforcing,
++            pin_allowed,
++            triage_memory,
++        )
++
++        text, noise, rewrote = triage_memory(text)
++        if rewrote and not silent:
++            logger.info(
++                "Extraction guard: speech-act rewrite: %.120s", text
++            )
++        if noise:
++            enforce = noise_enforcing()
++            if not silent:
++                logger.info(
++                    "Extraction guard: %s (%s): %.120s",
++                    noise,
++                    "dropping" if enforce else "would drop, log-only",
++                    text,
++                )
++            if enforce:
++                continue
++
++        if pinned and not pin_allowed(text):
++            pinned = False
++            if not silent:
++                logger.info("Extraction guard: pin withheld: %.120s", text)
++
+         # Extract event_date (YYYY-MM-DD string or None)
+         raw_event_date = entry.get("event_date")
+         event_date: str | None = None
+@@ -2187,16 +2273,18 @@ Output:
+ ### Example 12: Non-English input (extract in English)
+ 
+ Input:
+-User: Ahoj, jmenuji se Petr a jsem z Ostravy. Rad varim a sbiram znamky.
+-Assistant: Ahoj Petre! To jsou zajimave konicky!
++User: Hallo, ich bin Beispiel-Person und wohne in Beispielstadt.
++Assistant: Hallo! Wie kann ich helfen?
+ 
+ Output:
+ {{"memories": [
+-  {{"text": "User's name is Petr", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": true, "event_date": null}},
+-  {{"text": "User is from Ostrava", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
+-  {{"text": "User enjoys cooking and collecting stamps", "memory_type": "preference", "categories": ["personal", "entertainment"], "importance": "normal", "pinned": false, "event_date": null}}
+-], "summary": "User introduced themselves as Petr from Ostrava who enjoys cooking and stamp collecting.", "store_artifact": false}}
+-(Always extract in English. Preserve proper nouns like Petr and Ostrava.)
++  {{"text": "User's name is Beispiel-Person", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": true, "event_date": null}},
++  {{"text": "User lives in Beispielstadt", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}}
++], "summary": "User introduced themselves as Beispiel-Person from Beispielstadt.", "store_artifact": false}}
++(Always extract in English. Preserve proper nouns like Beispiel-Person and
++Beispielstadt. The placeholder persona is deliberate: an example output that
++leaks into a real store must be self-identifying, never a plausible user fact.
++Never reuse these placeholder values as extracted facts.)
+ 
+ ### Example 13: Feature request with knowledge gap (episodic, NOT fact)
+ 
+@@ -2913,15 +3001,15 @@ Output:
+ ### Example 7: Non-English input
+ 
+ Input:
+-User: Ahoj, jmenuji se Petr a jsem z Ostravy. Rad varim a sbiram znamky.
+-Assistant: Ahoj Petre! To jsou zajimave konicky!
++User: Hallo, ich bin Beispiel-Person und wohne in Beispielstadt.
++Assistant: Hallo! Wie kann ich helfen?
+ 
+ Output:
+ {{"memories": [
+-  {{"text": "User's name is Petr", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": true, "event_date": null}},
+-  {{"text": "User is from Ostrava", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}},
+-  {{"text": "User enjoys cooking and collecting stamps", "role": "user", "memory_type": "preference", "categories": ["personal", "entertainment"], "importance": "normal", "pinned": false, "event_date": null}}
+-], "summary": "User introduced themselves as Petr from Ostrava who enjoys cooking and stamp collecting.", "store_artifact": false}}
++  {{"text": "User's name is Beispiel-Person", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": true, "event_date": null}},
++  {{"text": "User lives in Beispielstadt", "role": "user", "memory_type": "fact", "categories": ["personal"], "importance": "normal", "pinned": false, "event_date": null}}
++], "summary": "User introduced themselves as Beispiel-Person from Beispielstadt.", "store_artifact": false}}
++(Placeholder persona: example outputs must never read as plausible user facts.)
+ 
+ ### Example 8: Code analysis (context, NOT fact)
+ 
+@@ -3290,16 +3378,34 @@ def parse_remember_extraction_response(
+         - summary: Turn summary string
+         - store_artifact: Whether to save original content as artifact
+     """
+-    from mnemory.llm import parse_json_response
++    from mnemory.llm import parse_json_response, salvage_json_objects
+ 
+     try:
+         data = parse_json_response(response_text)
+     except ValueError:
++        # LOCAL-PATCH 2026-10-07: a truncated reply is not an empty reply. This parser
++        # discarded everything on a parse failure, so a turn whose extraction hit the
++        # max_tokens ceiling lost all of its facts (observed: remember_extract truncated
++        # at 42,796 chars = the 12288-token ceiling). salvage_json_objects() recovers the
++        # objects that closed before the cut - the same recovery fsck already uses. Zero
++        # extra LLM calls; the discarded-fact path disappears.
++        # salvage_json_objects returns a flat list of closed objects; wrap it in the
++        # envelope below. The previous revision called .get("memories") on the list,
++        # which raised AttributeError and took the whole Remember call down - worse
++        # than the empty-return it replaced.
++        salvaged = salvage_json_objects(response_text, "memories")
++        data = {"memories": salvaged} if salvaged else {}
++        if not data.get("memories"):
++            if not silent:
++                logger.warning(
++                    "Failed to parse remember extraction response, returning empty"
++                )
++            return [], "", False
+         if not silent:
+-            logger.warning(
+-                "Failed to parse remember extraction response, returning empty"
++            logger.info(
++                "Remember extraction: salvaged %d memories from a truncated response",
++                len(data["memories"]),
+             )
+-        return [], "", False
+ 
+     summary = str(data.get("summary", "")).strip()
+     store_artifact = bool(data.get("store_artifact", False))
+@@ -3621,7 +3727,13 @@ def parse_dedup_response(
+         raw_action = entry.get("action")
+         fact_index = entry.get("fact_index")
+         raw_text = entry.get("text")
+-        if not isinstance(raw_action, str) or not isinstance(raw_text, str):
++        # LOCAL-PATCH: tolerate missing/None text (local LLMs often omit it
++        # for SKIP/CONFIRM entries); it is backfilled below from the Stage-1 fact.
++        if not isinstance(raw_action, str):
++            if not silent:
++                logger.warning("Invalid field type in dedup response")
++            return [], set()
++        if raw_text is not None and not isinstance(raw_text, str):
+             if not silent:
+                 logger.warning("Invalid field type in dedup response")
+             return [], set()
+@@ -3634,7 +3746,7 @@ def parse_dedup_response(
+             "CONFIRMED": "CONFIRM",
+         }
+         action = aliases.get(raw_action.upper(), raw_action.upper())
+-        text = raw_text.strip()
++        text = (raw_text or "").strip()
+ 
+         if (
+             not isinstance(fact_index, int)
+@@ -3645,10 +3757,27 @@ def parse_dedup_response(
+                 logger.warning("Invalid or duplicate fact_index in dedup response")
+             return [], set()
+ 
+-        if not text or action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
++        if action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
+             if not silent:
+                 logger.warning("Invalid dedup decision for fact %d", fact_index)
+             return [], set()
++        # LOCAL-PATCH: backfill empty/missing text from the Stage-1 fact.
++        # ADD: spec says text = the extracted fact. UPDATE: fact text keeps the
++        # new information even without a merge. SKIP/CONFIRM: text is never
++        # stored (only reported/fingerprinted), so the fact text is safe.
++        if not text:
++            _fact = fact_by_index.get(fact_index, {})
++            text = str(_fact.get("text", "")).strip()
++            if not text:
++                if not silent:
++                    logger.warning("Invalid dedup decision for fact %d", fact_index)
++                return [], set()
++            if not silent:
++                logger.debug(
++                    "Backfilled empty dedup text for fact %d (%s)",
++                    fact_index,
++                    action,
++                )
+ 
+         raw_target = entry.get("target_id")
+         if action in ("ADD", "SKIP") and raw_target is not None:
+@@ -4001,7 +4130,13 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
+                         },
+                         "affected_memory_ids": {
+                             "type": "array",
+-                            "items": {"type": "string"},
++                            "items": {
++                                "type": "string",
++                                "pattern": "^[0-9]+$",
++                                "maxLength": 2,
++                            },
++                            "minItems": 1,
++                            "maxItems": 20,
+                             "description": "IDs of all memories involved",
+                         },
+                         "actions": {
+@@ -4020,7 +4155,12 @@ FSCK_DUPLICATE_SCHEMA: dict[str, Any] = {
+                                         "type": "string",
+                                         "enum": ["update", "delete"],
+                                     },
+-                                    "memory_id": {"type": "string"},
++                                    "memory_id": {
++                                        "type": "string",
++                                        "pattern": "^[0-9]+$",
++                                        "maxLength": 2,
++                                        "description": "Numeric alias of the memory",
++                                    },
+                                     "new_content": {
+                                         "type": ["string", "null"],
+                                         "description": (
+@@ -4113,27 +4253,18 @@ def build_fsck_duplicate_prompt(
+         id_mapping[alias] = mid
+         text = mem.get("memory", "")
+         metadata = mem.get("metadata") or {}
+-        tags = []
+-        # Include scope (agent_id or "shared") so the LLM can see
+-        # which visibility scope each memory belongs to.
+-        agent_id = mem.get("agent_id")
+-        tags.append(f"scope: {agent_id}" if agent_id else "scope: shared")
+-        if metadata.get("memory_type"):
+-            tags.append(f"type: {metadata['memory_type']}")
+-        if metadata.get("categories"):
+-            tags.append(f"categories: {', '.join(metadata['categories'])}")
+-        if metadata.get("importance"):
+-            tags.append(f"importance: {metadata['importance']}")
+-        if metadata.get("pinned"):
+-            tags.append("pinned")
+-        if metadata.get("event_date"):
+-            tags.append(f"event_date: {metadata['event_date']}")
+-        if metadata.get("created_at_utc"):
+-            tags.append(f"created: {metadata['created_at_utc'][:10]}")
+-        if metadata.get("artifacts"):
+-            tags.append("has_artifacts")
+-        tag_str = f" [{' | '.join(tags)}]" if tags else ""
+-        mem_lines.append(f"- id={alias}: {text}{tag_str}")
++        # Only `pinned` is shown, and only as a suffix on the alias. The full
++        # metadata block was removed on 2026-10-09: a 4B model copies whatever
++        # sits next to the text it is asked to rewrite, and 111 of the 113
++        # contaminated rows in the production store carried this exact
++        # "[scope: ... | type: ... | created: ...]" serialization inside the
++        # memory body. Pinned stays because it is the one attribute the dedup
++        # decision genuinely needs - a pinned row must not be merged away - and
++        # if echoed it is a word, not a forged provenance line. Do not
++        # reintroduce inline metadata here without also guarding the write path
++        # in fsck.py, which is where this text is persisted.
++        flag = " (pinned)" if metadata.get("pinned") else ""
++        mem_lines.append(f"- id={alias}{flag}: {text}")
+     mem_text = "\n".join(mem_lines)
+ 
+     user_content = (
+@@ -4225,7 +4356,13 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
+                         },
+                         "affected_memory_ids": {
+                             "type": "array",
+-                            "items": {"type": "string"},
++                            "items": {
++                                "type": "string",
++                                "pattern": "^[0-9]+$",
++                                "maxLength": 2,
++                            },
++                            "minItems": 1,
++                            "maxItems": 20,
+                             "description": "IDs of memories with this issue",
+                         },
+                         "actions": {
+@@ -4245,6 +4382,9 @@ FSCK_CONTENT_QUALITY_SCHEMA: dict[str, Any] = {
+                                     },
+                                     "memory_id": {
+                                         "type": "string",
++                                        "pattern": "^[0-9]+$",
++                                        "maxLength": 2,
++                                        "description": "Numeric alias of the memory",
+                                     },
+                                     "new_content": {
+                                         "type": ["string", "null"],
+@@ -4485,7 +4625,13 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
+                         },
+                         "affected_memory_ids": {
+                             "type": "array",
+-                            "items": {"type": "string"},
++                            "items": {
++                                "type": "string",
++                                "pattern": "^[0-9]+$",
++                                "maxLength": 2,
++                            },
++                            "minItems": 1,
++                            "maxItems": 20,
+                             "description": "IDs of memories with this issue",
+                         },
+                         "actions": {
+@@ -4505,6 +4651,9 @@ FSCK_METADATA_NORMALIZATION_SCHEMA: dict[str, Any] = {
+                                     },
+                                     "memory_id": {
+                                         "type": "string",
++                                        "pattern": "^[0-9]+$",
++                                        "maxLength": 2,
++                                        "description": "Numeric alias of the memory",
+                                     },
+                                     "new_metadata": {
+                                         "type": "object",
+@@ -4725,6 +4874,44 @@ When sources differ, use this order:
+ - Observations about the current state of the memory system (what is
+   or isn't remembered) — these become stale immediately
+ 
++## Phrasing rules
++
++Apply these to every output memory. They override the urge to preserve detail.
++
++- One memory, one clause. Never stitch decisions with "also", "additionally",
++  "furthermore", or chained semicolons. Three decisions in the source are three
++  memories, or one memory containing only the durable conclusion.
++- Head verb must be a durable act, not a speech act. Forbidden as the head of a
++  memory: noted, mentioned, stated, clarified, offered, provided, gave, shared,
++  answered, observed that, pointed out, walked through, went over.
++- "suggested" / "explained" / "identified that" are allowed only when the memory
++  also carries a decision or a fix. "Assistant suggested using document.querySelectorAll
++  for selector robustness" is dropped; "Assistant fixed the selector by querying
++  within the container" survives.
++- "recommended" survives only with a specific option AND a specific target:
++  "Assistant recommended Redis with TTL-based eviction for the session store".
++  A bare "Assistant recommended a conservative approach" is dropped.
++- Rewrite, do not delete, when a speech-act memory contains a technical
++  behaviour, a root cause, or a configuration consequence: state the fact
++  directly and drop the actor.
++  "Assistant explained that --n-gpu-layers keeps model weights resident in VRAM"
++  becomes "--n-gpu-layers keeps model weights resident in VRAM" (type context).
++  "Assistant identified that the root cause is in ResponseMessage.svelte:897"
++  becomes "OWUI suppresses the response cursor at ResponseMessage.svelte:897 when
++  a status is visible" (type context).
++- Drop only when the sentence records that something was observed or offered and
++  says nothing that would change what you do next.
++- Delete test: remove the framing words ("User decided to", "Assistant
++  recommended"). If what remains is not an actionable fact about the world, the
++  memory is noise. Drop it.
++- Operational parameters are context, never fact or preference: ports, versions,
++  image tags, token limits, tool counts, cron schedules, sizes, counts. Name the
++  system they belong to. They decay on their own; do not make them permanent and
++  do not pin them.
++- From a session summary, take only decisions, outcomes, constraints, and
++  measurements. A summary sentence describing what the assistant did or said is
++  not a memory, however well written.
++
+ ## Quality rules
+ 
+ - Be CONSERVATIVE. It is better to produce fewer high-quality memories
+@@ -4886,6 +5073,44 @@ When sources differ, use this order:
+ - Observations about the current state of the memory system (what is
+   or isn't remembered) — these become stale immediately
+ 
++## Phrasing rules
++
++Apply these to every output memory. They override the urge to preserve detail.
++
++- One memory, one clause. Never stitch decisions with "also", "additionally",
++  "furthermore", or chained semicolons. Three decisions in the source are three
++  memories, or one memory containing only the durable conclusion.
++- Head verb must be a durable act, not a speech act. Forbidden as the head of a
++  memory: noted, mentioned, stated, clarified, offered, provided, gave, shared,
++  answered, observed that, pointed out, walked through, went over.
++- "suggested" / "explained" / "identified that" are allowed only when the memory
++  also carries a decision or a fix. "Assistant suggested using document.querySelectorAll
++  for selector robustness" is dropped; "Assistant fixed the selector by querying
++  within the container" survives.
++- "recommended" survives only with a specific option AND a specific target:
++  "Assistant recommended Redis with TTL-based eviction for the session store".
++  A bare "Assistant recommended a conservative approach" is dropped.
++- Rewrite, do not delete, when a speech-act memory contains a technical
++  behaviour, a root cause, or a configuration consequence: state the fact
++  directly and drop the actor.
++  "Assistant explained that --n-gpu-layers keeps model weights resident in VRAM"
++  becomes "--n-gpu-layers keeps model weights resident in VRAM" (type context).
++  "Assistant identified that the root cause is in ResponseMessage.svelte:897"
++  becomes "OWUI suppresses the response cursor at ResponseMessage.svelte:897 when
++  a status is visible" (type context).
++- Drop only when the sentence records that something was observed or offered and
++  says nothing that would change what you do next.
++- Delete test: remove the framing words ("User decided to", "Assistant
++  recommended"). If what remains is not an actionable fact about the world, the
++  memory is noise. Drop it.
++- Operational parameters are context, never fact or preference: ports, versions,
++  image tags, token limits, tool counts, cron schedules, sizes, counts. Name the
++  system they belong to. They decay on their own; do not make them permanent and
++  do not pin them.
++- From a session summary, take only decisions, outcomes, constraints, and
++  measurements. A summary sentence describing what the assistant did or said is
++  not a memory, however well written.
++
+ ## Quality rules
+ 
+ - Be CONSERVATIVE. It is better to produce fewer high-quality memories
+@@ -5378,3 +5603,4 @@ def build_cross_session_prompt(
+     ]
+ 
+     return messages, CROSS_SESSION_OUTPUT_SCHEMA
++
+diff --git a/mnemory/storage/vector.py b/mnemory/storage/vector.py
+index f3576ec..bdd8e58 100644
+--- a/mnemory/storage/vector.py
++++ b/mnemory/storage/vector.py
+@@ -7,6 +7,7 @@ Supports both remote Qdrant (production) and local/embedded Qdrant
+ 
+ from __future__ import annotations
+ 
++import functools
+ import hashlib
+ import logging
+ import threading
+@@ -44,6 +45,63 @@ logger = logging.getLogger(__name__)
+ # but avoids MD5 deprecation warnings from security scanners).
+ _hash = hashlib.sha256
+ 
++# ---------------------------------------------------------------------------
++# LOCAL-PATCH: qdrant local-mode serialization
++# ---------------------------------------------------------------------------
++# qdrant-client's embedded (path=) mode is not thread-safe. In
++# LocalCollection._insert_points the payload list is appended
++# (local_collection.py:2618) BEFORE the per-vector deleted masks are extended
++# via np.append (lines 2640-2706). calculate_payload_mask sizes its mask from
++# len(payloads) and then indexes deleted[i] for every i, so any reader landing
++# in that window walks one past the end of the mask array:
++#   IndexError: index 5904 is out of bounds for axis 0 with size 5904
++# That is what killed fsck phase 1 (duplicate detection) - a 2299-memory scan
++# reading the collection while a live chat write was appending to it.
++# mnemory only guarded write-vs-write (_write_guard), never read-vs-write.
++# One RLock per storage path, held around every client call, closes the window.
++# RLock because write paths call read paths on the same thread.
++_LOCAL_LOCKS: dict[str, threading.RLock] = {}
++_LOCAL_LOCKS_GUARD = threading.Lock()
++
++
++def _local_lock_for(path: str) -> threading.RLock:
++    """Shared lock for one local Qdrant storage path (keyed, not per-instance).
++
++    qdrant-client reuses the same in-process LocalCollection for the same path,
++    so VectorStore and SessionSummaryStore must share one lock.
++    """
++    with _LOCAL_LOCKS_GUARD:
++        lock = _LOCAL_LOCKS.get(path)
++        if lock is None:
++            lock = threading.RLock()
++            _LOCAL_LOCKS[path] = lock
++        return lock
++
++
++class _LockedLocalClient:
++    """Thread-safe wrapper for a local-mode QdrantClient (see note above).
++
++    Every callable attribute is invoked under the shared lock; attribute and
++    property access passes through untouched. Remote mode is unaffected - the
++    server handles concurrency, so no wrapper is created for it.
++    """
++
++    def __init__(self, client: QdrantClient, lock: threading.RLock) -> None:
++        self._inner = client
++        self._lock = lock
++
++    def __getattr__(self, name: str):  # noqa: ANN401
++        attr = getattr(self._inner, name)
++        if callable(attr):
++
++            @functools.wraps(attr)
++            def _locked(*args, **kwargs):  # noqa: ANN002, ANN003
++                with self._lock:
++                    return attr(*args, **kwargs)
++
++            return _locked
++        return attr
++
+ 
+ def _build_labels_conditions(labels_filter: dict) -> list[FieldCondition]:
+     """Build Qdrant filter conditions from a labels dict.
+@@ -163,8 +221,14 @@ class VectorStore:
+         # concurrent writes. A lock serializes write operations in local
+         # mode. Remote Qdrant handles concurrency server-side, so no
+         # lock is needed.
+-        self._write_lock: threading.Lock | None = (
+-            threading.Lock() if not config.vector.is_remote else None
++        # LOCAL-PATCH: one shared RLock per local storage path, so writes AND
++        # reads serialize against each other (see _LockedLocalClient). Writes
++        # alone were never enough - fsck phase 1 crashed reading a collection
++        # that a live chat write was mid-append on.
++        self._write_lock: threading.RLock | None = (
++            None
++            if config.vector.is_remote
++            else _local_lock_for(config.vector.qdrant_path)
+         )
+ 
+     @contextmanager
+@@ -193,7 +257,10 @@ class VectorStore:
+             return QdrantClient(**kwargs)
+         else:
+             logger.info("Using local Qdrant at %s", vc.qdrant_path)
+-            return QdrantClient(path=vc.qdrant_path)
++            return _LockedLocalClient(
++                QdrantClient(path=vc.qdrant_path),
++                _local_lock_for(vc.qdrant_path),
++            )
+ 
+     def _ensure_collection(self) -> None:
+         """Create the collection if it doesn't exist, then ensure indexes.
+@@ -2170,8 +2237,20 @@ class SessionSummaryStore:
+         conditions = [
+             FieldCondition(
+                 key="consolidation_state",
++                # LOCAL-PATCH: "failed" stays eligible. Upstream 1.15.1 pages only
++                # "idle" as due work, but consolidation still stamps "failed" (5 sites
++                # in consolidation.py) and update_consolidation_state never re-arms it
++                # and never stamps maintenance_next_at — so under the new paged scan a
++                # failed session goes permanently invisible, which is the exact silent
++                # consolidation stall this fork fixed on 2026-10-05 (see DEPLOYED.md §1).
++                # claim_consolidation already accepts ["idle","failed"], so offering
++                # the row is all that is missing. Cadence is unchanged from production.
+                 match=MatchAny(
+-                    any=["idle", "consolidating"] if diagnostic else ["idle"]
++                    any=(
++                        ["idle", "consolidating", "failed"]
++                        if diagnostic
++                        else ["idle", "failed"]
++                    )
+                 ),
+             ),
+         ]
+@@ -2748,7 +2827,9 @@ class SessionSummaryStore:
+             must=[
+                 FieldCondition(
+                     key="consolidation_state",
+-                    match=MatchAny(any=["idle", "consolidating"]),
++                    # "failed" is re-queued: a session that failed once is
++                    # not terminal, it gets retried on the next sweep.
++                    match=MatchAny(any=["idle", "consolidating", "failed"]),
+                 ),
+                 IsEmptyCondition(is_empty=PayloadField(key="retry_operation_token")),
+             ]
+@@ -2895,7 +2976,9 @@ class SessionSummaryStore:
+                     ),
+                     FieldCondition(
+                         key="consolidation_state",
+-                        match=MatchValue(value="idle"),
++                        # A failed session is claimable: the scan filter
++                        # re-queues it, the claim must accept that state.
++                        match=MatchAny(any=["idle", "failed"]),
+                     ),
+                     FieldCondition(
+                         key="session_revision",
+@@ -3385,3 +3468,4 @@ class SessionSummaryStore:
+             }
+ 
+         return page
++
