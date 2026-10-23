@@ -1,12 +1,13 @@
-"""Open WebUI mnemory_filter pipe — ARCHIVED COPY, NOT THE DEPLOYMENT.
+"""
+Open WebUI mnemory_filter pipe — ARCHIVED COPY, NOT THE DEPLOYMENT.
 
 The live filter is the ``function`` table row with id ``mnemory_filter`` in the
 Open WebUI sqlite database; that row is what actually executes. This file is the
 git-tracked archive of each shipped version, per the owner's decision on
 2026-10-15 that the filter is always git-tracked.
 
-  version        0.4.7-atlas.1
-  live row sha256 b403d7cf9f156ebaa26633526383feacd0d29f26267bf8569a342b3da14cbb4c
+  version        0.4.8-atlas.1
+  live row sha256 de377d7469bba2c7c3afae200d1abb5e05392c10f174eda57e72a2c85f0210cf
   this file sha256  (differs by design, see below)
 
 SANITIZED: the three valve defaults that name LAN endpoints carry the literal
@@ -20,21 +21,35 @@ Consequence when restoring from this archive: set the ``mnemory_url``,
 back to the real host before saving the function, or recall, embeddings and
 rerank all fail open into silence rather than loudly.
 
-Changes shipped in this version, on top of 0.4.6-atlas.1 (cross-encoder rerank):
-  * ``rerank_keep_top`` valve: keep the top K rows by RERANKED ORDER, a rank
-    cutoff rather than a score floor. Measured on 12 real queries, full coverage
-    was already reached at K=2 and K=3 leaves slack, cutting injected rows from
-    ~8.9 to 3.0 with no coverage loss. A score floor cannot be used here: the
-    reranker assigned its lowest confidence to the correct answer for a direct
-    lookup and its highest to a same-subject decoy.
-  * ``rerank_min_score`` stays at 0.0 and rows it does drop are dropped outright,
-    never resurrected by the unscored fallback.
+Changes shipped in this version, on top of 0.4.7-atlas.1 (rerank_keep_top):
+  * ``_inject_recalled`` no longer appends the ``## Recalled Memories`` block
+    inside the last user message; it appends a trailing ``role=user`` message
+    after it, with an idempotence guard on the tail so a retry that reuses the
+    built body cannot add a second block.
+  * Why, because it is a prompt-cache fix and not a formatting one: the block is
+    request-scoped and never persisted, so on the NEXT turn that historical user
+    message is sent WITHOUT it, the prompt prefix diverges at that message, and
+    the engine discards every checkpoint after it (basalt resumes only from a
+    checkpoint whose token ids are an exact prefix of the prompt). Measured on
+    2026-10-23 with a ~240k-token chat: requests inside one turn reused 96-99
+    percent and prefilled in 0.6-1.7 s, while turn-boundary requests resumed
+    only from 213,423 of 242,026 tokens and re-read for 5.0-5.1 s. Before the
+    system-prompt clock was also made static, every turn re-read the whole
+    conversation at 29-42 s. Rule this enforces: volatile per-turn content must
+    live in the tail of the body, never inside a persisted message.
+  * Still not ``role=system`` — Open WebUI merges system-role messages into
+    messages[0], which would move the block ahead of the entire conversation and
+    break the prefix from the other side.
 
-Carried from 0.4.6: cross-encoder rerank of recall candidates with fail-open on
-any error, timeout, non-200 or missing index. Carried from 0.4.5: the per-turn
-carry bucket stores dicts with the memory id and a timestamp, so an updated or
-retracted memory is replaced in place instead of being injected forever, and
-``recall_entry_ttl`` expires entries on the early-exit paths too.
+Carried from 0.4.7: the ``rerank_keep_top`` valve, keeping the top K rows by
+RERANKED ORDER (a rank cutoff, not a score floor: the reranker gave its lowest
+confidence to the correct answer of a direct lookup and its highest to a
+same-subject decoy). Carried from 0.4.6: cross-encoder rerank of recall
+candidates with fail-open on any error, timeout, non-200 or missing index.
+Carried from 0.4.5: the per-turn carry bucket stores dicts with the memory id and
+a timestamp, so an updated or retracted memory is replaced in place instead of
+being injected forever, and ``recall_entry_ttl`` expires entries on the
+early-exit paths too.
 """
 """
 title: Mnemory - Persistent Memory
@@ -43,7 +58,7 @@ description: Automatic memory recall and storage for conversations
 # Patched locally (atlas.1): injector fix, tag-aware + capped sanitizer,
 # example-leak and speech-act hygiene, placeholder regex de-anchored.
 # Upstream baseline was version: 0.4.2
-version: 0.4.7-atlas.1
+version: 0.4.8-atlas.1
 """
 
 import asyncio
@@ -59,7 +74,7 @@ _log = logging.getLogger(__name__)
 # Bump on every deploy: this line is the proof in `docker logs OpenWebUI` that the
 # running filter pipeline recompiled the stored content rather than serving a cache.
 _NUM_RE_FINDALL = re.compile(r"\d[\d.,:/-]*").findall
-_FILTER_BUILD = "0.4.7-atlas.1"
+_FILTER_BUILD = "0.4.8-atlas.1"
 _log.info("mnemory filter build %s loaded", _FILTER_BUILD)
 
 
@@ -1387,7 +1402,7 @@ prompt for them."""
         return "\n".join(out).strip()
 
     def _inject_recalled(self, body: dict, memories: list[str] | None) -> None:
-        """Append recalled memories to the last user message.
+        """Append recalled memories as a trailing user message.
 
         NOT a system message: Open WebUI merges all system-role messages
         into messages[0], which would move this volatile block ahead of
@@ -1404,15 +1419,30 @@ prompt for them."""
             return
         block = "\n\n## Recalled Memories\n" + "\n".join(f"- {m}" for m in memories)
         messages = body.setdefault("messages", [])
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                content = msg.get("content")
-                if isinstance(content, str):
-                    msg["content"] = content + block
-                elif isinstance(content, list):
-                    content.append({"type": "text", "text": block})
+        # Idempotent: a retry that reuses the built body must not add a second block.
+        if messages:
+            tail = messages[-1].get("content")
+            if isinstance(tail, str) and "## Recalled Memories" in tail[:40]:
                 return
-        messages.append({"role": "system", "content": block.strip()})
+            if isinstance(tail, list) and any(
+                "## Recalled Memories" in str(part.get("text", ""))
+                for part in tail
+                if isinstance(part, dict)
+            ):
+                return
+        # Trailing user message, never a mutation of the last one.
+        #
+        # Mutating the last user message cost a full re-prefill of the whole
+        # conversation on every turn: this block is request-scoped and is
+        # never persisted, so next turn that historical message is sent
+        # WITHOUT it, the prompt prefix diverges there, and the engine drops
+        # every checkpoint after it (basalt resumes only from a checkpoint
+        # whose token ids are an exact prefix of the prompt).
+        #
+        # Still not role=system: Open WebUI merges system-role messages into
+        # messages[0], which would move this volatile block ahead of the whole
+        # conversation and invalidate the prefix on the other side.
+        messages.append({"role": "user", "content": block})
 
     @staticmethod
     def _build_status(result: dict | None, is_first: bool) -> str:
