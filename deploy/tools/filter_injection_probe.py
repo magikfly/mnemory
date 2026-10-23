@@ -1,11 +1,20 @@
-# Sanitized for a public repository: credentials, the service address and the
-# LAN specifics that appeared in test fixtures are removed. Set MN_API_KEY and
-# MN_USER_ID (optionally MN_BASE_URL, default http://localhost:8050) to run.
+# Sanitized for a public repository: credentials and the LAN address that
+# appeared in fixtures are removed.
+#
+# Required environment:
+#   MN_USER_ID     store scope to probe (the email OWUI sends as the user id)
+#   MN_SSH_HELPER  path to a script that runs one command on the Docker host
+#
+# MN_API_KEY, MN_BASE_URL and MN_AGENT_ID are NOT used by this probe. It reads
+# the endpoint, key and agent scope out of the deployed function row's own
+# valves, which is the whole point: it tests what the filter actually does,
+# not what a config file claims.
 import os as _os
 MN_BASE_URL = _os.environ.get("MN_BASE_URL", "http://localhost:8050")
 MN_API_KEY = _os.environ.get("MN_API_KEY", "")
 MN_USER_ID = _os.environ.get("MN_USER_ID", "")
 MN_AGENT_ID = _os.environ.get("MN_AGENT_ID", "open-webui")
+MN_SSH_HELPER = _os.environ.get("MN_SSH_HELPER", "")
 
 #!/usr/bin/env python3
 """show_injected_context.py — what the mnemory filter actually puts in the prompt.
@@ -21,6 +30,15 @@ Usage:
 Always gates; prints PASS/FAIL per check and exits 1 if any check fails, so it
 is safe to drop in cron. "core memories empty" is a WARN, not a failure - it is
 correct output when nothing in the store is pinned.
+
+The "injection is live" check was added because of 2026-10-23, when build
+0.4.9-atlas.2 shipped with an unconditional ``return body`` at the top of
+inlet(). Memory injection was completely off for every Open WebUI user for
+about six hours and nothing noticed: mnemory stayed healthy, /api/recall
+returned 25 core items, the service returned 200, and the only symptom was
+that prompts came back exactly the size they went in. That is precisely what a
+cron gate can see and a human cannot, so the probe now measures request size
+versus prompt size instead of only hunting known junk.
 Persists across OpenTerminal recreates (bind mount); the probe itself runs
 inside the OpenWebUI container, which is where aiohttp and the DB live.
 """
@@ -43,7 +61,8 @@ exec(compile(row[0], "<deployed>", "exec"), mod.__dict__)
 
 f = mod.Filter()
 f.valves = mod.Filter.Valves(**json.loads(row[1] or "{}"))
-u = {"id": "probe", "email": MN_USER_ID, "name": "Chairil", "role": "admin"}
+u = {"id": "probe", "email": "__PROBE_USER_EMAIL__", "name": "Probe User",
+     "role": "admin"}
 
 JUNK = ["cooking and collecting stamps", "how proficient I am in COBOL",
         "is asking who the assistant is", "requested a greeting",
@@ -80,8 +99,16 @@ async def main():
         n = len([x for x in (blk.group(1).split("\n") if blk else []) if x.strip()])
         print("   %-22s %d line(s)" % (sec, n))
 
+    # injected_chars vs input_chars is the 2026-10-23 failure signature: an
+    # inlet() that returns the body untouched passes every other check here,
+    # because there is no junk and no leak in text that was never touched.
+    injected_chars = sum(len(m.get("content") or "") for m in msgs)
+    input_chars = 14 + 50
     checks = {
         "instructions injected": "## Memory (mnemory)" in blob,
+        "injection is live (%d -> %d chars)" % (input_chars, injected_chars):
+            injected_chars > input_chars + 500,
+        "core sections present": bool(re.search(r"## Agent Identity", blob)),
         "no placeholder leaks":  not re.search(r"\[[a-z][a-z0-9]*(?:_[a-z0-9]+)+\]", blob),
     }
     for j in JUNK:
@@ -90,16 +117,33 @@ async def main():
     bad = [k for k, v in checks.items() if not v]
     for k, v in checks.items():
         print("   %s %s" % ("PASS" if v else "FAIL", k))
-    core_empty = all(
-        not [x for x in (re.search(r"## %s\n(.*?)(?=\n## |\Z)" % re.escape(sec), blob, re.S)
-                         .group(1).split("\n")) if x.strip()]
-        for sec in ("Agent Identity", "User Facts", "User Preferences"))
+    def _sec_lines(sec):
+        blk = re.search(r"## %s\n(.*?)(?=\n## |\Z)" % re.escape(sec), blob, re.S)
+        # None means the header is absent entirely. That is a real failure, but
+        # the "core sections present" check reports it; this must not raise on
+        # it, because a gate that dies with AttributeError looks like a pass
+        # to anything reading only the exit code path it never reached.
+        return [x for x in (blk.group(1).split("\n") if blk else []) if x.strip()]
+
+    core_empty = all(not _sec_lines(sec) for sec in
+                     ("Agent Identity", "User Facts", "User Preferences"))
     print("   WARN core memories empty (nothing pinned in the store)" if core_empty
           else "   core memories populated")
     sys.exit(1 if bad else 0)
 
 asyncio.run(main())
 '''
+
+if not MN_USER_ID:
+    sys.exit("MN_USER_ID is required: the store scope to probe")
+if not MN_SSH_HELPER:
+    sys.exit("MN_SSH_HELPER is required: path to a host-command helper script")
+
+# PROBE is a raw string, so module-level names are NOT visible inside it. The
+# public-repo sanitisation left a bare MN_USER_ID reference there, which raised
+# NameError inside the OpenWebUI container and looked like a silent probe
+# failure from outside. Substituted as text, after the guards above.
+PROBE = PROBE.replace("__PROBE_USER_EMAIL__", MN_USER_ID)
 
 if "--verbose" in sys.argv or "-v" in sys.argv:
     print(PROBE)
@@ -108,5 +152,5 @@ if "--verbose" in sys.argv or "-v" in sys.argv:
 b64 = base64.b64encode(PROBE.encode()).decode()
 cmd = (f"printf '%s' '{b64}' > /tmp/sic.b64 && base64 -d /tmp/sic.b64 > /tmp/sic.py && "
        f"docker cp /tmp/sic.py OpenWebUI:/tmp/sic.py && docker exec OpenWebUI python3 /tmp/sic.py")
-r = subprocess.run(["python3", "<ssh-helper>", cmd, "150"])
+r = subprocess.run(["python3", MN_SSH_HELPER, cmd, "150"])
 sys.exit(r.returncode)

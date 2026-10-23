@@ -6,8 +6,8 @@ Open WebUI sqlite database; that row is what actually executes. This file is the
 git-tracked archive of each shipped version, per the owner's decision on
 2026-10-15 that the filter is always git-tracked.
 
-  version        0.4.9-atlas.2
-  live row sha256 0bdda285adab0c6fa173304e1715575a30a637a300aac580aef94767a6f280ee
+  version        0.4.9-atlas.3
+  live row sha256 474aeba0a49cc6d45b05906ad92e0594eeb5b9511f322507d635412675b356e1
   this file sha256  (differs by design, see below)
 
 SANITIZED: the three valve defaults that name LAN endpoints carry the literal
@@ -21,7 +21,18 @@ Consequence when restoring from this archive: set the ``mnemory_url``,
 back to the real host before saving the function, or recall, embeddings and
 rerank all fail open into silence rather than loudly.
 
-Changes shipped in this version, on top of 0.4.7-atlas.1 (rerank_keep_top):
+0.4.9-atlas.3 (2026-10-23): one-line removal. 0.4.9-atlas.2 left an
+unconditional ``return body`` immediately after the ``if not __user__``
+guard in ``inlet()``, which made every path below it unreachable: no core
+memories, no recalled block, no instructions, no logging. Memory injection
+was therefore fully disabled for every Open WebUI user from 16:18 until
+22:30 the same day, silently -- the row updated_at and the boot-log
+``_FILTER_BUILD`` line were the only traces. Detected by running the
+deployed DB content through the real ``inlet()`` and measuring that the
+body came back unchanged (65 chars in, 65 out), not by asking a model
+whether it had received memories.
+
+Changes shipped in 0.4.9-atlas.2, on top of 0.4.7-atlas.1 (rerank_keep_top):
   * ``_inject_recalled`` no longer appends the ``## Recalled Memories`` block
     inside the last user message; it appends a trailing ``role=user`` message
     after it, with an idempotence guard on the tail so a retry that reuses the
@@ -58,7 +69,7 @@ description: Automatic memory recall and storage for conversations
 # Patched locally (atlas.1): injector fix, tag-aware + capped sanitizer,
 # example-leak and speech-act hygiene, placeholder regex de-anchored.
 # Upstream baseline was version: 0.4.2
-version: 0.4.9-atlas.2
+version: 0.4.9-atlas.3
 """
 
 import asyncio
@@ -75,7 +86,7 @@ _log = logging.getLogger(__name__)
 # Bump on every deploy: this line is the proof in `docker logs OpenWebUI` that the
 # running filter pipeline recompiled the stored content rather than serving a cache.
 _NUM_RE_FINDALL = re.compile(r"\d[\d.,:/-]*").findall
-_FILTER_BUILD = "0.4.9-atlas.2"
+_FILTER_BUILD = "0.4.9-atlas.3"
 _log.info("mnemory filter build %s loaded", _FILTER_BUILD)
 
 
@@ -1061,7 +1072,6 @@ prompt for them."""
         """Before LLM: recall memories and inject into context."""
         if not __user__:
             return body
-        return body
 
         # Check user valves
         user_valves = __user__.get("valves")
