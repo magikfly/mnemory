@@ -187,6 +187,21 @@ EMBED_BASE_URL=https://api.openai.com/v1
 | `RECALL_RAW_PENALTY` | `0.05` | Score penalty for raw-layer memories in search results |
 | `RECALL_SUPERSEDED_PENALTY` | `0.15` | Score penalty for superseded raw memories in search results |
 
+### Content Guards
+
+Applied to LLM-written memory text at every write path — extraction,
+remember, consolidation, `infer=False`, and fsck apply — before anything
+reaches Qdrant or a log line.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MEMORY_REDACTION` | `on` | Replaces secret values in stored text with `[REDACTED:<kind>]`: GitHub, AWS, Slack, Stripe, OpenAI, Google and Telegram token shapes, JWTs, private-key headers, and label-delimited `api_key=` / `password:` / `wachtwoord:` values. Enforced on sight, because the memory survives and only the value is removed — a false positive loses no statement. Set `off` only to reproduce a suspected false positive against a live row. |
+| `MEMORY_NOISE_GUARD` | log-only | `drop` makes the `noise_memory()` rules delete memories outright. Permanent, because there is no un-retract endpoint, so audit `grep "noise guard" /data/logs/mnemory.log` before turning it on. |
+
+Redaction is deliberately positioned ahead of every guard log line: a guard
+that logs the secret it just caught would move the credential out of the
+vector store and into an unencrypted log file.
+
 ## Instruction Modes
 
 The `INSTRUCTION_MODE` env var controls how aggressively the LLM uses memory tools. These instructions are sent via the MCP protocol and injected into the LLM's system prompt by supporting clients.

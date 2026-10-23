@@ -1169,10 +1169,26 @@ def parse_extraction_response(
         from mnemory.output_guards import (
             noise_enforcing,
             pin_allowed,
+            redact_secrets,
             triage_memory,
         )
 
         text, noise, rewrote = triage_memory(text)
+
+        # Secret redaction runs BEFORE every log line in this loop. Guard
+        # verdicts are written to /data/logs/mnemory.log, and the lines below
+        # quote the text they acted on -- a guard that logged an unredacted
+        # secret would move the credential out of the vector store and into an
+        # unencrypted log file, a worse leak than the one being prevented.
+        # This is the ordering contract in output_guards.
+        text, redactions = redact_secrets(text)
+        if redactions and not silent:
+            logger.info(
+                "Extraction guard: redacted %s: %.120s",
+                ",".join(redactions),
+                text,
+            )
+
         if rewrote and not silent:
             logger.info(
                 "Extraction guard: speech-act rewrite: %.120s", text

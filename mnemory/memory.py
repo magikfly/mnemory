@@ -37,7 +37,7 @@ from mnemory.categories import (
 )
 from mnemory.config import Config
 from mnemory.llm import LLMClient, parse_json_response
-from mnemory.output_guards import noise_enforcing, triage_memory
+from mnemory.output_guards import noise_enforcing, redact_secrets, triage_memory
 from mnemory.prompts import (
     build_answer_prompt,
     build_classification_prompt,
@@ -1324,6 +1324,16 @@ class MemoryService:
         # real statement (see output_guards.triage_memory).
         flagged = []
         for f in facts:
+            # Redact first, ahead of triage: the rewrite log line below quotes
+            # the pre-rewrite text, so an unredacted secret would reach
+            # mnemory.log. Ordering contract in output_guards.
+            f["text"], redactions = redact_secrets(f.get("text", ""))
+            if redactions:
+                logger.info(
+                    "Remember redaction guard: %s in %.80s",
+                    ",".join(redactions),
+                    f.get("text", ""),
+                )
             new_text, reason, rewrote = triage_memory(f.get("text", ""))
             if rewrote:
                 logger.info(
@@ -2832,6 +2842,19 @@ class MemoryService:
                     "into multiple calls."
                 ),
             }
+
+        # infer=False stores caller-supplied text verbatim: no extraction, no
+        # parse_extraction_response, so no guard would otherwise run on it at
+        # all. A client that sends a credential gets the value replaced and the
+        # row kept -- redaction cannot lose the statement, which is why it runs
+        # here rather than behind MEMORY_NOISE_GUARD.
+        content, redactions = redact_secrets(content)
+        if redactions:
+            logger.info(
+                "infer=False redaction guard: %s (user_id=%s)",
+                ",".join(redactions),
+                user_id,
+            )
 
         # Determine which fields need auto-classification
         missing: set[str] = set()
@@ -5105,6 +5128,16 @@ class MemoryService:
                         f"Content too long: {len(content)} chars (max {max_len})."
                     ),
                 }
+            # The PUT path takes caller text with no extraction in front of
+            # it, so without this an agent could write a credential into a
+            # revision that then reads as curated knowledge.
+            content, redactions = redact_secrets(content)
+            if redactions:
+                logger.info(
+                    "Update redaction guard: %s (memory_id=%s)",
+                    ",".join(redactions),
+                    memory_id,
+                )
             changes["data"] = content
 
         if not changes:

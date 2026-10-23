@@ -22,6 +22,7 @@ from mnemory.categories import sanitize_categories
 from mnemory.output_guards import (
     clean_memory_text,
     noise_enforcing,
+    redact_secrets,
     triage_memory,
     role_mismatch,
 )
@@ -1104,6 +1105,21 @@ class ConsolidationService:
                         len(cleaned),
                     )
                     f["text"] = cleaned
+                # Redaction after clean_memory_text (so it sees final wording)
+                # and before every log line that quotes the fact. Consolidated
+                # rows are the only tier core_memories reads, so a credential
+                # written here reaches every future prompt; the log file is
+                # world-readable on the data volume.
+                f["text"], redactions = redact_secrets(f.get("text", ""))
+                if redactions:
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: redacted %s "
+                        "from output text",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                        ",".join(redactions),
+                    )
                 new_text, noise, rewrote = triage_memory(f.get("text", ""))
                 if rewrote:
                     logger.warning(

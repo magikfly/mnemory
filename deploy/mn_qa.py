@@ -443,6 +443,103 @@ except Exception:
     traceback.print_exc()
     FAILURES.append("extraction guard checks raised")
 
+# ------------------------------------------------------------- redaction
+# Secret redaction is enforced on sight (no MEMORY_NOISE_GUARD equivalent), so
+# a merge that silently drops one call site starts storing live credentials
+# again instead of failing. That is why the marker checks below read module
+# source rather than importing: mnemory.memory pulls qdrant_client at import
+# time, and two upstream merges have already removed fork patches unnoticed.
+section("redact_secrets - secret redaction at every write path")
+try:
+    import pathlib as _pl
+
+    from mnemory import output_guards as _ogr
+    from mnemory.output_guards import redact_secrets as _redact
+
+    _GOOGLE_FAKE = "AIza" + "aB3d" * 8 + "aB3"
+    check("google fixture is AIza + 35 chars", len(_GOOGLE_FAKE), 39)
+
+    # Assembled at runtime: as literals these are scanner-legal tokens for real
+    # services and GitHub push protection blocks the commit. Concatenation
+    # leaves the string handed to the guard unchanged.
+    _SLACK_FAKE = "xox" + "b" + "-" + "123456789012" + "-" + "abcdefghijklmno"
+    _STRIPE_FAKE = "sk_" + "test" + "_" + "Ab1cD2eF3gH4iJ5kL6mN7oP8"
+    _TELEGRAM_FAKE = "123456789" + ":" + "AA" + "HdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+
+    for _kind, _text, _secret in (
+        ("github_token", "pasted ghp_" + "A1" * 18 + " in chat",
+         "ghp_" + "A1" * 18),
+        ("aws_access_key", "deploy key AKIAIOSFODNN7EXAMPLE rotates",
+         "AKIAIOSFODNN7EXAMPLE"),
+        ("slack_token", "bot posts " + _SLACK_FAKE + " now",
+         _SLACK_FAKE),
+        ("stripe_key", "payments " + _STRIPE_FAKE + " used",
+         _STRIPE_FAKE),
+        ("openai_key", "extractor sk-proj-" + "aB3dE5fG7hI9jK1lM2nO3pQ4rS5tU6",
+         "sk-proj-aB3dE5fG7hI9jK1lM2nO3pQ4rS5tU6"),
+        ("jwt",
+         "cookie eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSJ9"
+         ".abcDEF1234567890XYZ sent",
+         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+        ("private_key", "material -----BEGIN RSA PRIVATE KEY----- truncated",
+         "-----BEGIN RSA PRIVATE KEY-----"),
+        ("telegram_bot_token",
+         "alerts " + _TELEGRAM_FAKE + " fire",
+         _TELEGRAM_FAKE),
+    ):
+        _out, _kinds = _redact(_text)
+        check("redacts " + _kind, _kind in _kinds, True)
+        check(_kind + " secret bytes removed", _secret in _out, False)
+
+    for _text in ("password: hunter2", "api_key=abc123def456",
+                  "wachtwoord: welkom123", "client_secret=g0supersecretvalue"):
+        _out, _kinds = _redact(_text)
+        check("redacts kv " + _text[:18], "credential_value" in _kinds, True)
+
+    # Negative controls: the config/threshold facts this store is full of.
+    for _text in (
+        "Set --max-tokens: 8192 on the llama-swap entry",
+        "Per-pass max_tokens ceilings: fsck_security 6144 and Pass B 12288",
+        "FSCK_MAX_LLM_CALLS=600",
+        "password: required for sudo access",
+        "The WEBUI_SECRET_KEY env var must be read from /proc/1/environ",
+        "CORE_MEMORY_INCLUDE_TOP_N is read by zero files",
+        "User lives in Examplestad, Netherlands",
+        "User's real name is Ada Lovelace.",
+        "User takes amlodipine 5 mg once daily",
+        "User aims for 84-88 rpm cadence on the trainer",
+    ):
+        _out, _kinds = _redact(_text)
+        check("untouched: " + _text[:34], (_out, _kinds), (_text, []))
+
+    _once, _k1 = _redact("api_key=abc123def456 here")
+    _twice, _k2 = _redact(_once)
+    check("idempotent on re-save", _twice, _once)
+    check("placeholder not re-redacted", _k2, [])
+    check("row never emptied", bool(_redact("password: hunter2")[0]), True)
+    check("None passes through", _redact(None), (None, []))
+    check("redaction on by default", _ogr.redaction_enabled(), True)
+
+    _pkg = _pl.Path(_ogr.__file__).parent
+    for _mod, _marker in (
+        ("prompts", "text, redactions = redact_secrets(text)"),
+        ("memory", "content, redactions = redact_secrets(content)"),
+        ("consolidation", "f[\"text\"], redactions = redact_secrets("),
+        ("fsck", "redact_secrets(cleaned)[0]"),
+    ):
+        _src = (_pkg / (_mod + ".py")).read_text(encoding="utf-8")
+        check("wired: " + _mod, _marker in _src, True)
+
+    # Call-site census. memory.py must hold three: the remember loop,
+    # _add_without_inference (infer=False) and update_memory (PUT). The marker
+    # checks above cannot see one disappearing, because the others still match
+    # -- which is how the fsck apply path nearly went uncovered.
+    _mem_src = (_pkg / "memory.py").read_text(encoding="utf-8")
+    check("memory.py redaction call sites", _mem_src.count("redact_secrets("), 3)
+except Exception:
+    traceback.print_exc()
+    FAILURES.append("redaction checks raised")
+
 # ---------------------------------------------------------------- summary
 print("\n================ SUMMARY ================")
 if FAILURES:

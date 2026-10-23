@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from qdrant_client.models import PointStruct
 
-from mnemory.output_guards import clean_memory_text
+from mnemory.output_guards import clean_memory_text, redact_secrets
 
 from mnemory.categories import (
     PREDEFINED_CATEGORIES,
@@ -3283,7 +3283,12 @@ class FsckService:
                         # (never fail an fsck action over formatting).
                         cleaned = clean_memory_text(action.new_content)
                         if cleaned:
-                            kwargs["content"] = cleaned
+                            # Redaction last: fsck-authored content is model
+                            # output, and a dedup or quality model can quote a
+                            # credential it read out of the store while
+                            # scanning. The secret must not survive into the
+                            # write, nor into the operation record.
+                            kwargs["content"] = redact_secrets(cleaned)[0]
                     start_action(index)
                     mutation = self._memory_service.update_memory(
                         action.memory_id, **kwargs
@@ -3478,8 +3483,10 @@ class FsckService:
                     self._memory_service.add_memory(
                         # Same guard as the update path above: fsck-authored
                         # text is model output, not trusted content.
-                        content=clean_memory_text(action.new_content)
-                        or action.new_content,
+                        content=redact_secrets(
+                            clean_memory_text(action.new_content)
+                            or action.new_content
+                        )[0],
                         user_id=user_id,
                         owner_id=source_owner_id,
                         agent_id=source_agent_id or meta.get("agent_id"),

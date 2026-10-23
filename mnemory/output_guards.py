@@ -30,6 +30,8 @@ __all__ = [
     "noise_enforcing",
     "noise_memory",
     "pin_allowed",
+    "redact_secrets",
+    "redaction_enabled",
     "role_mismatch",
     "triage_memory",
 ]
@@ -326,6 +328,166 @@ def pin_allowed(text: str | None) -> bool:
     if not text:
         return False
     return bool(_PIN_ALLOW_RE.search(_LIST_MARKER_RE.sub("", text, count=1)))
+
+# ── Secret redaction ─────────────────────────────────────────────────
+#
+# Why this guard applies on sight while the noise drops ship closed: redaction
+# keeps the row. A memory that said "the API key is sk-abc..." still records
+# that a key exists and what it is for; only the value is removed. Under
+# MEMORY_NOISE_GUARD=drop every false positive is permanent, because mnemory
+# has no un-retract endpoint. That constraint does not apply here, so this
+# belongs in the clean_memory_text tier: it rewrites stored text
+# unconditionally and behind no destructive flag.
+#
+# ORDERING CONTRACT -- every call site runs this BEFORE logging any text. Guard
+# verdicts go to /data/logs/mnemory.log and to `docker logs`; a guard that
+# logs the secret it just caught has copied the credential out of the vector
+# store into an unencrypted log file, which is a worse leak than the one being
+# prevented. Every call site in prompts.py, memory.py and consolidation.py
+# assigns the redacted text before its first logger call for that fact.
+_REDACTED_FMT = "[REDACTED:{kind}]"
+
+#: Matches an already-emitted marker, so re-saving a redacted memory cannot
+#: redact its own placeholder or report a second hit for one secret.
+_REDACTED_ANY_RE = re.compile(r"\[REDACTED:[a-z0-9_]+\]")
+
+# Named token shapes. Deliberately free of ASCII quote and apostrophe
+# characters: these patterns run over machine identifiers, not prose, and the
+# sweep in tests/test_output_guards_punctuation.py asserts a curly-punctuation
+# twin for every quote character a pattern contains. Adding one here would
+# either fail that sweep or force a per-pattern exemption, and that test's own
+# docstring rejects an exemption list as encoding the wrong rule. A GitHub
+# token is never written with curly quotes.
+_GH_TOKEN_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,99}\b")
+_AWS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA|AIDA|AROA|AGPA|ANPA|APKA)[0-9A-Z]{16}\b")
+_SLACK_TOKEN_RE = re.compile(r"\bxox[baprs](?:-[A-Za-z0-9]{8,})+\b")
+_GOOGLE_API_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")
+_STRIPE_KEY_RE = re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}\b")
+_OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")
+_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+)
+_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_TELEGRAM_BOT_RE = re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_-]{30,}\b")
+
+#: Applied in this order: specific shapes first, so the log names what was
+#: actually found instead of reporting the generic catch-all below.
+_TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("private_key", _PRIVATE_KEY_RE),
+    ("github_token", _GH_TOKEN_RE),
+    ("aws_access_key", _AWS_KEY_RE),
+    ("slack_token", _SLACK_TOKEN_RE),
+    ("google_api_key", _GOOGLE_API_RE),
+    ("stripe_key", _STRIPE_KEY_RE),
+    ("telegram_bot_token", _TELEGRAM_BOT_RE),
+    ("jwt", _JWT_RE),
+    ("openai_key", _OPENAI_KEY_RE),
+)
+
+#: Generic label-delimited credential. The value class is \S rather than an
+#: explicit "not a quote" class on purpose -- see the sweep note above. \S
+#: swallows a wrapping quote along with the value, which costs one cosmetic
+#: character and cannot leak anything.
+#:
+#: Bare "token" is NOT a label here, and that is a measured decision, not an
+#: omission: this store holds a lot of token-budget facts, and \btoken\b\s*[:=]
+#: matches the tail of "--max-tokens: 8192" because a hyphen is a word
+#: boundary. Qualifier-less labels only.
+_CRED_KV_RE = re.compile(
+    r"(?i)\b("
+    r"api[_ -]?keys?|api[_ -]?secrets?|access[_ -]?tokens?|"
+    r"refresh[_ -]?tokens?|auth[_ -]?tokens?|id[_ -]?tokens?|"
+    r"client[_ -]?secrets?|secret[_ -]?keys?|private[_ -]?tokens?|"
+    r"deploy[_ -]?keys?|ssh[_ -]?keys?|bearer|authorization|"
+    r"authorisation|passwords?|passphrase|passwd|pwd|"
+    r"wachtwoord|paswoord|geheim"
+    r")\b(\s*[:=]\s*)(\S{6,})"
+)
+# Dutch labels are listed because the store holds Dutch-language facts and the
+# extractor preserves input language.
+
+#: Words that read like a credential value but are ordinary prose sitting after
+#: the noun. Without this, "password: required" loses a word for nothing.
+_CRED_VALUE_STOPWORDS = frozenset(
+    {
+        "required", "requested", "mandatory", "changed", "rotate", "rotated",
+        "expired", "reset", "unknown", "missing", "needed", "stored",
+        "hidden", "never", "always", "yours", "mine", "here", "this", "that",
+        "none", "username", "user", "account", "login", "email", "e-mail",
+        "password", "passwd", "pwd", "api", "key", "secret", "token",
+        "and", "the", "for", "with", "again", "today", "tomorrow",
+        "verplicht", "ingesteld", "onbekend",
+    }
+)
+
+_REDACTION_ENV = "MEMORY_REDACTION"
+
+
+def redaction_enabled() -> bool:
+    """True unless MEMORY_REDACTION=off. On by default.
+
+    ``off`` exists for one job only: reproducing a suspected false positive
+    against a live row. It is not a safe steady state -- the alternative is a
+    usable credential in the vector store and in every prompt that recalls it.
+    """
+    return os.environ.get(_REDACTION_ENV, "on").strip().lower() not in {
+        "off",
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _looks_credential(value: str) -> bool:
+    """Decide whether a label-delimited value is machine-made rather than prose.
+
+    Requires six characters minimum and then either a digit anywhere (hunter2,
+    sk-ab12cd) or a length no ordinary word reaches. Deliberately NOT accepting
+    "contains an underscore or hyphen": that redacted "well-known" and
+    "high-value" in review, which is the same false-positive class that made
+    the assistant_speech_act rule unsafe to enforce.
+    """
+    # Raw, before the strip below: the strip removes [ ] and :, which are the
+    # very characters that identify an already-emitted marker. Checked in the
+    # wrong order, a re-saved row redacts its own placeholder and reports a
+    # fresh hit for a secret that is no longer there.
+    if _REDACTED_ANY_RE.search(value):
+        return False
+    v = value.strip("()[]{}<>.,;:!?\u201c\u201d\u2018\u2019\"'")
+    if len(v) < 6 or v.lower() in _CRED_VALUE_STOPWORDS:
+        return False
+    return any(ch.isdigit() for ch in v) or len(v) >= 16
+
+
+def redact_secrets(text: str | None) -> tuple[str | None, list[str]]:
+    """Replace secret values with ``[REDACTED:<kind>]``; never drop a memory.
+
+    Returns ``(text, kinds)`` where ``kinds`` lists what was replaced and is
+    empty when the text was clean. Honours ``redaction_enabled()`` internally
+    so a call site cannot forget the switch. See the ordering contract above:
+    run this before the text reaches a log line.
+    """
+    if not text or not redaction_enabled():
+        return text, []
+    out = text
+    kinds: list[str] = []
+
+    def _mark(kind: str) -> str:
+        if kind not in kinds:
+            kinds.append(kind)
+        return _REDACTED_FMT.format(kind=kind)
+
+    for kind, pattern in _TOKEN_PATTERNS:
+        out = pattern.sub(lambda m, k=kind: _mark(k), out)
+
+    def _kv_sub(m: "re.Match[str]") -> str:
+        if not _looks_credential(m.group(3)):
+            return m.group(0)
+        return f"{m.group(1)}{m.group(2)}{_mark('credential_value')}"
+
+    out = _CRED_KV_RE.sub(_kv_sub, out)
+    return out, kinds
+
 
 _META_HEAD_RE = re.compile(
     r"^\s*(?:the\s+)?(?:dashboard|memory\s+(?:store|ui|system|filter))\b",
