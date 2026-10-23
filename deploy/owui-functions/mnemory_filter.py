@@ -6,8 +6,8 @@ Open WebUI sqlite database; that row is what actually executes. This file is the
 git-tracked archive of each shipped version, per the owner's decision on
 2026-10-15 that the filter is always git-tracked.
 
-  version        0.4.8-atlas.1
-  live row sha256 de377d7469bba2c7c3afae200d1abb5e05392c10f174eda57e72a2c85f0210cf
+  version        0.4.9-atlas.1
+  live row sha256 ee14d46e92e93e561f4a717a4ecf3fff07ac8f2037b5b733a093a344bb07abcb
   this file sha256  (differs by design, see below)
 
 SANITIZED: the three valve defaults that name LAN endpoints carry the literal
@@ -58,10 +58,11 @@ description: Automatic memory recall and storage for conversations
 # Patched locally (atlas.1): injector fix, tag-aware + capped sanitizer,
 # example-leak and speech-act hygiene, placeholder regex de-anchored.
 # Upstream baseline was version: 0.4.2
-version: 0.4.8-atlas.1
+version: 0.4.9-atlas.1
 """
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -74,7 +75,7 @@ _log = logging.getLogger(__name__)
 # Bump on every deploy: this line is the proof in `docker logs OpenWebUI` that the
 # running filter pipeline recompiled the stored content rather than serving a cache.
 _NUM_RE_FINDALL = re.compile(r"\d[\d.,:/-]*").findall
-_FILTER_BUILD = "0.4.8-atlas.1"
+_FILTER_BUILD = "0.4.9-atlas.1"
 _log.info("mnemory filter build %s loaded", _FILTER_BUILD)
 
 
@@ -1059,7 +1060,8 @@ prompt for them."""
     ) -> dict:
         """Before LLM: recall memories and inject into context."""
         if not __user__:
-            return body
+            self._prefix_probe(body, chat_id)
+        return body
 
         # Check user valves
         user_valves = __user__.get("valves")
@@ -1470,6 +1472,45 @@ prompt for them."""
         return f"No new memories ({ms}ms)"
 
     # ── Outlet (after LLM) ───────────────────────────────────────────
+
+    def _prefix_probe(self, body: dict, chat_id: str) -> None:
+        """Fingerprint the prompt prefix once per request.
+
+        A prompt-cache miss can only be attributed if we know WHICH message
+        stopped matching.  Logs role/sha1/char-length for the first four and
+        the last two messages.  Message 0 is the base system prompt, message 1
+        is the static memory block this filter injects at a fixed early
+        position, message 2 onward is history - so a hash that changes between
+        two consecutive requests names the region that broke the prefix.
+        Best-effort: never raises, never blocks the request.
+        """
+        try:
+            msgs = body.get("messages") or []
+
+            def dig(m):
+                cont = m.get("content")
+                if isinstance(cont, list):
+                    cont = "".join(
+                        str(p.get("text", "")) for p in cont if isinstance(p, dict)
+                    )
+                cont = str(cont)
+                return "%s:%s/%d" % (
+                    str(m.get("role", "?"))[:4],
+                    hashlib.sha1(cont.encode("utf-8", "replace")).hexdigest()[:8],
+                    len(cont),
+                )
+
+            head = " ".join(dig(m) for m in msgs[:4])
+            tail = " ".join(dig(m) for m in msgs[-2:]) if len(msgs) > 6 else ""
+            _log.info(
+                "PREFIXPROBE chat=%s n=%d | %s | tail %s",
+                str(chat_id)[:8],
+                len(msgs),
+                head,
+                tail,
+            )
+        except Exception:
+            pass
 
     async def outlet(
         self,
