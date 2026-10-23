@@ -267,7 +267,18 @@ _DATE_ECHO_RE = re.compile(
     # Deliberately narrow: only the two shapes actually observed in the store.
     # A general "the date is ..." rule would drop legitimate facts such as "The
     # date is August 13, my birthday", and there is no evidence broadening it.
-    r"|^(?:the\s+current\s+)?date\s+(?:is|was)\s+\d",
+    r"|^(?:the\s+current\s+)?date\s+(?:is|was)\s+\d"
+    # 2026-10-23: the injection-template family.  The client filter prepends a
+    # rendered "Current date context: <date>" line and the extractor narrates it
+    # back as a user fact; five such rows were purged from the live store, and
+    # two of them had stored the placeholder UNEXPANDED -- proof the extractor
+    # is fed the template, not the conversation.  An unexpanded brace pair is
+    # never a durable statement, so that alternative is safe on its own; the
+    # phrase rule is the deliberate part.  Accepted collateral, pinned by
+    # test_known_accepted_collateral: a meta-note that quotes the placeholder
+    # is dropped too -- write those to the ops journal, not the memory store.
+    r"|\bcurrent\s+date\s+context\b"
+    r"|\{\s*current[_\s-]*date\s*\}",
     re.IGNORECASE,
 )
 

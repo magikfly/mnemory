@@ -35,6 +35,14 @@ SHOULD_DROP = [
     "Assistant noted the pinned row still claims the old filter version",
     "User initiated a greeting with 'hey there'",
     "User greeted the assistant in Dutch",
+    # Injection-template family, 2026-10-23: three of five purged live rows
+    # slipped past every rule above. Forms only, dates synthetic.
+    "Today's date is Wednesday, 7 October 2026.",
+    "User indicated today's date is 2025-08-24, which will be used as the briefing date.",
+    "User noted that current date context is 2025-08-24.",
+    "Current date context: {current_date}",
+    "Current date context provided: {current_date} = 2025-08-24.",
+    "Assistant recorded the current date context for the session.",
 ]
 
 MUST_KEEP = [
@@ -56,6 +64,10 @@ MUST_KEEP = [
     "Assistant identified cross-role leak bug where claims were laundered",
     "User's memory of the run includes pace and heart rate per kilometre",
     "User stores the vault file at mode 0600 with git history",
+    # Controls for the template-family rules: adjacent shapes that must not burn.
+    "The meeting date was 2025-06-01 and the venue holds 40.",
+    "User's filter bug let the [session_id] placeholder reach the prompt.",
+    "User dates the regression to the 2025-08-24 deploy.",
 ]
 
 
@@ -90,3 +102,17 @@ def test_default_mode_is_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
     assert noise_enforcing() is True
     monkeypatch.setenv("MEMORY_NOISE_GUARD", "LOG")
     assert noise_enforcing() is False
+
+
+def test_known_accepted_collateral() -> None:
+    """A meta-note that quotes the placeholder is dropped. Accepted 2026-10-23.
+
+    Deliberate, not an oversight: the brace alternative cannot tell "the
+    extractor ate {current_date}" from a fact that happens to name it, and the
+    leak itself is documented in the ops journal, which is searchable from the
+    agent side. Pinned here so the next reader sees a decision rather than a
+    bug -- and so flipping this back to a keep is a visible edit.
+    """
+    assert noise_memory(
+        "User documented that {current_date} must never reach the extractor."
+    ) == "date_echo"
