@@ -6,8 +6,8 @@ Open WebUI sqlite database; that row is what actually executes. This file is the
 git-tracked archive of each shipped version, per the owner's decision on
 2026-10-15 that the filter is always git-tracked.
 
-  version        0.4.9-atlas.1
-  live row sha256 ee14d46e92e93e561f4a717a4ecf3fff07ac8f2037b5b733a093a344bb07abcb
+  version        0.4.9-atlas.2
+  live row sha256 0bdda285adab0c6fa173304e1715575a30a637a300aac580aef94767a6f280ee
   this file sha256  (differs by design, see below)
 
 SANITIZED: the three valve defaults that name LAN endpoints carry the literal
@@ -58,7 +58,7 @@ description: Automatic memory recall and storage for conversations
 # Patched locally (atlas.1): injector fix, tag-aware + capped sanitizer,
 # example-leak and speech-act hygiene, placeholder regex de-anchored.
 # Upstream baseline was version: 0.4.2
-version: 0.4.9-atlas.1
+version: 0.4.9-atlas.2
 """
 
 import asyncio
@@ -75,7 +75,7 @@ _log = logging.getLogger(__name__)
 # Bump on every deploy: this line is the proof in `docker logs OpenWebUI` that the
 # running filter pipeline recompiled the stored content rather than serving a cache.
 _NUM_RE_FINDALL = re.compile(r"\d[\d.,:/-]*").findall
-_FILTER_BUILD = "0.4.9-atlas.1"
+_FILTER_BUILD = "0.4.9-atlas.2"
 _log.info("mnemory filter build %s loaded", _FILTER_BUILD)
 
 
@@ -1060,7 +1060,7 @@ prompt for them."""
     ) -> dict:
         """Before LLM: recall memories and inject into context."""
         if not __user__:
-            self._prefix_probe(body, chat_id)
+            return body
         return body
 
         # Check user valves
@@ -1317,6 +1317,15 @@ prompt for them."""
                     "data": {"description": desc, "done": True},
                 }
             )
+        # Tripwire for prompt-cache regressions: fingerprint the prefix as it is
+        # finally handed off, after every injection this filter performs.
+        try:
+            _cid = body.get("chat_id") or (
+                __user__.get("chat_id") if isinstance(__user__, dict) else None
+            )
+        except Exception:
+            _cid = None
+        self._prefix_probe(body, _cid)
         return body
 
     def _inject_static_context(
