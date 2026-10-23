@@ -43,6 +43,7 @@ from mnemory import __version__
 from mnemory.auth import get_jwt_validator, looks_like_jwt
 from mnemory.config import load_config
 from mnemory.instructions import VALID_MODES, build_instructions
+from mnemory.logsink import attach_file_handler
 from mnemory.memory import MemoryService
 from mnemory.metrics import get_collector
 from mnemory.revisions import RevisionConflictError
@@ -54,6 +55,11 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 logger = logging.getLogger("mnemory")
+
+# Guard verdicts, drops and retractions are the audit trail for a write path
+# with no un-retract endpoint, and stderr alone ties them to the container's
+# lifetime.  No-op unless MNEMORY_LOG_FILE is set; see mnemory/logsink.py.
+attach_file_handler()
 
 # ── Session Identity Context ──────────────────────────────────────────
 # Set by the auth middleware per-request, read by tool handlers via
