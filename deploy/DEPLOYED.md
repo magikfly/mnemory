@@ -131,3 +131,29 @@ Branch `mn-fork` (commit `3bb9753`) carries the Open WebUI **filter** provenance
 dir: baseline + mn-fork filter, patch, test, deploy script, `PATCHES.md`, `build_fork.py`). It
 changes how recalled memories are labelled in the chat prompt — staged, tested locally, **not
 applied to the OWUI function DB** and not in the image.
+
+## 2026-10-27 - retrieval seam + TTL reaper (commit 2493941)
+
+Patched files touched by this change, for upstream-merge conflict resolution:
+
+- `mnemory/memory.py`
+  - `find_memories(score_threshold=None)` - a caller threshold now wins over
+    `SEARCH_SCORE_THRESHOLD`; that constant is vector-calibrated and was being
+    applied to rerank rubric scores after the score field was overwritten.
+  - the rerank stage keeps candidates the LLM omitted (score set to the floor,
+    ranked last) and logs the omission, instead of deleting those memories.
+  - `list_categories` scan cap 1000 -> 20000, with a warning if it ever clips.
+  - `_get_available_categories` scan cap 1000 -> 20000, same warning.
+  - `delete_all_memories` artifact-cleanup enumeration 1000 -> 20000, same.
+- `mnemory/fsck.py` - new `_phase_ttl_reap()` (deterministic, consumes no LLM
+  budget) called from `run_check` after the quality phase. It holds pinned
+  rows, rows cited as evidence by a live memory, and fact/preference types.
+- `mnemory/api/schemas.py` - `FindMemoriesRequest.score_threshold` and
+  `SearchMemoriesResponse.stats`.
+- `mnemory/api/memories.py` - the `/find` route forwards the threshold and
+  returns the stats block.
+- `tests/test_fork_rerank_seam.py` - new guard suite (10 tests).
+
+If upstream rework touches `find_memories`, the rerank scoring loop, or the
+fsck phase sequence, re-read this section first: those three behaviours
+regressed silently and were only caught by instrumentation.
