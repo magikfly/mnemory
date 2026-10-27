@@ -3531,6 +3531,7 @@ class MemoryService:
         session_timezone: str | None = None,
         context: str | None = None,
         labels: dict[str, Any] | None = None,
+        score_threshold: float | None = None,
         track_access: bool = True,
     ) -> dict:
         """Find memories relevant to a complex question using AI-powered search.
@@ -3568,7 +3569,18 @@ class MemoryService:
         user_id = _validate_id(user_id, "user_id")
         owner_id = _validate_id(owner_id, "owner_id") if owner_id else user_id
         num_queries = self._config.memory.find_memories_queries
-        threshold = self._config.memory.search_score_threshold
+        # FIX(2026-10-27): search_score_threshold (SEARCH_SCORE_THRESHOLD,
+        # default 0.30) is calibrated for vector/RRF scores, but below this
+        # point mem["score"] has already been overwritten with the rerank LLM's
+        # 0-1 rubric relevance. One inherited constant was therefore deciding
+        # how much of the pool survives, and a caller-supplied threshold was
+        # impossible to pass at all. Config value stays the default for callers
+        # that do not specify one.
+        threshold = (
+            score_threshold
+            if score_threshold is not None
+            else self._config.memory.search_score_threshold
+        )
 
         t_start = time.monotonic()
 
@@ -3798,10 +3810,32 @@ class MemoryService:
 
         # Apply LLM scores, then apply final ranking before thresholding.
         reranked = []
+        unscored = []
         for idx, mem in enumerate(rerank_candidates):
             if idx in score_map:
                 mem["score"] = round(score_map[idx], 4)
                 reranked.append(mem)
+            else:
+                unscored.append(mem)
+
+        if unscored:
+            # FIX(2026-10-27): the rerank prompt commands "Include ALL memories
+            # in the response. Do not omit any", so a missing idx is a model
+            # formatting failure - not a relevance judgement. The old code
+            # deleted those candidates, which turned a small-model hiccup into
+            # silent information loss that was indistinguishable from
+            # "scored irrelevant" in the dropped counter. Keep them at the
+            # floor so they survive the threshold and rank behind everything
+            # the model actually scored.
+            logger.warning(
+                "find_memories: rerank LLM omitted %d of %d candidate indices;"
+                " retaining them at the score floor",
+                len(unscored),
+                len(rerank_candidates),
+            )
+            for mem in unscored:
+                mem["score"] = max(float(threshold), 0.0)
+            reranked.extend(unscored)
 
         reranked = self._apply_validation_decay(reranked)
         reranked = [m for m in reranked if m.get("score", 0) >= threshold]
@@ -5363,9 +5397,19 @@ class MemoryService:
         else:
             # Deleting only agent-scoped memories — need reference checking
             try:
+                # FIX(2026-10-27): the memories themselves are removed by
+                # vector.delete_all() (filter-based, unconditional), but this
+                # enumeration drives ARTIFACT cleanup - so any agent-scoped
+                # memory past the first 1000 left its artifacts orphaned.
+                _scan = 20000
                 result = self.vector.get_all(
-                    user_id=user_id, agent_id=agent_id, limit=1000
+                    user_id=user_id, agent_id=agent_id, limit=_scan
                 )
+                if len(result.get('results', [])) >= _scan:
+                    logger.warning(
+                        'delete_all_memories: artifact cleanup scanned only %d '
+                        'rows for user %s - raise the limit', _scan, user_id,
+                    )
                 for mem in result.get("results", []):
                     mem_id = mem.get("id")
                     if mem_id and (mem.get("metadata") or {}).get("artifacts"):
@@ -5397,8 +5441,20 @@ class MemoryService:
         project: categories found in the user's memories.
         """
         user_id = _validate_id(user_id, "user_id")
-        result = self.vector.get_all(user_id=user_id, limit=1000)
+        # FIX(2026-10-27): limit=1000 silently truncated the scan, so every
+        # category count and the "total memories" figure could report a
+        # fraction of the store (it did: 999 reported vs 2,694 real). Scan the
+        # whole scope and make any future clipping loud instead of invisible.
+        scan_limit = 20000
+        result = self.vector.get_all(user_id=user_id, limit=scan_limit)
         memories = result.get("results", [])
+        if len(memories) >= scan_limit:
+            logger.warning(
+                "list_categories: counts computed from a TRUNCATED scan of %d "
+                "rows for user %s - raise scan_limit",
+                scan_limit,
+                user_id,
+            )
         counts = count_categories(memories)
 
         categories = []
@@ -5736,7 +5792,15 @@ class MemoryService:
 
         # Add dynamic subcategories from existing memories
         try:
-            result = self.vector.get_all(user_id=user_id, limit=1000)
+            # FIX(2026-10-27): same silent-truncation class as list_categories;
+            # past this many rows the available-category list is incomplete.
+            _scan = 20000
+            result = self.vector.get_all(user_id=user_id, limit=_scan)
+            if len(result.get('results', [])) >= _scan:
+                logger.warning(
+                    'available categories computed from a TRUNCATED scan of %d rows',
+                    _scan,
+                )
             counts = count_categories(result.get("results", []))
             for cat_name in sorted(counts.keys()):
                 if ":" in cat_name and cat_name not in categories:

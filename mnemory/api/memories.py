@@ -301,12 +301,13 @@ def find_memories(
             include_decayed=req.include_decayed,
             session_timezone=ctx.timezone,
             context=req.context,
+            score_threshold=req.score_threshold,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
     items = [format_memory_item(r) for r in result.get("results", [])]
-    return SearchMemoriesResponse(results=items)
+    return SearchMemoriesResponse(results=items, stats=result.get("stats"))
 
 
 @router.post("/ask", response_model=AskMemoriesResponse)

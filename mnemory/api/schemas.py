@@ -239,6 +239,15 @@ class SearchMemoriesRequest(BaseModel):
 class FindMemoriesRequest(BaseModel):
     """Request for AI-powered multi-query search."""
 
+    score_threshold: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum rerank relevance (0-1) applied to the rerank LLM "
+            "rubric. Omit to fall back to SEARCH_SCORE_THRESHOLD."
+        ),
+    )
     question: str = Field(
         ..., max_length=10_000, description="Natural language question"
     )
@@ -318,6 +327,14 @@ class SearchMemoriesResponse(BaseModel):
     """Response from memory search."""
 
     results: list[MemoryItem]
+    stats: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Retrieval accounting for find (searched/merged/reranked/dropped/"
+            "returned). Without it, rerank attrition is invisible to API "
+            "clients and can only be read off the server log."
+        ),
+    )
 
 
 class ListMemoriesResponse(BaseModel):

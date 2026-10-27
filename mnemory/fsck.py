@@ -712,6 +712,101 @@ class FsckService:
             check.status = "failed"
             check.error = type(exc).__name__
 
+    def _phase_ttl_reap(self, check) -> list:
+        # LOCAL-PATCH 2026-10-27: nothing in this file could ever remove expired
+        # rows. Every phase here scans with exclude_expired=True, so corpses are
+        # invisible to the janitor, while query-time exclusion means they are
+        # never recalled either - they just accumulate. Measured 2026-10-27: 650
+        # rows (24% of the active surface) sat past expires_at, oldest 77 days.
+        # This phase scans WITH expiry and proposes one delete per expired row.
+        # Guards: never pinned rows, never rows a live memory cites as evidence,
+        # never durable types (fact/preference) - those need a human call.
+        # confidence 1.0 / severity low puts it inside the existing auto-apply
+        # gate, so it runs on the normal fsck schedule with no extra cron.
+        import datetime as _dt
+        issues = []
+        try:
+            rows = self._vector.get_all(
+                user_id=check.user_id,
+                owner_id=check.owner_id or check.user_id,
+                limit=50000,
+            ).get('results', [])
+        except Exception:
+            logger.warning('ttl_reap: scan failed, skipping phase')
+            return issues
+        now = _dt.datetime.now(_dt.timezone.utc)
+
+        def _md(m):
+            return m.get('metadata') or {}
+
+        def _expired(m):
+            e = _md(m).get('expires_at')
+            if not e:
+                return False
+            try:
+                return _dt.datetime.fromisoformat(e) < now
+            except Exception:
+                return False
+
+        live_ids = set()
+        refs = set()
+        for m in rows:
+            if not _expired(m):
+                live_ids.add(str(m.get('id')))
+        for m in rows:
+            if str(m.get('id')) not in live_ids:
+                continue
+            d = _md(m)
+            for key in ('evidence_root_ids', 'consumed_evidence_root_ids'):
+                for x in (d.get(key) or []):
+                    refs.add(str(x))
+        proposed = 0
+        held = 0
+        for m in rows:
+            if not _expired(m):
+                continue
+            d = _md(m)
+            mid = str(m.get('id'))
+            if d.get('pinned') or mid in refs:
+                held += 1
+                continue
+            if d.get('memory_type') in ('fact', 'preference'):
+                held += 1
+                continue
+            issues.append(
+                FsckIssue(
+                    issue_id=str(uuid.uuid4()),
+                    type='quality',
+                    severity='low',
+                    reasoning=(
+                        'TTL expired ' + str(d.get('expires_at'))[:10]
+                        + ' (type=' + str(d.get('memory_type'))
+                        + ', ttl_days=' + str(d.get('ttl_days'))
+                        + ', accesses=' + str(d.get('access_count') or 0)
+                        + '); no live memory cites it.'
+                    ),
+                    affected_memories=[
+                        FsckAffectedMemory(
+                            id=mid,
+                            content=str(m.get('memory') or '')[:1000],
+                            metadata=d,
+                            agent_id=d.get('agent_id'),
+                        )
+                    ],
+                    actions=[FsckAction(action='delete', memory_id=mid)],
+                    confidence=1.0,
+                )
+            )
+            proposed += 1
+        if proposed:
+            logger.info(
+                'ttl_reap: %d expired row(s) proposed for retraction (%d held '
+                'by pin/evidence/durable guard)',
+                proposed,
+                held,
+            )
+        return issues
+
     def run_check(
         self,
         check_id: str,
@@ -947,6 +1042,11 @@ class FsckService:
                 quality_memories, check, available_categories=available_categories
             )
             check.issues.extend(quality_issues)
+
+            # LOCAL-PATCH 2026-10-27: deterministic TTL enforcement, no LLM.
+            # Placed after the LLM phases so it is never budget-starved, and it
+            # deliberately does NOT consume check.llm_calls.
+            check.issues.extend(self._phase_ttl_reap(check))
             check.progress.issues_found = len(check.issues)
             check.progress.percent = 100
 
