@@ -2,7 +2,21 @@ name: Build and publish mnemory image
 
 on:
   schedule:
-    - cron: "30 0 * * *" # daily 00:30 UTC: merges any new upstream release, finishes well before the 04:00 Europe/Amsterdam Watchtower poll
+    # Two evening slots instead of one pre-dawn one, because the old
+    # "finishes well before the poll" claim was false in practice: GitHub
+    # delivers `schedule` events to this account 2h17m to 4h59m late
+    # (measured 2026-10-21..27 across basalt, mnemory and intervals-icu-mcp;
+    # createdAt == startedAt, so it is their scheduler, not a queued runner).
+    # The 00:30 UTC slot actually ran at 04:51, 05:01, 05:04, 05:07 and
+    # 05:20 UTC - every one AFTER the host applies :latest at 04:00
+    # Europe/Amsterdam = 03:00 UTC (WATCHTOWER_SCHEDULE "0 0 4 * * *",
+    # measured 2026-10-27), so every published image waited a full day.
+    # Worst observed lag (+4h59m) puts 18:30 at ~23:30 UTC and 20:30 at
+    # ~01:30 UTC, both still ahead of the poll. A duplicated run costs ~15s:
+    # the "already published" gate exits without building. Do not move
+    # either slot toward the poll - the lag is GitHub-side and unbounded.
+    - cron: "30 18 * * *"
+    - cron: "30 20 * * *"
   workflow_dispatch:
     inputs:
       tag:
