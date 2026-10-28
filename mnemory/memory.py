@@ -37,7 +37,12 @@ from mnemory.categories import (
 )
 from mnemory.config import Config
 from mnemory.llm import LLMClient, parse_json_response
-from mnemory.output_guards import noise_enforcing, redact_secrets, triage_memory
+from mnemory.output_guards import (
+    noise_enforcing,
+    noise_enforcing_for,
+    redact_secrets,
+    triage_memory,
+)
 from mnemory.prompts import (
     build_answer_prompt,
     build_classification_prompt,
@@ -1343,18 +1348,22 @@ class MemoryService:
                 f["text"] = new_text
             flagged.append((f, reason))
         if any(reason for _, reason in flagged):
-            enforcing = noise_enforcing()
+            # Per-reason enforcement: MEMORY_NOISE_GUARD=drop is already live in
+            # production, so the two new reasons (user_speech_act) must not
+            # inherit it -- they get their own switch. See
+            # output_guards.noise_enforcing_for.
             for fact, reason in flagged:
                 if reason:
                     logger.info(
                         "Remember noise guard: %s (%s): %.80s",
-                        "dropped" if enforcing else "would drop (log only)",
+                        "dropped" if noise_enforcing_for(reason)
+                        else "would drop (log only)",
                         reason, fact.get("text", ""),
                     )
-            if enforcing:
-                facts = [f for f, reason in flagged if not reason]
-                if not facts:
-                    return []
+            facts = [f for f, reason in flagged
+                     if not noise_enforcing_for(reason)]
+            if not facts:
+                return []
 
         # 1. Batch embed all fact texts
         fact_texts = [f["text"] for f in facts]

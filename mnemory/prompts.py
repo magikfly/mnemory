@@ -1167,7 +1167,9 @@ def parse_extraction_response(
         pinned = bool(entry.get("pinned", False))
 
         from mnemory.output_guards import (
-            noise_enforcing,
+            agent_voice,
+            agent_voice_enforcing,
+            noise_enforcing_for,
             pin_allowed,
             redact_secrets,
             triage_memory,
@@ -1194,7 +1196,7 @@ def parse_extraction_response(
                 "Extraction guard: speech-act rewrite: %.120s", text
             )
         if noise:
-            enforce = noise_enforcing()
+            enforce = noise_enforcing_for(noise)
             if not silent:
                 logger.info(
                     "Extraction guard: %s (%s): %.120s",
@@ -1215,6 +1217,31 @@ def parse_extraction_response(
         event_date: str | None = None
         if isinstance(raw_event_date, str) and raw_event_date.strip():
             event_date = raw_event_date.strip()
+
+        # Agent voice: the extractor already labels each fact with the
+        # speaker. Transcribed assistant utterances (episodic/context) are the
+        # single largest noise class measured in this store -- 1,070 of 2,312
+        # rows -- and the persona rows are NOT in that class, because identity
+        # arrives as role=assistant + type=fact/preference, or pinned.
+        voice = agent_voice(
+            str(entry.get("role") or ""),
+            memory_type,
+            pinned,
+            importance,
+        )
+        if voice:
+            if agent_voice_enforcing():
+                if not silent:
+                    logger.info(
+                        "Extraction guard: %s (dropping): %.120s", voice, text
+                    )
+                continue
+            if not silent:
+                logger.info(
+                    "Extraction guard: %s (would drop, log-only): %.120s",
+                    voice,
+                    text,
+                )
 
         results.append(
             {
@@ -2943,7 +2970,7 @@ and the Example Cycles touring bike uses cable-operated disc brakes.
 Output:
 {{"memories": [
   {{"text": "User needs help replacing the brakes on their Example Cycles touring bike", "role": "user", "memory_type": "episodic", "categories": ["vehicles"], "importance": "normal", "pinned": false, "event_date": "2025-03-15"}},
-  {{"text": "Assistant researched the Example Cycles touring bike and found it uses cable-operated disc brakes", "role": "assistant", "memory_type": "episodic", "categories": ["vehicles"], "importance": "normal", "pinned": false, "event_date": "2025-03-15"}}
+  {{"text": "The user's Example Cycles touring bike uses cable-operated disc brakes", "role": "user", "memory_type": "fact", "categories": ["vehicles"], "importance": "normal", "pinned": false, "event_date": null}}
 ], "summary": "User needs help replacing touring bike brakes. Assistant found the model uses cable-operated disc brakes.", "store_artifact": false}}
 (The assistant's serial-number request is a session-specific clarifying question — \
 not extracted. The brake finding has lasting reference value.)

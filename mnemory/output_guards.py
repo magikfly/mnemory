@@ -528,6 +528,108 @@ _GREETING_ACT_RE = re.compile(
 
 #: log = report only (default), drop = actually refuse the row. There is no
 #: un-retract endpoint, so refusing to write must be a conscious opt-in.
+# ── user-side speech acts ────────────────────────────────────────────────
+#: LOCAL-PATCH 2026-10-28 (gates/agent-voice).
+#: The assistant side is policed (_ASSISTANT_ACT_RE). The user side was not,
+#: and the 2,312-row census of 2026-10-27 measured the cost: of 1,166
+#: narration-shaped rows, 434 carry role="user" -- "User requested to bump
+#: max-file to 5 in docker-compose.yml", "User expressed frustration with
+#: memory's current state". Policing only the assistant shape fixes 63% of the
+#: surface and teaches the extractor to keep laundering the rest under the user
+#: role.
+#:
+#: Deliberately absent from the verb list: decided, prefers, wants, needs,
+#: plans, agreed. Those are the durable classes this store exists for (a
+#: decision, a preference, an open loop). "agreed" is the recorded false
+#: positive of 2026-10-18 -- a sentence of the form "<spouse> agreed to the
+#: move" must survive, so it stays out. The fixture pinning that lives in
+#: tests/test_output_guards_agent_voice.py.
+#:
+#: NOTE for whoever flips MEMORY_NOISE_USER_ACTS=drop: unlike the assistant
+#: case, there is no that-clause rescue wired for these heads yet. Run in
+#: shadow first and read the would-drop list; if substance is wrapping itself
+#: in a user speech act, extend triage_memory() with a user-head split before
+#: enforcing.
+_USER_ACT_HEAD = (
+    r"^\s*(?:the\s+)?user(?:" + _APOS + r")?\s+"
+    r"(?:(?:is|was|has|have|had)\s+)*"
+)
+_USER_ACT_RE = re.compile(
+    _USER_ACT_HEAD
+    + r"(?:request(?:s|ed)?|ask(?:s|ed)|inquir(?:e|es|ed|ing)"
+    r"|express(?:es|ed)?|complain(?:s|ed)?|thank(?:s|ed)?"
+    r"|apologis(?:e|ed|ing)|reiterat(?:es|ed)?|clarif(?:y|ies|ied)"
+    r"|acknowledg(?:es|ed)?|volunte(?:er|ered|ers)|mention(?:s|ed)?"
+    r"|stat(?:e|es|ed)|inform(?:s|ed)?|report(?:s|ed)?)\b",
+    re.IGNORECASE,
+)
+
+#: Facts the extractor attributes to the assistant. This is NOT the assistant
+#: identity: identity rows are role=assistant AND memory_type in (fact,
+#: preference) AND usually pinned -- "Assistant's name is Atlas" is exactly
+#: that shape and must survive. Measured on the live store: of 1,070
+#: role=assistant rows, 999 are episodic or context (transcribed utterances)
+#: and 71 are fact/preference/procedural or pinned. Refusing the episodic and
+#: context ones removes 93% of the agent voice while leaving the persona and
+#: the durable capability notes intact.
+AGENT_VOICE_TYPES = frozenset({"episodic", "context"})
+
+#: Per-rule enforcement modes. Both new rules ship CLOSED and in shadow, even
+#: though MEMORY_NOISE_GUARD is already set to drop in production: a new
+#: pattern added to a predicate that is already enforcing starts deleting on
+#: the deploy that adds it, and there is no un-retract endpoint.
+_USER_ACT_MODE_ENV = "MEMORY_NOISE_USER_ACTS"
+_AGENT_VOICE_MODE_ENV = "MEMORY_AGENT_VOICE"
+
+
+def _mode(env: str) -> str:
+    return os.getenv(env, "shadow").strip().lower()
+
+
+def user_act_enforcing() -> bool:
+    """True when MEMORY_NOISE_USER_ACTS=drop."""
+    return _mode(_USER_ACT_MODE_ENV) == "drop"
+
+
+def agent_voice_enforcing() -> bool:
+    """True when MEMORY_AGENT_VOICE=drop."""
+    return _mode(_AGENT_VOICE_MODE_ENV) == "drop"
+
+
+def noise_enforcing_for(reason: str | None) -> bool:
+    """Whether a given noise reason should actually refuse the row.
+
+    The single global noise_enforcing() cannot be reused for new rules: it is
+    already `drop` on this deployment, so any pattern added to noise_memory()
+    would start deleting the moment it merged. Each new reason gets its own
+    switch; every legacy reason keeps inheriting MEMORY_NOISE_GUARD so no
+    existing behaviour changes.
+    """
+    if reason == "user_speech_act":
+        return user_act_enforcing()
+    return noise_enforcing()
+
+
+def agent_voice(role: str | None, memory_type: str | None, pinned: bool,
+                importance: str | None = None) -> str | None:
+    """Return "assistant_agent_voice" for a transcribed assistant utterance.
+
+    Pure and deterministic, like the rest of this module: no model call, no
+    store access. `role` is the per-fact field the extractor already emits
+    (prompts.py "Each extracted fact must include a role field"), which means
+    the provenance we needed was already being produced and thrown away.
+    """
+    if (role or "").strip().lower() != "assistant":
+        return None
+    if pinned:
+        return None
+    if (memory_type or "").strip().lower() not in AGENT_VOICE_TYPES:
+        return None
+    if str(importance or "").strip().lower() in ("high", "critical"):
+        return None
+    return "assistant_agent_voice"
+
+
 _NOISE_MODE_ENV = "MEMORY_NOISE_GUARD"
 
 
@@ -558,6 +660,7 @@ def noise_memory(text: str | None) -> str | None:
         (_META_INDEXICAL_RE, "meta_indexical"),
         (_DATE_ECHO_RE, "date_echo"),
         (_SPEAKER_QUOTE_RE, "speaker_quote"),
+        (_USER_ACT_RE, "user_speech_act"),
     ):
         if regex.search(probe):
             return reason
