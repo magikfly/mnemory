@@ -574,6 +574,18 @@ _USER_ACT_RE = re.compile(
 #: the durable capability notes intact.
 AGENT_VOICE_TYPES = frozenset({"episodic", "context"})
 
+#: LOCAL-PATCH 2026-10-28: category carve-out. agent_voice() refused on
+#: role+type alone, so a health, medication, family or finance row that the
+#: extractor happened to type "episodic" at normal importance was deleted at
+#: write time once MEMORY_AGENT_VOICE=drop. Measured context: the extractor
+#: types roughly 63% of facts episodic, so type is a weak proxy for
+#: durability, and a wrong refusal here is unrecoverable (no un-retract).
+#: Durable life categories are therefore never refused on voice alone.
+LIFE_CATEGORIES = frozenset({
+    "health", "personal", "family", "finance", "preferences", "decisions",
+    "goals", "home", "travel", "entertainment",
+})
+
 #: Per-rule enforcement modes. Both new rules ship CLOSED and in shadow, even
 #: though MEMORY_NOISE_GUARD is already set to drop in production: a new
 #: pattern added to a predicate that is already enforcing starts deleting on
@@ -596,7 +608,14 @@ def agent_voice_enforcing() -> bool:
     return _mode(_AGENT_VOICE_MODE_ENV) == "drop"
 
 
-def noise_enforcing_for(reason: str | None) -> bool:
+NARRATION_REASONS = frozenset({
+    "assistant_speech_act", "assistant_meta_observation", "user_speech_act",
+    "greeting_narration",
+})
+
+
+def noise_enforcing_for(reason: str | None,
+                        categories: list | tuple | None = None) -> bool:
     """Whether a given noise reason should actually refuse the row.
 
     The single global noise_enforcing() cannot be reused for new rules: it is
@@ -604,25 +623,48 @@ def noise_enforcing_for(reason: str | None) -> bool:
     would start deleting the moment it merged. Each new reason gets its own
     switch; every legacy reason keeps inheriting MEMORY_NOISE_GUARD so no
     existing behaviour changes.
+
+    LIFE-CATEGORY VETO (2026-10-28): narration reasons must not delete a row
+    that carries a durable life category. Measured in this session: a row
+    reading "Assistant confirmed the user should not train fasted above 15
+    mmol/l glucose" matched assistant_speech_act, triage_memory() declined to
+    rescue it (the rescue covers that-clauses and subject-less clauses only),
+    and under the already-live MEMORY_NOISE_GUARD=drop it is deleted outright.
+    Same for "Assistant noted the family holiday is booked for October". A
+    paraphrase of medical or family content phrased as narration is exactly the
+    content this store exists to keep, and there is no un-retract.
     """
+    if categories and reason in NARRATION_REASONS:
+        cats = {str(c).strip().lower() for c in categories}
+        if cats & LIFE_CATEGORIES:
+            return False
     if reason == "user_speech_act":
         return user_act_enforcing()
     return noise_enforcing()
 
 
 def agent_voice(role: str | None, memory_type: str | None, pinned: bool,
-                importance: str | None = None) -> str | None:
+                importance: str | None = None,
+                categories: list | tuple | None = None) -> str | None:
     """Return "assistant_agent_voice" for a transcribed assistant utterance.
 
     Pure and deterministic, like the rest of this module: no model call, no
     store access. `role` is the per-fact field the extractor already emits
     (prompts.py "Each extracted fact must include a role field"), which means
     the provenance we needed was already being produced and thrown away.
+
+    `categories` is a safety net, not a classifier: any durable life category
+    suppresses the verdict, because memory_type is a weak proxy for durability
+    and a false refusal is permanent.
     """
     if (role or "").strip().lower() != "assistant":
         return None
     if pinned:
         return None
+    if categories:
+        cats = {str(c).strip().lower() for c in categories}
+        if cats & LIFE_CATEGORIES:
+            return None
     if (memory_type or "").strip().lower() not in AGENT_VOICE_TYPES:
         return None
     if str(importance or "").strip().lower() in ("high", "critical"):

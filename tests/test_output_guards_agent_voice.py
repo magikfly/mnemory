@@ -117,3 +117,85 @@ class TestMedicalRescueUntouched:
         assert rewrote is True
         assert "fasted" in text
         assert "hypoglycaemia" in text
+
+
+class TestLifeCategoryCarveOut:
+    """Type is a weak proxy for durability; a false refusal is permanent.
+
+    The extractor types roughly 63% of facts episodic, so a health or family
+    row can easily arrive as role=assistant + episodic + normal importance.
+    Once MEMORY_AGENT_VOICE=drop is set that shape is deleted at write time,
+    and mnemory has no un-retract endpoint. Life categories veto the verdict.
+    """
+
+    def test_health_category_vetoes_voice(self):
+        assert agent_voice(
+            "assistant", "episodic", False, "normal",
+            categories=["health"],
+        ) is None
+
+    def test_medication_row_survives_voice(self):
+        assert agent_voice(
+            "assistant", "context", False, "normal",
+            categories=["health", "technical"],
+        ) is None
+
+    def test_personal_and_finance_veto(self):
+        assert agent_voice("assistant", "episodic", False, "normal",
+                           categories=["personal"]) is None
+        assert agent_voice("assistant", "episodic", False, "normal",
+                           categories=["finance"]) is None
+
+    def test_pure_technical_still_flagged(self):
+        assert agent_voice("assistant", "episodic", False, "normal",
+                           categories=["technical"]) == "assistant_agent_voice"
+
+    def test_project_token_alone_does_not_veto(self):
+        # project: tags are infra work and must not become a life shield.
+        assert agent_voice("assistant", "episodic", False, "normal",
+                           categories=["technical", "project:mnemory"]) == (
+            "assistant_agent_voice"
+        )
+
+    def test_none_categories_keeps_old_behaviour(self):
+        assert agent_voice("assistant", "episodic", False, "normal",
+                           categories=None) == "assistant_agent_voice"
+
+
+class TestLifeVetoOnLegacyEnforcement:
+    """The life-category veto must cover the ALREADY-LIVE legacy gate.
+
+    Measured 2026-10-28: 'Assistant confirmed the user should not train fasted
+    above 15 mmol/l glucose' matched assistant_speech_act, was NOT rescued by
+    triage_memory() (no that-clause, has a subject), and under the live
+    MEMORY_NOISE_GUARD=drop would be deleted at write time.
+    """
+
+    def test_legacy_health_row_not_enforced(self, monkeypatch):
+        monkeypatch.setenv("MEMORY_NOISE_GUARD", "drop")
+        assert noise_enforcing_for(
+            "assistant_speech_act", categories=["health"]
+        ) is False
+
+    def test_legacy_personal_travel_row_not_enforced(self, monkeypatch):
+        monkeypatch.setenv("MEMORY_NOISE_GUARD", "drop")
+        assert noise_enforcing_for(
+            "assistant_speech_act", categories=["personal", "travel"]
+        ) is False
+
+    def test_legacy_technical_row_still_enforced(self, monkeypatch):
+        monkeypatch.setenv("MEMORY_NOISE_GUARD", "drop")
+        assert noise_enforcing_for("assistant_speech_act",
+                                   categories=["technical"]) is True
+
+    def test_user_act_also_vetoed_by_life_category(self, monkeypatch):
+        monkeypatch.setenv("MEMORY_NOISE_USER_ACTS", "drop")
+        assert noise_enforcing_for("user_speech_act",
+                                   categories=["health"]) is False
+        assert noise_enforcing_for("user_speech_act",
+                                   categories=["technical"]) is True
+
+    def test_no_categories_keeps_legacy_behaviour(self, monkeypatch):
+        monkeypatch.setenv("MEMORY_NOISE_GUARD", "drop")
+        assert noise_enforcing_for("assistant_speech_act") is True
+        assert noise_enforcing_for("greeting_narration", categories=None) is True

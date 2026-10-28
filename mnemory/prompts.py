@@ -1196,7 +1196,7 @@ def parse_extraction_response(
                 "Extraction guard: speech-act rewrite: %.120s", text
             )
         if noise:
-            enforce = noise_enforcing_for(noise)
+            enforce = noise_enforcing_for(noise, categories=categories)
             if not silent:
                 logger.info(
                     "Extraction guard: %s (%s): %.120s",
@@ -1228,6 +1228,7 @@ def parse_extraction_response(
             memory_type,
             pinned,
             importance,
+            categories=categories,
         )
         if voice:
             if agent_voice_enforcing():

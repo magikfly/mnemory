@@ -1356,12 +1356,14 @@ class MemoryService:
                 if reason:
                     logger.info(
                         "Remember noise guard: %s (%s): %.80s",
-                        "dropped" if noise_enforcing_for(reason)
+                        "dropped" if noise_enforcing_for(
+                            reason, categories=fact.get("categories"))
                         else "would drop (log only)",
                         reason, fact.get("text", ""),
                     )
             facts = [f for f, reason in flagged
-                     if not noise_enforcing_for(reason)]
+                     if not noise_enforcing_for(reason,
+                                                 categories=f.get("categories"))]
             if not facts:
                 return []
 
