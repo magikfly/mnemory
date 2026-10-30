@@ -429,6 +429,16 @@ class MemoryConfig:
     dedup_similarity_threshold: float = field(
         default_factory=lambda: _env_float("DEDUP_SIMILARITY_THRESHOLD", 0.4)
     )
+    # LOCAL-PATCH 2026-10-30: soft char budget for a single Stage-2 dedup
+    # prompt (measured on the built messages, before generation). An
+    # oversized batch is split in half and deduped per sub-batch; see
+    # MemoryService._dedup_llm_bounded. 150k chars is roughly 37k tokens,
+    # inside the shared 65536-token --kv-unified pool with schema and
+    # response headroom. Measured failure it fixes: dedup prompts built at
+    # ~97k tokens, both attempts rejected with 400, whole batch lost.
+    dedup_max_prompt_chars: int = field(
+        default_factory=lambda: _env_int("DEDUP_MAX_PROMPT_CHARS", 150_000)
+    )
 
     # Search ranking weights
     # Controls the balance between cosine similarity and importance in the

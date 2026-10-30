@@ -3626,6 +3626,12 @@ DEDUP_SCHEMA: dict[str, Any] = {
 }
 
 
+# LOCAL-PATCH 2026-10-30: cap on candidate display text in the Stage-2
+# dedup prompt. Dedup only needs enough text to judge similarity; the full
+# text stays in the store and is never rewritten from this echo.
+_DEDUP_CANDIDATE_MAX_CHARS = 400
+
+
 def build_dedup_prompt(
     facts_with_candidates: list[dict[str, Any]],
     *,
@@ -3665,15 +3671,23 @@ def build_dedup_prompt(
                     "memory_id": cand["id"],
                     "fact_index": idx,
                 }
+                cand_raw = str(cand.get("memory", cand.get("text", "")))
+                if len(cand_raw) > _DEDUP_CANDIDATE_MAX_CHARS:
+                    cand_raw = (
+                        cand_raw[:_DEDUP_CANDIDATE_MAX_CHARS] + "…[truncated]"
+                    )
                 cand_mapped.append(
                     {
                         "id": str_id,
-                        "text": cand.get("memory", cand.get("text", "")),
+                        "text": cand_raw,
                         "score": round(cand.get("score", 0), 2),
                     }
                 )
                 id_counter += 1
-            cand_text = json.dumps(cand_mapped, indent=2)
+            # LOCAL-PATCH 2026-10-30: indent=2 roughly tripled the echo size
+            # (whitespace per key); compact separators keep it parseable and
+            # machine-readable without the padding.
+            cand_text = json.dumps(cand_mapped, separators=(",", ":"))
             parts.append(f"{fact_line}\nSimilar existing memories:\n{cand_text}")
         else:
             parts.append(f"{fact_line}\nSimilar existing memories: none")

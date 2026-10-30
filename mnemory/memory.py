@@ -1569,13 +1569,66 @@ class MemoryService:
         *,
         trusted: bool = False,
     ) -> list[dict[str, Any]]:
-        """Make a single LLM call for dedup decisions.
+        """Make LLM call(s) for dedup decisions, chunked to a prompt budget.
 
         Returns list of action dicts compatible with _execute_action.
-        Retries once and fails closed if output is missing or invalid.
+        Retries once per chunk and fails closed if output is missing or
+        invalid.
+
+        LOCAL-PATCH 2026-10-30: a single dedup call shipped every fact with up
+        to 10 full-text candidates and was built at ~97k tokens against the
+        shared 65536-token --kv-unified extractor pool, so both attempts
+        failed with a 400 context error and the whole remember batch was
+        lost (298 log hits). Now: if the built prompt exceeds
+        config.memory.dedup_max_prompt_chars, split the facts in half and
+        dedup each sub-batch with local indices; decisions carry fact text
+        (never a global index), so the merged action list is unchanged.
         """
+        return self._dedup_llm_bounded(
+            facts_with_candidates, facts, trusted=trusted
+        )
+
+    def _dedup_llm_bounded(
+        self,
+        items: list[dict[str, Any]],
+        facts: list[dict[str, Any]],
+        *,
+        trusted: bool,
+    ) -> list[dict[str, Any]]:
+        # isinstance guard: MagicMock answers __int__, which would turn a
+        # mocked config into budget=1 and split every batch in tests.
+        raw_budget = self._config.memory.dedup_max_prompt_chars
+        budget = raw_budget if isinstance(raw_budget, int) else None
+        if budget is not None and budget <= 0:
+            budget = None
+        probe_messages, _, _ = build_dedup_prompt(
+            items, **({"trusted": True} if trusted else {})
+        )
+        prompt_chars = sum(
+            len(str(m.get("content", ""))) for m in probe_messages
+        )
+        if budget and prompt_chars > budget and len(items) > 1:
+            mid = (len(items) + 1) // 2
+            merged_actions: list[dict[str, Any]] = []
+            logger.info(
+                "Remember dedup prompt %d chars over budget %d; splitting "
+                "%d facts into two sub-batches",
+                prompt_chars,
+                budget,
+                len(items),
+            )
+            for sub in (items[:mid], items[mid:]):
+                sub_facts = [facts[it["index"]] for it in sub]
+                reindexed = [{**it, "index": j} for j, it in enumerate(sub)]
+                merged_actions.extend(
+                    self._dedup_llm_bounded(
+                        reindexed, sub_facts, trusted=trusted
+                    )
+                )
+            return merged_actions
+
         messages, json_schema, id_mapping = build_dedup_prompt(
-            facts_with_candidates, **({"trusted": True} if trusted else {})
+            items, **({"trusted": True} if trusted else {})
         )
 
         for attempt in range(2):
