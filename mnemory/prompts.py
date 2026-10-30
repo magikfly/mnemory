@@ -3839,9 +3839,18 @@ def parse_dedup_response(
 
         raw_target = entry.get("target_id")
         if action in ("ADD", "SKIP") and raw_target is not None:
+            # LOCAL-PATCH 2026-10-30: DEDUP_SCHEMA *requires* target_id on
+            # every decision, and the 4B extractor regularly fills it with
+            # the candidate id on SKIP despite the prompt. The old path
+            # returned [], set() here - one stray field nuked the entire
+            # dedup parse and the whole remember batch failed closed
+            # (291 log hits, the dominant dedup failure). The target is
+            # meaningless for ADD/SKIP: drop it and keep the decision.
             if not silent:
-                logger.warning("%s action has unexpected target_id", action)
-            return [], set()
+                logger.info(
+                    "%s action carried stray target_id; ignoring", action
+                )
+            raw_target = None
 
         # Map target_id back to real UUID
         target_id = None

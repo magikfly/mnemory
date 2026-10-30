@@ -133,3 +133,63 @@ class TestDedupBudgetConfig:
         from mnemory.config import MemoryConfig
 
         assert MemoryConfig().dedup_max_prompt_chars == 150_000
+
+
+class TestStrayTargetTolerance:
+    """2026-10-30: SKIP entries carrying target_id (schema-forced field)
+    must not nuke the whole parse (291 log hits, decided-0-of-N failures)."""
+
+    def test_skip_with_stray_target_keeps_batch(self):
+        from mnemory.prompts import parse_dedup_response
+
+        resp = json.dumps(
+            {
+                "decisions": [
+                    {
+                        "fact_index": 0,
+                        "action": "ADD",
+                        "target_id": None,
+                        "text": "fact zero text",
+                    },
+                    {
+                        "fact_index": 1,
+                        "action": "SKIP",
+                        "target_id": "3",
+                        "text": "fact one text",
+                    },
+                ]
+            }
+        )
+        facts = [{"text": "fact zero text"}, {"text": "fact one text"}]
+        id_mapping = {
+            "3": {"memory_id": "uuid-x", "fact_index": 1}
+        }
+        actions, decided = parse_dedup_response(
+            resp, id_mapping, facts, silent=True
+        )
+        assert decided == {0, 1}
+        # ADD survives, SKIP carries no mutation target
+        assert len(actions) >= 1
+        assert all(a.get("target_id") is None for a in actions)
+
+    def test_stray_target_never_resolves_to_a_real_mutation(self):
+        from mnemory.prompts import parse_dedup_response
+
+        resp = json.dumps(
+            {
+                "decisions": [
+                    {
+                        "fact_index": 0,
+                        "action": "ADD",
+                        "target_id": "9",
+                        "text": "fact zero text",
+                    }
+                ]
+            }
+        )
+        facts = [{"text": "fact zero text"}]
+        actions, decided = parse_dedup_response(
+            resp, {}, facts, silent=True
+        )
+        assert decided == {0}
+        assert actions and actions[0].get("target_id") is None
