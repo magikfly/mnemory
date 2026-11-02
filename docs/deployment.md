@@ -52,18 +52,25 @@ docker run -d \
   -e S3_SECRET_KEY=secret \
   -e MCP_API_KEYS='{"your-api-key": "your-username"}' \
   -v mnemory-data:/data \
-  genunix/mnemory:latest
+  ghcr.io/fpytloun/mnemory:latest
 ```
 
 ### Docker Build
 
 ```bash
-# Build for linux/amd64 (for Kubernetes deployment)
-docker buildx build --platform linux/amd64 -t genunix/mnemory:latest .
+# Build for linux/amd64 and linux/arm64 (for Kubernetes deployment)
+docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/fpytloun/mnemory:latest .
 
-# Push
-docker push genunix/mnemory:latest
+# Publish with buildx
+docker buildx build --platform linux/amd64,linux/arm64 --push -t ghcr.io/fpytloun/mnemory:latest .
 ```
+
+GitHub Actions publishes `latest` from `main` and `vX.Y.Z` for published,
+non-prerelease server releases. Before first use, an owner must set the GHCR
+package visibility to **Public** in GitHub Packages settings
+(`fpytloun/mnemory`). Images can then be pulled without authentication:
+`docker pull ghcr.io/fpytloun/mnemory:latest` or
+`docker pull ghcr.io/fpytloun/mnemory:v1.0.0`.
 
 ## Authentication
 

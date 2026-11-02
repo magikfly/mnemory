@@ -79,9 +79,9 @@ The UI uses Alpine.js + Tailwind CSS + Chart.js + D3.js — all vendored as stat
 ## Docker Build
 
 ```bash
-# Build for linux/amd64 (for Kubernetes deployment)
-docker buildx build --platform linux/amd64 -t genunix/mnemory:latest .
+# Build for linux/amd64 and linux/arm64 (for Kubernetes deployment)
+docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/fpytloun/mnemory:latest .
 
-# Push
-docker push genunix/mnemory:latest
+# Publish with buildx
+docker buildx build --platform linux/amd64,linux/arm64 --push -t ghcr.io/fpytloun/mnemory:latest .
 ```
