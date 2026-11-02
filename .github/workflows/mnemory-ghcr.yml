@@ -56,6 +56,12 @@ jobs:
         id: upstream
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
+          # PAT with Workflows write (repo secret MERGE_PUSH_PAT). GITHUB_TOKEN
+          # cannot push merge commits that touch .github/workflows/ - GitHub
+          # rejects with "refusing to allow a GitHub App to create or update
+          # workflow ... without `workflows` permission". Falls back to the
+          # default credential when the secret is absent.
+          MERGE_PUSH_PAT: ${{ secrets.MERGE_PUSH_PAT }}
         shell: bash
         run: |
           set -euo pipefail
@@ -80,7 +86,11 @@ jobs:
               echo "::error title=Upstream merge conflict::upstream $TARGET conflicts with the local mnemory patches. Merge $TARGET into mn-deployed by hand (the patched files are listed in deploy/DEPLOYED.md), push, and rerun. The last good image stays deployed."
               exit 1
             fi
-            git push origin "HEAD:refs/heads/mn-deployed"
+            if [ -n "$MERGE_PUSH_PAT" ]; then
+              git push "https://x-access-token:${MERGE_PUSH_PAT}@github.com/magikfly/mnemory.git" "HEAD:refs/heads/mn-deployed"
+            else
+              git push origin "HEAD:refs/heads/mn-deployed"
+            fi
           else
             echo "$TARGET is already merged; nothing new from upstream"
           fi
