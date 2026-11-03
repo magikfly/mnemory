@@ -2059,7 +2059,10 @@ class TestCoreMemoriesPerSectionLimit:
         service.vector.get_pinned_memories.return_value = [
             {
                 "id": f"agent-{i}",
-                "memory": f"Agent identity trait {i}",
+                # FORK 2026-11-04: _classify_agent_memory now routes on content,
+                # not on role+memory_type, so an identity fixture has to state a
+                # self-designation. The capping assertion below is unchanged.
+                "memory": f"My name is Agent{i}",
                 "agent_id": "bob",
                 "metadata": {
                     "memory_type": "fact",
@@ -2072,7 +2075,7 @@ class TestCoreMemoriesPerSectionLimit:
         ]
         result = service.get_core_memories(user_id="filip", agent_id="bob").text
         assert "## Agent Identity" in result
-        trait_count = sum(1 for i in range(4) if f"Agent identity trait {i}" in result)
+        trait_count = sum(1 for i in range(4) if f"My name is Agent{i}" in result)
         assert trait_count == 2
 
     def test_unlimited_when_zero(self):

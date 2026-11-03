@@ -436,7 +436,12 @@ try:
     _src = open(_prompts.__file__, encoding="utf-8").read()
     # noise_memory(text) is deliberately absent: the write paths call it
     # through triage_memory now, which is the marker that matters.
-    for _marker in ("pin_allowed(text)", "noise_enforcing()",
+    # noise_enforcing() was corrected 2026-11-04: the 2026-10-28 per-reason
+    # gate patch replaced the zero-arg call with noise_enforcing_for(reason,
+    # categories=...) call, and this marker was never updated, so
+    # the only automated image gate has been red-by-default since then. A gate
+    # that is always red is how the next real failure hides.
+    for _marker in ("pin_allowed(text)", "noise_enforcing_for(",
                     "triage_memory(text)"):
         check("prompts wired: " + _marker, _marker in _src, True)
 except Exception:
@@ -539,6 +544,148 @@ try:
 except Exception:
     traceback.print_exc()
     FAILURES.append("redaction checks raised")
+
+# ---------------------------------------------------------------- 2026-11-04
+# Core-section router and build-reference staleness. The behavioural suite is
+# tests/test_fork_core_section_router.py; these are image-level presence checks
+# so a future image cannot ship without either half, and the two lists must be
+# non-empty because an empty pattern list silently deletes a whole prompt
+# section rather than failing.
+try:
+    from mnemory.memory import (
+        _IDENTITY_RES,
+        _INSTRUCTION_RES,
+        _NARRATION_HEAD_RE,
+        MemoryService,
+    )
+    from mnemory.prompts import _BUILD_ID_RE, _correct_build_staleness
+
+    section("core-section router (2026-11-04)")
+
+    def _sec(text, role, mtype):
+        return MemoryService._classify_agent_memory(
+            None,
+            {
+                "id": "x",
+                "memory": text,
+                "metadata": {"role": role, "memory_type": mtype},
+            },
+        )[0]
+
+    check(
+        "third-person name is identity",
+        _sec("Assistant's name is Atlas", "assistant", "fact"),
+        "identity",
+    )
+    check(
+        "first-person name is identity",
+        _sec("My name is Bob", "assistant", "fact"),
+        "identity",
+    )
+    check(
+        "sub-agent persona is identity",
+        _sec("I am Bob. I speak casually.", "assistant", "fact"),
+        "identity",
+    )
+    check(
+        "first-person work note is not identity",
+        _sec("I am working on the dashboard.", "assistant", "fact"),
+        "knowledge",
+    )
+    check(
+        "hardware note is not identity",
+        _sec("User uses an Atlas Ezo pH board in I2C mode.", "assistant", "fact"),
+        "knowledge",
+    )
+    check(
+        "car registration is not an instruction",
+        _sec("User registered their 2021 Kia EV6.", "user", "fact"),
+        "knowledge",
+    )
+    check(
+        "agent-scope preference is an instruction",
+        _sec("User wants me to create commit messages", "user", "preference"),
+        "instructions",
+    )
+    check(
+        "standing rule is an instruction",
+        _sec("Assistant must never print passwords.", "user", "procedural"),
+        "instructions",
+    )
+    check(
+        "one-off ask is not an instruction",
+        _sec("User asked the assistant to write the flow.", "user", "episodic"),
+        "knowledge",
+    )
+    check("identity patterns present", len(_IDENTITY_RES) >= 5, True)
+    check("instruction patterns present", len(_INSTRUCTION_RES) >= 5, True)
+    check(
+        "narration head detected",
+        bool(_NARRATION_HEAD_RE.match("Assistant noted that the run passed.")),
+        True,
+    )
+
+    section("build-reference staleness (2026-11-04)")
+    BUILD_REF = (
+        "Assistant published container image 40d50b32a21f with manifest digest "
+        "812a92da65a1aeae0aba0801a376369c04e773875f2ebe6ea2d016d7dc7b76b1."
+    )
+    check(
+        "build ref demotes importance",
+        _correct_build_staleness("high", "episodic", BUILD_REF),
+        ("low", "episodic"),
+    )
+    check(
+        "pinned row exempt",
+        _correct_build_staleness("high", "episodic", BUILD_REF, pinned=True),
+        ("high", "episodic"),
+    )
+    check(
+        "endpoint is not a version",
+        _correct_build_staleness(
+            "high",
+            "fact",
+            "Pi-hole runs on 192.168.2.25; web UI on 127.0.0.1:8080, binds 0.0.0.0.",
+        ),
+        ("high", "fact"),
+    )
+    check(
+        "durable lesson with the word version kept",
+        _correct_build_staleness(
+            "high",
+            "episodic",
+            "User's CI skips building when the image version tag exists.",
+        ),
+        ("high", "episodic"),
+    )
+    check(
+        "bare commit sha demotes",
+        _correct_build_staleness("high", "fact", "The main branch is at commit 2d47b9a.")[0],
+        "low",
+    )
+    check(
+        "BUILD_ID_RE finds a patched build",
+        _BUILD_ID_RE.search("deployed version v1.15.0-patched21") is not None,
+        True,
+    )
+
+    # call-site census, same reasoning as the redaction census above: the
+    # marker checks alone cannot see one of the two extraction sites vanish.
+    import pathlib as _pl2
+    import sys as _sys2
+
+    _pkg2 = _pl2.Path(_sys2.modules["mnemory.memory"].__file__).parent
+    _p_src = (_pkg2 / "prompts.py").read_text(encoding="utf-8")
+    check("prompts.py staleness call sites", _p_src.count("_correct_build_staleness("), 3)
+    _m_src = (_pkg2 / "memory.py").read_text(encoding="utf-8")
+    check(
+        "memory.py router is content-shaped",
+        "_IDENTITY_RES" in _m_src and "_NARRATION_HEAD_RE" in _m_src,
+        True,
+    )
+except Exception:
+    traceback.print_exc()
+    FAILURES.append("core-section / staleness checks raised")
 
 # ---------------------------------------------------------------- summary
 print("\n================ SUMMARY ================")

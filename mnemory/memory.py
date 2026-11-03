@@ -113,6 +113,94 @@ _CORE_SECTION_ORDER = [
     "recent_agent_activity",
 ]
 
+# ---------------------------------------------------------------------------
+# Core-section routing, content-shaped (LOCAL-PATCH 2026-11-04)
+# ---------------------------------------------------------------------------
+# _classify_agent_memory used to route on role and memory_type alone:
+#
+#     assistant + (fact|preference) -> identity
+#     assistant + anything else      -> knowledge
+#     user (agent-scoped)            -> instructions
+#
+# That makes identity a synonym for "the assistant asserted this as a fact", so
+# any hardware note or benchmark became part of the assistant's identity.
+# Measured on the live store 2026-11-04 over 1230 agent-scoped rows: identity
+# held 20 rows of which exactly 1 was identity, the rest being Project Maya
+# hardware specs and build-fix notes; instructions held 358 rows including the
+# user's own name and their car registration. Both sections render into EVERY
+# prompt, and the user's name under "Agent Instructions" is worse than
+# cosmetic - it tells the model that a biographical fact is a rule to obey.
+#
+# Kept from upstream: preference rows in agent scope are instructions, and a
+# row with no role at all keeps the legacy instructions fallback.
+# Changed: identity requires a self-designation, in third person OR first
+# person (sub-agent personas are stored as "I am Bob."), and a fact or
+# procedural row only becomes an instruction when it reads like a standing
+# directive aimed at the assistant rather than a report about one.
+_APOS = "’'"
+
+_IDENTITY_RES = [
+    re.compile("assistant[" + _APOS + "]?s?[ ]+name[ ]+(is|was|:|=)", re.IGNORECASE),
+    re.compile(r"assistant[ ]+(is|was)[ ]+(named|called|dubbed)", re.IGNORECASE),
+    re.compile("assistant[" + _APOS + "]?s?[ ]+(persona|identity)[ ]+(is|was|:)", re.IGNORECASE),
+    re.compile(r"^my[ ]+name[ ]+is[ ]+", re.IGNORECASE),
+    re.compile(r"^i[ ]+am[ ]+(named|called|dubbed)[ ]+", re.IGNORECASE),
+    re.compile("i[" + _APOS + "]m[ ]+(named|called)[ ]+", re.IGNORECASE),
+    # case-sensitive on purpose: a name is capitalised, a verb is not, so
+    # "I am Bob." is identity while "I am working on the dashboard" is not
+    re.compile(r"^I[ ]+am[ ]+[A-Z][A-Za-z0-9_-]{1,30}"),
+    re.compile(
+        r"^i[ ]+am[ ]+(the[ ]+)?(only[ ]+)?[a-z0-9 _-]{0,30}(assistant|bot|agent|ai|persona)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^you[ ]+are[ ]+(the[ ]+|a[ ]+|an[ ]+)?[a-z0-9 _-]{0,30}assistant",
+        re.IGNORECASE,
+    ),
+]
+
+_INSTRUCTION_RES = [
+    re.compile(r"(assistant|you)[ ]+(should|must|never|always)", re.IGNORECASE),
+    re.compile(
+        r"(assistant|you)[ ]+to[ ]+(use|reply|respond|greet|write|avoid|keep|treat|match|prefer)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(user|owner)[ ]+(set|has[ ]+set|enforces?|enforced|imposed|requires?|insists?)"
+        r"[^.]{0,45}(limit|rule|never|policy|hard|always)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(user|owner)[ ]+(prefers?|preferred|wants?|wished|needs?|asks?|requires?)"
+        r"[^.]{0,45}(me|assistant|you)[ ]+(to|should|must|never|always)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(always|never|only)[ ]+(greet|reply|respond|answer|use|write|keep|address"
+        r"|match|start|begin|prefer)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(hard[ ]+limits?|standing[ ]+rule|rule[ ]+(set|is)|policy[ ]+(is|of))",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(do|does[ ]+not|never)[ ]+(restate|print|edit|touch|reboot|use|include|assume|invent|append)",
+        re.IGNORECASE,
+    ),
+]
+
+# A row opening with a speech-act verb reports a request, it is not one.
+# episodic is excluded from instructions entirely: an event is not a rule.
+_INSTRUCTION_TYPES = ("procedural", "fact")
+_NARRATION_HEAD_RE = re.compile(
+    r"^(assistant|user)[ ]+(asked|noted|recommended|suggested|explained|reported"
+    r"|clarified|confirmed|provided|offered|identif|analyz|conclud|decided"
+    r"|determined|updated|pushed|deployed|created|fixed|patched|published"
+    r"|generated|configured|enforced|re-?pulled|wrote|added|ran|checked)",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class CoreMemoriesStats:
@@ -4092,14 +4180,26 @@ class MemoryService:
         meta = memory.get("metadata") or {}
         mt = meta.get("memory_type", "fact")
         mr = meta.get("role", "user")
-        text = wrap_memory_item(memory.get("memory", ""))
+        raw = memory.get("memory", "") or ""
+        text = wrap_memory_item(raw)
         line = f"- {text}"
 
         if mr == "assistant":
-            if mt in ("preference", "fact"):
+            if any(p.search(raw) for p in _IDENTITY_RES):
                 return "identity", line
             return "knowledge", line
-        return "instructions", line
+        if "role" not in meta:
+            # legacy row with no role recorded: upstream fallback, unchanged
+            return "instructions", line
+        if mt == "preference":
+            return "instructions", line
+        if (
+            mt in _INSTRUCTION_TYPES
+            and not _NARRATION_HEAD_RE.match(raw)
+            and any(p.search(raw) for p in _INSTRUCTION_RES)
+        ):
+            return "instructions", line
+        return "knowledge", line
 
     def _classify_user_memory(self, memory: dict) -> tuple[str, str]:
         """Classify a shared user memory into section and formatted line.

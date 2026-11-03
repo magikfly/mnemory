@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -1150,6 +1151,9 @@ def parse_extraction_response(
         memory_type = _correct_memory_type(memory_type, text)
         categories = _validate_categories(entry.get("categories"))
         importance = _validate_importance(entry.get("importance"))
+        importance, memory_type = _correct_build_staleness(
+            importance, memory_type, text, pinned=bool(entry.get("pinned", False))
+        )
 
         # LOCAL-PATCH: content guard + pin policy at the single chokepoint
         # every extractor reply passes through.  Two enforcement modes on
@@ -1440,6 +1444,80 @@ _CONTEXT_PATTERNS: list[re.Pattern[str]] = [
         r"\bdoesn'?t\s+support\b",
     )
 ]
+
+
+# ---------------------------------------------------------------------------
+# Fast-rotating build references (LOCAL-PATCH 2026-11-04)
+# ---------------------------------------------------------------------------
+# "Assistant published container image 40d50b32a21f with manifest digest..."
+# and "User's main branch is at commit 2d47b9a." are accurate the day they are
+# written and wrong within days. Measured on the live store 2026-11-04: 67 of
+# 1925 active rows carry such a reference, and the stale mnemory version and
+# image rows injected into this session's own prompt both come from this
+# population - they are assigned high importance often enough to clear
+# CORE_MIN_IMPORTANCE=high and so reach every prompt.
+#
+# Two modes, chosen because the remedies differ in reversibility:
+#
+#   importance (default) - demote to "low". The row leaves core context but
+#     stays searchable forever, and PUT /api/memories/{id} undoes it. Nothing
+#     is deleted, which matters because retraction has no un-retract verb.
+#   context              - additionally retype to "context", so the row decays
+#     on TTL_CONTEXT (3 days in this deployment).
+#
+# Pinned rows are never touched. Version-shaped tokens only: a bare dotted
+# triple is NOT accepted, because the first draft of this pattern matched
+# 127.0.0.1:8080 and 0.0.0.0 - endpoints, not versions.
+_BUILD_ID_RE = re.compile(
+    r"(v[0-9]+[.][0-9]+[.][0-9]+[-_.a-z0-9]*|patched[0-9]+|atlas[.][0-9]+"
+    r"|sha256:[0-9a-f]{12,}|image[ ]+[0-9a-f]{8,}"
+    r"|commit[ ]+[0-9a-f]{7,}|digest[ ]+[0-9a-f]{12,}"
+    r"|build[ ]+[0-9]{4,}"
+    r"|(version|release|tag)[ ]+v?[0-9]+[.][0-9]+([.][0-9]+)?)",
+    re.IGNORECASE,
+)
+
+_BUILD_STALENESS_MODES = ("importance", "context", "off")
+
+
+def _build_staleness_mode() -> str:
+    """MEMORY_BUILD_STALENESS: importance (default) | context | off."""
+    mode = os.environ.get("MEMORY_BUILD_STALENESS", "importance").strip().lower()
+    if mode not in _BUILD_STALENESS_MODES:
+        logger.warning("Unknown MEMORY_BUILD_STALENESS %r; using importance", mode)
+        return "importance"
+    return mode
+
+
+def _correct_build_staleness(
+    importance: str, memory_type: str, text: str, *, pinned: bool = False
+) -> tuple[str, str]:
+    """Return ``(importance, memory_type)`` after build-reference handling.
+
+    Runs after ``_correct_memory_type`` at both extraction sites. Logs every
+    demotion so the population can be audited from the durable log.
+    """
+    if pinned or not text:
+        return importance, memory_type
+    mode = _build_staleness_mode()
+    if mode == "off":
+        return importance, memory_type
+    match = _BUILD_ID_RE.search(text)
+    if not match:
+        return importance, memory_type
+    new_type = "context" if mode == "context" else memory_type
+    if importance != "low" or new_type != memory_type:
+        logger.info(
+            "Build-reference staleness (%s, token %r): importance %s -> low,"
+            " type %s -> %s for: %.90s",
+            mode,
+            match.group(0),
+            importance,
+            memory_type,
+            new_type,
+            text,
+        )
+    return "low", new_type
 
 
 def _correct_memory_type(memory_type: str, text: str) -> str:
@@ -3474,6 +3552,9 @@ def parse_remember_extraction_response(
         categories = _validate_categories(entry.get("categories"))
         importance = _validate_importance(entry.get("importance"))
         pinned = bool(entry.get("pinned", False))
+        importance, memory_type = _correct_build_staleness(
+            importance, memory_type, text, pinned=pinned
+        )
 
         raw_event_date = entry.get("event_date")
         event_date: str | None = None
