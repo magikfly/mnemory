@@ -781,6 +781,9 @@ try:
           "identity_condition = _build_owner_scope_condition" in _vec4, True)
     check("API accepts subject_scope",
           "subject_scope: bool = Query(" in _api4, True)
+    # 3b: retraction is owner-scoped, so a view that hides the owner is inert
+    check("maintenance view names the disagreeing fields",
+          "_attach_scope_fields(" in _api4, True)
 except Exception:
     traceback.print_exc()
     FAILURES.append("core-memory owner-scoping checks raised")

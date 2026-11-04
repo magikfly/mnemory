@@ -488,7 +488,22 @@ def list_memories(
     return ListMemoriesResponse(results=items)
 
 
-@router.get("/browse", response_model=ListMemoriesResponse)
+def _attach_scope_fields(items, raw_items):
+    """LOCAL-PATCH 2026-11-05: name the two identity fields a scope audit keys on.
+
+    project_memory_item returns a MemoryItem with a whitelisted metadata dict,
+    which drops owner_id and user_id. That makes the maintenance view useless:
+    retraction is owner-scoped, so DELETE against one of these rows as its own
+    subject answers 422 'Cannot access memory', and without the owner value an
+    operator cannot act as the owner either. Callers that asked for a scope
+    audit get the fields; ordinary browse payloads are untouched.
+    """
+    for projected, raw in zip(items, raw_items):
+        projected.metadata["owner_id"] = raw.get("owner_id")
+        projected.metadata["subject_user_id"] = raw.get("user_id")
+
+
+@router.get("/browse")
 def browse_memories(
     cursor: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -607,6 +622,8 @@ def browse_memories(
     next_offset = result.get("next_offset")
     next_cursor = encode_cursor(next_offset, binding) if next_offset else None
     items = [project_memory_item(item) for item in result["results"]]
+    if scope_mismatch or subject_scope:
+        _attach_scope_fields(items, result["results"])
     return ListMemoriesResponse(
         results=items,
         next_cursor=next_cursor,

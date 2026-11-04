@@ -257,3 +257,38 @@ class TestSubjectScopeBrowse:
         """Broadening ownership must not broaden the identity being read."""
         built = _filter_for(subject_scope=True)
         assert OTHER not in built, "another subject leaked into the filter"
+
+
+_RAW_STRAY = {
+    "id": "r1",
+    "memory": "about me, owned by someone else",
+    "user_id": ME,
+    "owner_id": OTHER,
+    "metadata": {"role": "user", "importance": "normal"},
+}
+
+
+class TestScopeFieldExposure:
+    """An audit you cannot act on is not an audit.
+
+    Retraction is owner-scoped, so DELETE on one of these rows as its own
+    subject answers 422 'Cannot access memory'. The operator has to be told who
+    owns it. Measured live: 59 such rows were listed and none could be removed
+    until the view named the owner.
+    """
+
+    def test_ordinary_projection_hides_the_scope_fields(self):
+        from mnemory.api.ui_projections import project_memory_item
+
+        meta = project_memory_item(dict(_RAW_STRAY)).metadata
+        assert "owner_id" not in meta
+        assert "subject_user_id" not in meta
+
+    def test_maintenance_projection_names_owner_and_subject(self):
+        from mnemory.api.memories import _attach_scope_fields
+        from mnemory.api.ui_projections import project_memory_item
+
+        projected = project_memory_item(dict(_RAW_STRAY))
+        _attach_scope_fields([projected], [_RAW_STRAY])
+        assert projected.metadata["owner_id"] == OTHER
+        assert projected.metadata["subject_user_id"] == ME
