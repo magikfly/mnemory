@@ -687,6 +687,31 @@ except Exception:
     traceback.print_exc()
     FAILURES.append("core-section / staleness checks raised")
 
+# ----------------------------------------------------- dedup partial apply
+# 2026-11-04: Stage-2 dedup used to discard the ENTIRE remember batch when a
+# single fact lacked a decision (measured: 4 of 23 batches lost in 19h). These
+# are presence checks only; the behavioural suite is
+# tests/test_fork_dedup_partial_apply.py.
+try:
+    import pathlib as _pl3
+    import sys as _sys3
+
+    _pkg3 = _pl3.Path(_sys3.modules["mnemory.memory"].__file__).parent
+    _mem3 = (_pkg3 / "memory.py").read_text(encoding="utf-8")
+    _cfg3 = (_pkg3 / "config.py").read_text(encoding="utf-8")
+
+    section("dedup partial apply (2026-11-04)")
+    check("partial-apply path present", "Remember dedup partial apply" in _mem3, True)
+    check("best partial result tracked", "best_indices" in _mem3, True)
+    check("total failure still fails closed", "0 of %d facts decided" in _mem3, True)
+    check("undecided policy knob defined", "dedup_undecided" in _cfg3, True)
+    from mnemory.config import Config as _Cfg3
+
+    check("undecided default is add", _Cfg3().memory.dedup_undecided, "add")
+except Exception:
+    traceback.print_exc()
+    FAILURES.append("dedup partial-apply checks raised")
+
 # ---------------------------------------------------------------- summary
 print("\n================ SUMMARY ================")
 if FAILURES:

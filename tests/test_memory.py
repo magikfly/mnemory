@@ -5679,8 +5679,14 @@ class TestRememberTwoStagePipeline:
         assert metadata["evidence_root_ids"] == []
         assert metadata["validation_count"] == 0
 
-    def test_unmentioned_facts_fail_closed(self):
-        """Partial dedup output must not mutate memory after one retry."""
+    def test_unmentioned_facts_default_to_add(self):
+        """One unmentioned fact must not discard the facts that were decided.
+
+        FORK 2026-11-04: this asserted RuntimeError, i.e. the whole batch was
+        thrown away because the extractor omitted one line. Measured cost on the
+        live store: 4 of 23 remember batches lost in 19h, gap shapes 1 of 2,
+        4 of 5, 10 of 11.
+        """
 
         service = _make_service()
 
@@ -5710,12 +5716,14 @@ class TestRememberTwoStagePipeline:
         ]
         service.vector.insert.side_effect = ["mem-1", "mem-2"]
 
-        with pytest.raises(RuntimeError, match="no memories changed"):
-            service.remember(
-                content="I like Python, Rust, and Go",
-                user_id="filip",
-            )
-        service.vector.insert.assert_not_called()
+        service.remember(
+            content="I like Python, Rust, and Go",
+            user_id="filip",
+        )
+        # fact 0 was SKIPped by the model; the two unmentioned facts are
+        # recovered as ADD (config.memory.dedup_undecided, default add).
+        # insert.side_effect carries exactly two ids, so a third insert raises.
+        assert service.vector.insert.call_count == 2
         assert service._llm.generate.call_count == 3
 
     def test_oversized_fact_truncated(self):
@@ -6458,8 +6466,12 @@ class TestRememberAutoMode:
         service.vector.insert.assert_not_called()
         assert service._llm.generate.call_count == 3
 
-    def test_dedup_unmentioned_fact_fails_closed(self):
-        """Partial dedup output must not mutate either role."""
+    def test_dedup_unmentioned_fact_defaults_to_add(self):
+        """An unmentioned fact is recovered in its own role, not lost.
+
+        FORK 2026-11-04: the comment written inside this test always said
+        "should default to ADD"; the implementation never did until now.
+        """
         import json
 
         service = _make_service()
@@ -6496,13 +6508,14 @@ class TestRememberAutoMode:
         ]
         service.vector.insert.side_effect = ["mem-1", "mem-2"]
 
-        with pytest.raises(RuntimeError, match="no memories changed"):
-            service.remember(
-                content="User: I like Python\nAssistant: I recommend FastAPI",
-                user_id="filip",
-                agent_id="test-agent",
-            )
-        service.vector.insert.assert_not_called()
+        service.remember(
+            content="User: I like Python\nAssistant: I recommend FastAPI",
+            user_id="filip",
+            agent_id="test-agent",
+        )
+        # fact 0 decided ADD, fact 1 unmentioned and recovered as ADD in the
+        # assistant role: neither role is silently dropped any more
+        assert service.vector.insert.call_count == 2
         assert service._llm.generate.call_count == 3
 
 

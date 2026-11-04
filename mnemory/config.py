@@ -439,6 +439,14 @@ class MemoryConfig:
     dedup_max_prompt_chars: int = field(
         default_factory=lambda: _env_int("DEDUP_MAX_PROMPT_CHARS", 150_000)
     )
+    # LOCAL-PATCH 2026-11-04: what to do with a fact the Stage-2 dedup model
+    # never gave a decision for. add stores it; skip drops it. add is the
+    # default because the two errors are not equally recoverable: a duplicate
+    # is detectable and fsck's dedup pass can merge it later, while a silently
+    # dropped fact is unrecoverable and the user never learns it was lost.
+    dedup_undecided: str = field(
+        default_factory=lambda: _env("DEDUP_UNDECIDED", "add")
+    )
 
     # Search ranking weights
     # Controls the balance between cosine similarity and importance in the

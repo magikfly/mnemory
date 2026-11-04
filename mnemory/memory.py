@@ -1719,6 +1719,9 @@ class MemoryService:
             items, **({"trusted": True} if trusted else {})
         )
 
+        best_actions: list[dict[str, Any]] = []
+        best_indices: set[int] = set()
+
         for attempt in range(2):
             try:
                 response_text = self._llm.generate(
@@ -1742,6 +1745,11 @@ class MemoryService:
             )
             if decided_indices == set(range(len(facts))):
                 return actions
+
+            # Keep the most complete answer seen, not just the last one.
+            if len(decided_indices) > len(best_indices):
+                best_actions, best_indices = actions, decided_indices
+
             if not _SUPPRESS_SENSITIVE_LLM_LOGS.get():
                 logger.warning(
                     "Remember dedup output incomplete (attempt %d/2): decided %d of %d",
@@ -1750,10 +1758,65 @@ class MemoryService:
                     len(facts),
                 )
 
-        logger.error(
-            "Remember dedup failed closed after 2 attempts; no memory mutations executed"
+        # LOCAL-PATCH 2026-11-04: this used to raise whenever ANY fact lacked
+        # a decision, throwing away the facts the model DID decide. Measured on
+        # the live store over the 19h after the previous build: 8 incomplete
+        # attempts and 4 whole batches lost, 17 pct of remember writes, with
+        # single-fact gaps (decided 1 of 2, 4 of 5, 10 of 11). An eleven-fact
+        # batch was discarded over one missing line.
+        #
+        # Now: apply what was decided, and default only the undecided facts.
+        # config.memory.dedup_undecided picks the default (add | skip). A fact
+        # with no similar existing memory is always added, because there is
+        # nothing it could duplicate - that case needs no policy choice.
+        #
+        # The hard failure survives for the shape that really does mean a
+        # broken reply: nothing decided at all.
+        missing = set(range(len(facts))) - best_indices
+        if not best_indices:
+            logger.error(
+                "Remember dedup failed closed: 0 of %d facts decided;"
+                " no memory mutations executed",
+                len(facts),
+            )
+            raise RuntimeError(
+                "Deduplication failed after 2 attempts; no memories changed"
+            )
+
+        undecided_mode = str(
+            getattr(self._config.memory, "dedup_undecided", "add")
+        ).strip().lower()
+        candidate_counts = {
+            it.get("text"): len(it.get("candidates") or []) for it in items
+        }
+        recovered: list[dict[str, Any]] = []
+        for idx in sorted(missing):
+            f = facts[idx]
+            has_competitor = candidate_counts.get(f.get("text"), 0) > 0
+            action = "SKIP" if (has_competitor and undecided_mode == "skip") else "ADD"
+            recovered.append(
+                {
+                    "text": f["text"],
+                    "action": action,
+                    "target_id": None,
+                    "old_memory": None,
+                    "memory_type": f.get("memory_type"),
+                    "categories": f.get("categories"),
+                    "importance": f.get("importance"),
+                    "pinned": f.get("pinned", False),
+                    "event_date": f.get("event_date"),
+                    "role": f.get("role"),
+                }
+            )
+        logger.info(
+            "Remember dedup partial apply: %d decided, %d undecided handled as %s"
+            " (dedup_undecided=%s)",
+            len(best_actions),
+            len(missing),
+            sorted({a["action"] for a in recovered}) or ["nothing"],
+            undecided_mode,
         )
-        raise RuntimeError("Deduplication failed after 2 attempts; no memories changed")
+        return best_actions + recovered
 
     def _update_session_context(
         self,
