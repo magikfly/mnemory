@@ -774,6 +774,13 @@ try:
           "if scope_mismatch and not _is_scope_mismatch(" in _vec4, True)
     check("API accepts scope_mismatch",
           "scope_mismatch: bool = Query(" in _api4, True)
+    # part 3: the owner filter runs before the mismatch predicate, so without a
+    # subject-side mode the audit cannot see rows owned by someone else
+    check("browse has a subject-scope mode", "subject_scope: bool = False," in _vec4, True)
+    check("subject scope replaces the owner predicate",
+          "identity_condition = _build_owner_scope_condition" in _vec4, True)
+    check("API accepts subject_scope",
+          "subject_scope: bool = Query(" in _api4, True)
 except Exception:
     traceback.print_exc()
     FAILURES.append("core-memory owner-scoping checks raised")

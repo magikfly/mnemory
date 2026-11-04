@@ -509,6 +509,14 @@ def browse_memories(
             "search, so this is the only way to enumerate them before deleting."
         ),
     ),
+    subject_scope: bool = Query(
+        False,
+        description=(
+            "Maintenance view: match on the subject user_id instead of the "
+            "owner dimension, so rows recorded about you under someone else's "
+            "ownership can be listed and deleted. Combine with scope_mismatch."
+        ),
+    ),
     sort: str = Query("newest"),
     created_start: str | None = Query(None),
     created_end: str | None = Query(None),
@@ -560,6 +568,7 @@ def browse_memories(
         "decayed_only": decayed_only,
         "include_decayed": include_decayed,
         "scope_mismatch": scope_mismatch,
+        "subject_scope": subject_scope,
         "sort": sort,
         "created_start": created_start,
         "created_end": created_end,
@@ -588,6 +597,7 @@ def browse_memories(
             decayed_only=decayed_only,
             include_decayed=include_decayed,
             scope_mismatch=scope_mismatch,
+            subject_scope=subject_scope,
             sort=sort,
             created_start=created_start,
             created_end=created_end,

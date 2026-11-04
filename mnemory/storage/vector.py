@@ -1121,13 +1121,27 @@ class VectorStore:
         decayed_only: bool = False,
         include_decayed: bool = False,
         scope_mismatch: bool = False,
+        subject_scope: bool = False,
         sort: str = "storage",
         created_start: str | None = None,
         created_end: str | None = None,
     ) -> dict[str, Any]:
         """Return one authorized active-memory page in the requested order."""
+        if subject_scope:
+            # LOCAL-PATCH 2026-11-05: enumerate rows ABOUT this user regardless
+            # of who owns them. The owner predicate below hides precisely the
+            # rows that the unscoped core-memory reads used to return, so an
+            # operator auditing that residue cannot see it through an
+            # owner-scoped scroll. Still bounded to the caller's own identity as
+            # subject, so this is not a cross-user read.
+            identity_condition = FieldCondition(
+                key="user_id", match=MatchValue(value=user_id)
+            )
+        else:
+            identity_condition = _build_owner_scope_condition(user_id, owner_id)
+
         must: list[Any] = [
-            _build_owner_scope_condition(user_id, owner_id),
+            identity_condition,
             _active_revision_condition(),
         ]
         if memory_type:

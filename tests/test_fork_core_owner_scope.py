@@ -171,5 +171,89 @@ class TestBrowseScopeMismatch:
     def test_api_param_is_wired(self):
         params = inspect.signature(browse_memories).parameters
         assert "scope_mismatch" in params
+        assert "subject_scope" in params
         target = inspect.signature(VectorStore.browse_active).parameters
         assert "scope_mismatch" in target
+        assert "subject_scope" in target
+
+
+# ----------------------------------------------------------------  part 3
+# The scope_mismatch view shipped blind: browse filters on the owner dimension
+# BEFORE the post-scroll predicate, so rows owned by someone else can never
+# enter the scroll no matter what is asked of them afterwards. That is exactly
+# the population this incident produced. These tests pin the difference between
+# the two modes, including the direction the old audit could not see.
+OTHER_ROWS = [
+    _Point("own", {"data": "mine", "user_id": ME, "owner_id": ME}),
+    _Point("stray", {"data": "about me, owned elsewhere", "user_id": ME,
+                     "owner_id": OTHER}),
+    _Point("legacy", {"data": "predates owner dimension", "user_id": ME}),
+    _Point("foreign", {"data": "someone else's, about someone else",
+                       "user_id": OTHER, "owner_id": OTHER}),
+]
+
+
+class _CapturingClient:
+    """Records the filter browse_active hands to Qdrant.
+
+    The fake scroll cannot evaluate Qdrant conditions, so owner-versus-subject
+    scoping is not observable in the returned rows - it has to be asserted on
+    the filter that was built.
+    """
+
+    def __init__(self):
+        self.filters = []
+
+    def scroll(self, **kw):
+        self.filters.append(str(kw.get("scroll_filter")))
+        return [], None
+
+
+def _filter_for(**kw):
+    store = object.__new__(VectorStore)
+    client = _CapturingClient()
+    store._client = client
+    store._config = types.SimpleNamespace(
+        vector=types.SimpleNamespace(collection_name="test"))
+    base = dict(user_id=ME, owner_id=ME, session_agent_id=None,
+                include_decayed=True, limit=50)
+    base.update(kw)
+    store.browse_active(**base)
+    assert client.filters, "browse_active issued no scroll"
+    return client.filters[0]
+
+
+class TestSubjectScopeBrowse:
+    def test_default_browse_filters_on_the_owner_dimension(self):
+        assert "owner_id" in _filter_for()
+
+    def test_subject_scope_replaces_owner_with_the_subject(self):
+        built = _filter_for(subject_scope=True)
+        assert "owner_id" not in built, "owner predicate survived subject_scope"
+        assert ME in built, "subject identity missing from the filter"
+
+    def test_subject_scope_is_off_by_default(self):
+        assert _filter_for() == _filter_for(subject_scope=False)
+
+    def test_the_post_scroll_predicate_is_unchanged_by_the_mode(self):
+        """scope_mismatch stays a Python-side narrowing in either mode.
+
+        The fake scroll applies no Qdrant scoping, so 'foreign' is still in the
+        page it hands back - but its owner and its subject are the same person,
+        so it is a clean row and the predicate must not report it. What is being
+        pinned here is that turning subject_scope on does not alter the
+        predicate itself.
+        """
+        expect = {"stray"}
+        for mode in (False, True):
+            res = _store(list(OTHER_ROWS)).browse_active(
+                user_id=ME, owner_id=ME, session_agent_id=None,
+                include_decayed=True, scope_mismatch=True,
+                subject_scope=mode, limit=50)
+            got = {r["id"] for r in res["results"]}
+            assert got == expect, (mode, got)
+
+    def test_subject_scope_never_matches_another_subject(self):
+        """Broadening ownership must not broaden the identity being read."""
+        built = _filter_for(subject_scope=True)
+        assert OTHER not in built, "another subject leaked into the filter"
