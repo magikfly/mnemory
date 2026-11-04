@@ -4352,6 +4352,13 @@ class MemoryService:
         # ── 1. Fetch all pinned memories in a single query ────────────
         all_pinned = self.vector.get_pinned_memories(
             user_id=user_id,
+            # LOCAL-PATCH 2026-11-04: owner and subject scoping, matching what
+            # list/search/browse apply. Without owner_id the storage predicate
+            # degrades to a bare user_id match and pulls in rows owned by other
+            # identities, which no enumeration endpoint will show and so no
+            # operator can delete, while they keep reaching this prompt.
+            owner_id=owner_id,
+            subject_user_id=user_id,
             exclude_layers=_CORE_EXCLUDE_LAYERS,
         )
         for memory in all_pinned:
@@ -4380,6 +4387,8 @@ class MemoryService:
                     futures["agent"] = pool.submit(
                         self.vector.get_all,
                         user_id=user_id,
+                        owner_id=owner_id,
+                        subject_user_id=user_id,
                         agent_id=agent_id,
                         filters={"pinned": False, "importance": imp_levels},
                         exclude_layers=_CORE_EXCLUDE_LAYERS,
@@ -4388,6 +4397,8 @@ class MemoryService:
                 futures["user"] = pool.submit(
                     self.vector.get_all,
                     user_id=user_id,
+                    owner_id=owner_id,
+                    subject_user_id=user_id,
                     shared_only=True,
                     filters={"pinned": False, "importance": imp_levels},
                     exclude_layers=_CORE_EXCLUDE_LAYERS,
@@ -4524,6 +4535,8 @@ class MemoryService:
             f_user_recent = pool.submit(
                 self.vector.get_recent_memories,
                 user_id=user_id,
+                owner_id=owner_id,
+                subject_user_id=user_id,
                 agent_id=None,
                 since=since,
                 limit=limit_user,
@@ -4536,6 +4549,8 @@ class MemoryService:
                 f_agent_recent = pool.submit(
                     self.vector.get_recent_memories,
                     user_id=user_id,
+                    owner_id=owner_id,
+                    subject_user_id=user_id,
                     agent_id=agent_id,
                     since=since,
                     limit=limit_agent,

@@ -153,6 +153,26 @@ def _build_owner_scope_condition(
     )
 
 
+def _is_scope_mismatch(memory: dict[str, Any], requested_owner: str) -> bool:
+    """True when a stored row's owner and subject identity disagree.
+
+    These rows are the residue of consolidation writing facts under the wrong
+    subject. Because list, search and browse filter on the owner dimension they
+    are invisible to every enumeration route, while the core-memory path - which
+    used to query on user_id alone - handed them straight to the model. The
+    scope_mismatch browse mode exists so an operator can find and delete them.
+
+    Rows with no owner_id at all predate the owner dimension and are not
+    reported: they are legitimately reachable by their user_id.
+    """
+    meta = memory.get("metadata") or {}
+    owner = memory.get("owner_id") if memory.get("owner_id") is not None else meta.get("owner_id")
+    subject = memory.get("user_id") if memory.get("user_id") is not None else meta.get("user_id")
+    if owner is None:
+        return False
+    return subject != owner
+
+
 def _active_revision_condition() -> Filter:
     """Match active revisions and rolling-upgrade records without state."""
     return Filter(
@@ -1100,6 +1120,7 @@ class VectorStore:
         has_artifacts: bool = False,
         decayed_only: bool = False,
         include_decayed: bool = False,
+        scope_mismatch: bool = False,
         sort: str = "storage",
         created_start: str | None = None,
         created_end: str | None = None,
@@ -1164,6 +1185,11 @@ class VectorStore:
                 )
             )
 
+        if scope_mismatch:
+            # Post-scroll predicate, so it cannot be combined with the
+            # creation-ordered path; storage order keeps the cursor honest.
+            sort = "storage"
+
         if sort != "storage":
             return self._browse_by_creation(
                 must=must,
@@ -1207,6 +1233,10 @@ class VectorStore:
                     not include_decayed
                     and not decayed_only
                     and should_exclude(item, False)
+                ):
+                    continue
+                if scope_mismatch and not _is_scope_mismatch(
+                    item, owner_id or user_id
                 ):
                     continue
                 results.append(item)

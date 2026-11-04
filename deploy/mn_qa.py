@@ -712,6 +712,72 @@ except Exception:
     traceback.print_exc()
     FAILURES.append("dedup partial-apply checks raised")
 
+# ------------------------------------------------- core-memory owner scoping
+# 2026-11-04: get_core_memories read storage without owner/subject scoping, so
+# rows owned by another identity were injected into this user's prompt while
+# every enumeration endpoint hid them. Presence checks only; the behavioural
+# suite is tests/test_fork_core_owner_scope.py.
+try:
+    import pathlib as _pl4
+    import sys as _sys4
+
+    _pkg4 = _pl4.Path(_sys4.modules["mnemory.memory"].__file__).parent
+    _mem4 = (_pkg4 / "memory.py").read_text(encoding="utf-8")
+    _vec4 = (_pkg4 / "storage" / "vector.py").read_text(encoding="utf-8")
+    _api4 = (_pkg4 / "api" / "memories.py").read_text(encoding="utf-8")
+
+    section("core-memory owner scoping (2026-11-04)")
+
+    # Text counting is brittle here (scoping kwargs legitimately exist in other
+    # call sites), so drive the builder with a recording stub and assert on the
+    # kwargs it actually passes to storage.
+    class _Rec:
+        def __init__(self):
+            self.calls = []
+
+        def get_pinned_memories(self, **k):
+            self.calls.append(("pinned", k))
+            return []
+
+        def get_all(self, **k):
+            self.calls.append(("all", k))
+            return {"results": []}
+
+        def get_recent_memories(self, **k):
+            self.calls.append(("recent", k))
+            return []
+
+    class _NoCache:
+        def get(self, key):
+            return None
+
+        def set(self, key, value):
+            return None
+
+    from mnemory.config import Config as _Cfg4
+    from mnemory.memory import MemoryService as _MS4
+
+    _svc4 = object.__new__(_MS4)
+    _svc4._config = _Cfg4()
+    _svc4._core_cache = _NoCache()
+    _svc4.vector = _Rec()
+    _uid = "qa-scope@user.test"
+    _svc4.get_core_memories(user_id=_uid, owner_id=_uid, agent_id="qa-agent",
+                           track_access=False)
+    check("core builder performed storage reads", bool(_svc4.vector.calls), True)
+    unscoped = [name for name, kw in _svc4.vector.calls
+                if kw.get("owner_id") != _uid or kw.get("subject_user_id") != _uid]
+    check("every core read is owner+subject scoped", unscoped, [])
+    check("scope audit helper defined", "def _is_scope_mismatch(" in _vec4, True)
+    check("browse exposes scope_mismatch", "scope_mismatch: bool = False," in _vec4, True)
+    check("filter applied in browse scroll",
+          "if scope_mismatch and not _is_scope_mismatch(" in _vec4, True)
+    check("API accepts scope_mismatch",
+          "scope_mismatch: bool = Query(" in _api4, True)
+except Exception:
+    traceback.print_exc()
+    FAILURES.append("core-memory owner-scoping checks raised")
+
 # ---------------------------------------------------------------- summary
 print("\n================ SUMMARY ================")
 if FAILURES:

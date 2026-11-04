@@ -501,6 +501,14 @@ def browse_memories(
     has_artifacts: bool = Query(False),
     decayed_only: bool = Query(False),
     include_decayed: bool = Query(False),
+    scope_mismatch: bool = Query(
+        False,
+        description=(
+            "Maintenance view: only rows whose owner_id differs from their "
+            "subject user_id. Such rows are hidden from owner-scoped list and "
+            "search, so this is the only way to enumerate them before deleting."
+        ),
+    ),
     sort: str = Query("newest"),
     created_start: str | None = Query(None),
     created_end: str | None = Query(None),
@@ -551,6 +559,7 @@ def browse_memories(
         "has_artifacts": has_artifacts,
         "decayed_only": decayed_only,
         "include_decayed": include_decayed,
+        "scope_mismatch": scope_mismatch,
         "sort": sort,
         "created_start": created_start,
         "created_end": created_end,
@@ -578,6 +587,7 @@ def browse_memories(
             has_artifacts=has_artifacts,
             decayed_only=decayed_only,
             include_decayed=include_decayed,
+            scope_mismatch=scope_mismatch,
             sort=sort,
             created_start=created_start,
             created_end=created_end,
