@@ -21,8 +21,10 @@ from typing import TYPE_CHECKING, Any
 from mnemory.categories import sanitize_categories
 from mnemory.output_guards import (
     clean_memory_text,
+    launders_user_decision,
     noise_enforcing,
     redact_secrets,
+    role_provenance_enforcing,
     triage_memory,
     role_mismatch,
 )
@@ -1139,6 +1141,23 @@ class ConsolidationService:
                         noise, f.get("text", ""),
                     )
                     if enforcing:
+                        continue
+                laundered = launders_user_decision(
+                    f.get("text", ""), summary, role
+                )
+                if laundered:
+                    drop = role_provenance_enforcing()
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: %s (%s) "
+                        "- assistant pass restating a user decision: %.80s",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                        laundered,
+                        "dropping" if drop else "shadow, not dropped",
+                        f.get("text", ""),
+                    )
+                    if drop:
                         continue
                 mismatch = role_mismatch(f.get("text", ""), role)
                 if mismatch == "assistant_pass_user_subject":

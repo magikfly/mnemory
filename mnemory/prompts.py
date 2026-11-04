@@ -3584,6 +3584,71 @@ def parse_remember_extraction_response(
                     )
                 fact["role"] = "user"
 
+        # LOCAL-PATCH 2026-11-05: this parser, not parse_extraction_response,
+        # is what the chat pipeline uses, and it ran no content guard at all.
+        # MEMORY_AGENT_VOICE=drop therefore never applied to a chat write -
+        # the mechanism behind every "the purge refilled itself" note. Same
+        # verdicts and log prefixes as parse_extraction_response, so tooling
+        # that greps "Extraction guard" keeps matching.
+        from mnemory.output_guards import (
+            agent_voice,
+            agent_voice_enforcing,
+            noise_enforcing_for,
+            pin_allowed,
+            triage_memory,
+        )
+
+        # triage_memory is the shared entry point used by
+        # parse_extraction_response: it strips list markers and metadata blocks,
+        # unwrites a speech-act head into its clause, and returns the noise
+        # verdict. Going through it keeps one write policy instead of two.
+        text, guard_noise, guard_rewrote = triage_memory(text)
+        fact["text"] = text
+        if guard_rewrote and not silent:
+            logger.info("Extraction guard: speech-act rewrite: %.120s", text)
+
+        if guard_noise:
+            guard_enforce = noise_enforcing_for(
+                guard_noise, categories=categories
+            )
+            if not silent:
+                logger.info(
+                    "Extraction guard: %s (%s): %.120s",
+                    guard_noise,
+                    "dropping" if guard_enforce else "would drop, log-only",
+                    text,
+                )
+            if guard_enforce:
+                continue
+
+        if fact.get("pinned") and not pin_allowed(text):
+            fact["pinned"] = False
+            if not silent:
+                logger.info("Extraction guard: pin withheld: %.120s", text)
+
+        guard_voice = agent_voice(
+            str(fact.get("role") or "user"),
+            memory_type,
+            bool(fact.get("pinned")),
+            importance,
+            categories=categories,
+        )
+        if guard_voice:
+            if agent_voice_enforcing():
+                if not silent:
+                    logger.info(
+                        "Extraction guard: %s (dropping): %.120s",
+                        guard_voice,
+                        text,
+                    )
+                continue
+            if not silent:
+                logger.info(
+                    "Extraction guard: %s (would drop, log-only): %.120s",
+                    guard_voice,
+                    text,
+                )
+
         facts.append(fact)
 
     return facts, summary, store_artifact

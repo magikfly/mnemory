@@ -68,8 +68,23 @@ class TestAgentVoice:
         assert agent_voice("user", "episodic", False, "normal") is None
         assert agent_voice(None, "episodic", False, "normal") is None
 
-    def test_high_importance_assistant_row_survives(self):
-        assert agent_voice("assistant", "episodic", False, "high") is None
+    def test_high_importance_no_longer_exempts_assistant_voice(self):
+        """RETIRED CONTRACT (2026-11-05), kept visible rather than deleted.
+
+        This used to assert that importance=high rescued an assistant-subject
+        episodic row from the voice gate. On the live store that exemption was
+        the hole, not the safety net: the extractor rates its own chat narration
+        "high", and three of the six rows purged on 2026-11-05 survived on this
+        line alone ("Assistant retracted a pinned fact...", "Assistant logged
+        the retraction in the vault...", "Assistant corrected its earlier
+        conclusion..."). Durability is carried by type (fact/preference/
+        procedural), by pinned, or by a life category - each still asserted
+        above. importance is a proxy for none of them.
+        """
+        assert agent_voice("assistant", "episodic", False, "high") == \
+            "assistant_agent_voice"
+        assert agent_voice("assistant", "episodic", False, "critical") == \
+            "assistant_agent_voice"
 
 
 class TestPerReasonEnforcement:

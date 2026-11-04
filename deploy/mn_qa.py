@@ -788,6 +788,43 @@ except Exception:
     traceback.print_exc()
     FAILURES.append("core-memory owner-scoping checks raised")
 
+# ------------------------------------------------- write-guard wiring (2026-11-05)
+# The chat pipeline parses with parse_remember_extraction_response. Every guard
+# in output_guards was wired to the OTHER parser, so MEMORY_AGENT_VOICE=drop
+# never applied to a chat write and the store refilled after each purge. Text
+# presence here is the cheapest possible guard against that class of silent
+# unwiring, which a config dump and a code review both missed.
+try:
+    import pathlib as _p7
+    import sys as _s7
+
+    _pkg7 = _p7.Path(_s7.modules["mnemory.prompts"].__file__).parent
+    _pr7 = (_pkg7 / "prompts.py").read_text(encoding="utf-8")
+    _og7 = (_pkg7 / "output_guards.py").read_text(encoding="utf-8")
+    _co7 = (_pkg7 / "consolidation.py").read_text(encoding="utf-8")
+
+    def _fn_body7(src, start_marker, end_marker):
+        i = src.index(start_marker)
+        return src[i:src.index(end_marker, i)]
+
+    _remember7 = _fn_body7(
+        _pr7, "def parse_remember_extraction_response(", "def build_dedup_prompt(")
+    section("write-guard wiring (2026-11-05)")
+    check("chat parser runs the voice gate", "agent_voice(" in _remember7, True)
+    check("chat parser runs triage/noise guard", "triage_memory(" in _remember7, True)
+    check("chat parser enforces pin policy", "pin_allowed(" in _remember7, True)
+    check("provenance rule defined", "def launders_user_decision(" in _og7, True)
+    check("provenance rule ships shadow by default",
+          '_ROLE_PROVENANCE_MODE_ENV = "MEMORY_ROLE_PROVENANCE"' in _og7, True)
+    check("consolidation calls the provenance rule",
+          "launders_user_decision(" in _co7, True)
+    check("importance exemption removed",
+          'in ("high", "critical"):\n        return None\n    return "assistant_agent_voice"'
+          in _og7, False)
+except Exception:
+    traceback.print_exc()
+    FAILURES.append("write-guard wiring checks raised")
+
 # ---------------------------------------------------------------- summary
 print("\n================ SUMMARY ================")
 if FAILURES:

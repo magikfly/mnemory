@@ -643,6 +643,89 @@ def noise_enforcing_for(reason: str | None,
     return noise_enforcing()
 
 
+_USER_DECISION_HEAD_RE = re.compile(
+    r"^(?:the\s+)?user\s+(?:decided|chose|opted|agreed|confirmed|specified|"
+    r"instructed|selected|asked\s+for)\b",
+    re.IGNORECASE,
+)
+#: Concrete decision parameters: numbers with optional units, CLI flags,
+#: filenames. Sharing one with a clause the summary attributes to the user is
+#: strong evidence the assistant pass echoed the user instead of reporting its
+#: own work, and it is the shape the 9B still produces (probe P2, 2026-11-05).
+_DECISION_PARAM_RE = re.compile(
+    r"--[A-Za-z][\w-]*|-?[A-Za-z]?\d[\d.,]*\s*"
+    r"(?:%|km|kg|W|bpm|MB|GB|TB|ms|s|min|h)?"
+    r"|[\w.-]+\.(?:py|yaml|yml|toml|json|md|gguf)",
+)
+# No apostrophe in this class on purpose: the module-wide punctuation invariant
+# (tests/test_output_guards_punctuation.py) flags any pattern carrying a bare
+# ASCII ' without its typographic twin, and content-word overlap does not need
+# possessives or contractions to do its job.
+_WORD_RE = re.compile(r"[A-Za-z]{4,}")
+_DECISION_STOP = frozenset(
+    {
+        "that", "this", "with", "from", "into", "have", "been", "will",
+        "would", "should", "their", "them", "because", "which", "about",
+        "after", "before", "user", "users", "assistant", "also", "for",
+        "using", "used", "were",
+    }
+)
+
+_ROLE_PROVENANCE_MODE_ENV = "MEMORY_ROLE_PROVENANCE"
+
+
+def role_provenance_enforcing() -> bool:
+    """True when MEMORY_ROLE_PROVENANCE=drop."""
+    return _mode(_ROLE_PROVENANCE_MODE_ENV) == "drop"
+
+
+def launders_user_decision(
+    text: str | None, summary: str | None, role: str | None
+) -> str | None:
+    """Return a reason when the assistant pass echoes a user decision.
+
+    The assistant consolidation pass reads a session summary that also records
+    what the user decided and re-emits it with an assistant subject: for the
+    summary clause "User decided on temperature 0.4, 12288 tokens and reasoning
+    on for the irrigation agent" the model returned "Assistant configured the
+    irrigation agent with temperature 0.4, 12288 tokens, and enabled reasoning".
+    role_mismatch() cannot see that, because it keys on a leading "User", so the
+    attribution theft was invisible to the guard written for it.
+
+    Deliberately narrow: fires only when the output shares a concrete parameter
+    with a user-decision clause, or reproduces most of that clause content words.
+    """
+    if not text or not summary:
+        return None
+    if (role or "").strip().lower() != "assistant":
+        return None
+    probe = _LIST_MARKER_RE.sub("", text, count=1).strip()
+    if re.match(r"^User\b", probe, re.IGNORECASE):
+        return None  # already covered by role_mismatch
+
+    text_params = {p.strip().lower() for p in _DECISION_PARAM_RE.findall(probe)}
+    text_words = {
+        w.lower() for w in _WORD_RE.findall(probe)
+        if w.lower() not in _DECISION_STOP
+    }
+    for clause in re.split(r"(?<=[.!?])\s+|\n+", summary):
+        clause = clause.strip()
+        if not _USER_DECISION_HEAD_RE.match(clause):
+            continue
+        params = {p.strip().lower() for p in _DECISION_PARAM_RE.findall(clause)}
+        if params and text_params and (params & text_params):
+            return "assistant_pass_user_decision"
+        words = {
+            w.lower() for w in _WORD_RE.findall(clause)
+            if w.lower() not in _DECISION_STOP
+        }
+        if len(words) >= 3:
+            shared = len(words & text_words)
+            if shared >= 3 and shared / len(words) >= 0.5:
+                return "assistant_pass_user_decision"
+    return None
+
+
 def agent_voice(role: str | None, memory_type: str | None, pinned: bool,
                 importance: str | None = None,
                 categories: list | tuple | None = None) -> str | None:
@@ -667,8 +750,18 @@ def agent_voice(role: str | None, memory_type: str | None, pinned: bool,
             return None
     if (memory_type or "").strip().lower() not in AGENT_VOICE_TYPES:
         return None
-    if str(importance or "").strip().lower() in ("high", "critical"):
-        return None
+    # LOCAL-PATCH 2026-11-05: the importance escape hatch is removed. It let
+    # the extractor rate its own narration "high" and walk out of the only
+    # gate that is not wording-dependent. Three of the six rows purged at
+    # 00:31 survived on this line alone, and none of them are text the noise
+    # patterns catch, so making the exemption conditional on a noise hit was
+    # measured to achieve nothing. What still protects durable content:
+    # pinned, the LIFE_CATEGORIES carve-out, and the type filter - identity
+    # and capability notes arrive as fact/preference/procedural, never
+    # episodic. Measured basis: of 1,070 role=assistant rows in this store,
+    # 999 were episodic or context. importance stays in the signature because
+    # callers pass it positionally and the audit log carries it.
+    del importance  # intentionally unused after 2026-11-05
     return "assistant_agent_voice"
 
 
