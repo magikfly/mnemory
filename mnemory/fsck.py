@@ -998,13 +998,12 @@ class FsckService:
             check.issues.extend(dup_issues)
             check.progress.issues_found = len(check.issues)
 
-            # Estimate LLM calls for duplicate evaluation (1 per cluster).
-            # clustered_ids is a flat set; average cluster size ~2-3 members,
-            # so number of clusters ≈ len(clustered_ids) / 2.
-            estimated_dup_clusters = (
-                max(len(clustered_ids) // 2, 1) if clustered_ids else 0
-            )
-            check.llm_calls += estimated_dup_clusters
+            # 2026-11-05: the duplicate phase now counts its own calls, one per
+            # chunk actually evaluated (see the as_completed loop), so the former
+            # len(clustered_ids) // 2 guess is gone. It under-counted big clusters
+            # and over-counted pairs, and after the split change it would have
+            # been wrong in a new direction because clustered_ids now covers
+            # every member rather than a truncated head.
 
             if self._check_budget(check):
                 logger.info(
@@ -2584,14 +2583,45 @@ class FsckService:
 
         # Prepare cluster data and collect clustered IDs
         cluster_inputs: list[tuple[str, list[dict]]] = []
+        # LOCAL-PATCH 2026-11-05: this was `member_ids[:_MAX_CLUSTER_SIZE]`,
+        # which dropped every member past 15 without a word. The cap is earned -
+        # fsck_dedup echoes the cluster it is merging, and a 15-member reply
+        # already needed the 12288-token ceiling (check 3710afac) - but truncating
+        # made a flood both invisible and undrainable: 193 duplicate copies on
+        # 2026-11-05 were reported as "6 clusters from 207 memories" with no hint
+        # that most members never reached evaluation. Splitting an oversized
+        # cluster into chunks of <= _MAX_CLUSTER_SIZE keeps every reply inside the
+        # same ceiling while covering everyone. Chunks are taken from a
+        # union-find cluster, whose members are already mutually similar, so an
+        # arbitrary partition is safe; whatever falls across chunks converges on a
+        # later pass, as it always did - the difference is the set is now
+        # enumerated instead of discarded.
+        oversized = 0
         for _root, member_ids in cluster_list:
-            member_ids = member_ids[:_MAX_CLUSTER_SIZE]
-            clustered_ids.update(member_ids)
-            cluster_mems = [
-                corpus_by_id[mid] for mid in member_ids if mid in corpus_by_id
+            if len(member_ids) > _MAX_CLUSTER_SIZE:
+                oversized += 1
+            chunks = [
+                member_ids[i : i + _MAX_CLUSTER_SIZE]
+                for i in range(0, len(member_ids), _MAX_CLUSTER_SIZE)
             ]
-            if len(cluster_mems) >= 2:
-                cluster_inputs.append((_root, cluster_mems))
+            for part, chunk in enumerate(chunks):
+                clustered_ids.update(chunk)
+                cluster_mems = [
+                    corpus_by_id[mid] for mid in chunk if mid in corpus_by_id
+                ]
+                if len(cluster_mems) >= 2:
+                    cluster_inputs.append(
+                        (_root if part == 0 else "%s#%d" % (_root, part), cluster_mems)
+                    )
+        if oversized:
+            logger.info(
+                "Fsck duplicate split: %d cluster(s) over the %d-member cap "
+                "became %d evaluation chunks covering %d members",
+                oversized,
+                _MAX_CLUSTER_SIZE,
+                len(cluster_inputs),
+                len(clustered_ids),
+            )
 
         concurrency = max(1, self._config.memory.fsck_llm_concurrency)
         progress_lock = threading.Lock()
@@ -2610,6 +2640,9 @@ class FsckService:
                 root = futures[future]
                 try:
                     cluster_issues = future.result()
+                    # Real accounting, replacing the len(clustered_ids) // 2
+                    # estimate below: one call was made for this chunk.
+                    check.llm_calls += 1
                     with progress_lock:
                         issues.extend(cluster_issues)
                         completed_count += 1
@@ -2626,6 +2659,9 @@ class FsckService:
                         root,
                         exc_info=True,
                     )
+                    # The call happened and the tokens are spent; only the
+                    # answer is useless. Counting it keeps the budget honest.
+                    check.llm_calls += 1
                     with progress_lock:
                         completed_count += 1
                         check.progress.processed = completed_count
