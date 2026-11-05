@@ -6,8 +6,8 @@ Open WebUI sqlite database; that row is what actually executes. This file is the
 git-tracked archive of each shipped version, per the owner's decision on
 2026-10-15 that the filter is always git-tracked.
 
-  version        0.4.9-atlas.3
-  live row sha256 474aeba0a49cc6d45b05906ad92e0594eeb5b9511f322507d635412675b356e1
+  version        0.4.9-atlas.4
+  live row sha256 60bf4624460ed7db3a8b7919a661da0e54b7a8acfb3a8725c97ced02bc07b877
   this file sha256  (differs by design, see below)
 
 SANITIZED: the three valve defaults that name LAN endpoints carry the literal
@@ -20,6 +20,20 @@ Consequence when restoring from this archive: set the ``mnemory_url``,
 ``embedding_api_base`` and ``rerank_url`` valve defaults, or their saved values,
 back to the real host before saving the function, or recall, embeddings and
 rerank all fail open into silence rather than loudly.
+
+0.4.9-atlas.4 (2026-11-05): echo-loop stop in ``outlet()``. The store was
+re-ingesting this filter's own injected memory block as a user utterance and
+feeding a duplicate flood (201 rows in one burst; 222 -> 29 after the sweep).
+The outlet filtered only on ``role in (user, assistant)``, and
+``_inject_recalled`` appends the recalled block as a synthetic role=user
+message for prompt-cache reasons, so the role test could not exclude it. Added
+``_INJECTION_MARKERS`` (strings only this file writes) plus
+``_is_injected_memory()``, applied both to the exchange sent to
+``/api/remember`` and to the topic-context pick. Deliberately narrow: a real
+user message quoting a memory verbatim is dropped, which is the cheaper error.
+Proven by driving the deployed row content through the real ``outlet()`` -
+14/14 - not by reading source.
+
 
 0.4.9-atlas.3 (2026-10-23): one-line removal. 0.4.9-atlas.2 left an
 unconditional ``return body`` immediately after the ``if not __user__``
@@ -69,7 +83,7 @@ description: Automatic memory recall and storage for conversations
 # Patched locally (atlas.1): injector fix, tag-aware + capped sanitizer,
 # example-leak and speech-act hygiene, placeholder regex de-anchored.
 # Upstream baseline was version: 0.4.2
-version: 0.4.9-atlas.3
+version: 0.4.9-atlas.4
 """
 
 import asyncio
@@ -86,7 +100,19 @@ _log = logging.getLogger(__name__)
 # Bump on every deploy: this line is the proof in `docker logs OpenWebUI` that the
 # running filter pipeline recompiled the stored content rather than serving a cache.
 _NUM_RE_FINDALL = re.compile(r"\d[\d.,:/-]*").findall
-_FILTER_BUILD = "0.4.9-atlas.3"
+_FILTER_BUILD = "0.4.9-atlas.4"
+
+# Content this filter injects into the request body itself. The outlet must
+# never send it back to /api/remember. _inject_recalled appends the recalled
+# block as a synthetic role=USER message (prompt-cache reasons: a system
+# message would jump ahead of the whole conversation and drop the prefix), so
+# it survives the outlet user/assistant role filter unchanged. Measured
+# 2026-11-05: feeding ["ok then. update the vault and do housecleaning", the
+# injected block] to the deployed extractor produced 10 facts, 8 of them
+# echoes of rows already in the store, every one role=user, 7 at
+# importance=high. The store was re-ingesting its own recalled context once
+# per turn and filing it as something the user said.
+_INJECTION_MARKERS = ("## Recalled Memories", "⟨memory_item⟩")
 _log.info("mnemory filter build %s loaded", _FILTER_BUILD)
 
 
@@ -1422,6 +1448,24 @@ prompt for them."""
         # Trim lines that are now empty due to bullet removal
         return "\n".join(out).strip()
 
+    @staticmethod
+    def _is_injected_memory(msg: dict) -> bool:
+        """True for content THIS filter added to the request body.
+
+        Kept deliberately narrow: the markers are strings only this file
+        writes. A real user message that quotes a memory verbatim is dropped
+        from extraction, which is the harmless direction - the alternative
+        mistake is what refilled the store for months.
+        """
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts = [content]
+        elif isinstance(content, list):  # multimodal: text parts in a list
+            parts = [str(p.get("text", "")) for p in content if isinstance(p, dict)]
+        else:
+            return False
+        return any(mk in p[:400] for p in parts for mk in _INJECTION_MARKERS)
+
     def _inject_recalled(self, body: dict, memories: list[str] | None) -> None:
         """Append recalled memories as a trailing user message.
 
@@ -1551,8 +1595,18 @@ prompt for them."""
         session_id = sess["session_id"] if sess else None
         messages = body.get("messages", [])
 
-        # Only user/assistant messages — exclude system prompts and tool results
-        conversation = [m for m in messages if m.get("role") in ("user", "assistant")]
+        # Only user/assistant messages — exclude system prompts and tool
+        # results, AND exclude this filter own injected memory block. It
+        # arrives as role=user, so the role test alone cannot remove it, and
+        # leaving it in makes the store re-ingest its own recalled context as
+        # a user utterance (echo loop, measured 2026-11-05; see
+        # _INJECTION_MARKERS). Also keeps the block out of the topic context
+        # built from first_user_msg below.
+        conversation = [
+            m for m in messages
+            if m.get("role") in ("user", "assistant")
+            and not self._is_injected_memory(m)
+        ]
 
         if len(conversation) < 2:
             await self._debug(
