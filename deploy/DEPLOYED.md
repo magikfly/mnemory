@@ -1,19 +1,37 @@
-# mn-deployed — source of the running mnemory image
+# mn-deployed — the patched mnemory tree that CI builds
 
-Branch `mn-deployed` = upstream tag `v1.15.1` + the exact delta that goes into the image.
+Branch `mn-deployed` is an upstream release tag plus the local delta that goes into
+`ghcr.io/magikfly/mnemory:latest`. It is **not** the fork's default branch. `main` exists to host
+`.github/workflows/mnemory-ghcr.yml` so its `schedule:` trigger fires — GitHub only reads
+schedules from the default branch — and the workflow then checks *this* branch out explicitly
+with `ref: mn-deployed` and pushes its upstream-merge commits back here. So `main` always shows
+many commits behind: by design, not a missed merge. **Never merge this branch into `main`.** It
+carries upstream's `docker-publish.yml`, which triggers on `push: branches: [main]` and tags
+`ghcr.io/fpytloun/mnemory`; a merge push would try to publish this patched tree into the upstream
+author's package namespace.
 
-- **Currently running**: `ghcr.io/magikfly/mnemory:latest` == the `v1.15.0`-based build
-  (`mnemory:v1.15.0-patched7`, id `2754d56485ab`), container `mnemory` on the unraid homeserver.
-  The `v1.15.1` merge is committed here but **not yet published** — it lands when CI rebuilds and
-  Watchtower recreates the container. Update this bullet once that happens.
-- Delta vs `v1.15.1`: **11 files, 1601 insertions / 92 deletions, 80 hunks** —
-  `mnemory/api/fsck.py`, `api/schemas.py`, `categories.py`, `consolidation.py`, `fsck.py`,
-  `llm.py`, `maintenance.py`, `memory.py`, `output_guards.py`, `prompts.py`, `storage/vector.py`.
-- **Authoritative diff: `deploy/deployed-vs-v1.15.1.diff`** (applies clean on a pristine `v1.15.1`
-  checkout; result verified byte-identical to this branch by md5 across all 11 files, all modules
-  compile).
+**Scope of this file.** Why each local patch exists, upstream-merge friction, and the build
+procedure — the material that has to travel with the code. Which image, tag or digest is running
+on the homeserver is **deployment state and does not belong here**: read it from the netvault
+(`services.mnemory`, keys `image`, `deploy`, `source_of_truth`), which is where those claims get
+stamped and corrected. The previous header carried a "Currently running" bullet that went two
+releases stale while telling the reader to update it.
+
+## Current delta
+
+- Base: upstream tag `v1.15.2` (an ancestor of this branch, merged as `9b251aa`). Branch tip `81e5e48`.
+- Delta vs `v1.15.2`, `mnemory/` only — **15 files, 3133 insertions / 126 deletions**:
+  `api/fsck.py`, `api/memories.py`, `api/schemas.py`, `categories.py`, `config.py`,
+  `consolidation.py`, `fsck.py`, `llm.py`, `logsink.py`, `maintenance.py`, `memory.py`,
+  `output_guards.py`, `prompts.py`, `server.py`, `storage/vector.py`.
+- Whole-branch delta including `deploy/`, `docs/`, `tests/` and `benchmarks/`: 52 files, 14084
+  insertions. Re-measure both with `git diff --stat v1.15.2..mn-deployed`.
+- **Authoritative diff: `deploy/deployed-vs-v1.15.1.diff`** — applies clean on a pristine
+  `v1.15.1` checkout, result verified byte-identical by md5 across its 11 files, all modules
+  compile. **No diff against `v1.15.2` exists yet; generate one at the next upstream merge** and
+  re-run the md5 parity check before trusting it.
 - `deploy/deployed-vs-v1.15.0.diff` and `deploy/local-patches.diff` are **historical** — they
-  describe the pre-merge tree and will not apply to `v1.15.1`.
+  describe pre-merge trees and will not apply to the current base.
 
 ## What each patch does
 
@@ -109,12 +127,12 @@ Zero merge-induced regressions.
 `pip install --no-deps .`). The GHCR image is built by `.github/workflows/mnemory-ghcr.yml` on
 branch `mn-deployed`: it merges the newest upstream tag if it is not already an ancestor, skips the
 build when the version tag is already published (use `rebuild=true` to force), and publishes
-`latest` + the version tag. Watchtower recreates the container on a newer `latest` digest.
+`latest` + the version tag. Watchtower recreates the container on a newer `latest` digest. Scheduled at 18:30 and 20:30 UTC (two slots because GitHub delivers `schedule` events to this account up to ~5h late — measured 2026-10-21..27 and written into the workflow comments); both land before the 04:00 Europe/Amsterdam Watchtower poll, which reads `:latest` at 03:00 UTC.
 
 To reproduce production from this branch:
 ```
-git checkout v1.15.1 && git apply deploy/deployed-vs-v1.15.1.diff
-# or simply: git checkout mn-deployed   (the branch *is* v1.15.1 + delta)
+git checkout v1.15.1 && git apply deploy/deployed-vs-v1.15.1.diff   # reproduces the v1.15.1-era state
+# or simply: git checkout mn-deployed   (the branch *is* the current base + delta)
 ```
 
 Manual build/publish when the schedule must not wait:
