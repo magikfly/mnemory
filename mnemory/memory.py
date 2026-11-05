@@ -82,6 +82,92 @@ from mnemory.ttl import (
 
 logger = logging.getLogger(__name__)
 
+
+_DUPLICATE_FLOOD_MIN_BATCH = 8
+_DUPLICATE_FLOOD_UNIQUE_RATIO = 0.5
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def _norm_fact_text(text: Any) -> str:
+    """Case- and whitespace-insensitive key for exact duplicate tests.
+
+    Deliberately weak: it folds case, whitespace and trailing sentence
+    punctuation and nothing else. This is a flood brake, not a semantic
+    deduplication - the LLM dedup pass owns meaning, and a paraphrase that
+    deserves merging is its problem, not this function's.
+    """
+    t = _WS_COLLAPSE_RE.sub(" ", str(text or "")).strip().lower()
+    return t.rstrip(" .!?:;")
+
+
+def _collapse_duplicate_actions(
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop repeated ADD actions for the same fact text within one batch.
+
+    Runs after decisions and before execution, so it applies whichever way the
+    duplicate arrived: the model looping, salvage recovering the same closed
+    object many times, or several extractions agreeing. UPDATE and DELETE are
+    untouched because they carry a target_id and are meaningful per target.
+    """
+    seen: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for action in actions:
+        if str(action.get("action", "")).upper() == "ADD":
+            key = _norm_fact_text(action.get("text"))
+            if key and key in seen:
+                dropped += 1
+                continue
+            if key:
+                seen.add(key)
+        kept.append(action)
+    if dropped:
+        logger.warning(
+            "Remember duplicate guard: dropped %d intra-batch duplicate ADDs "
+            "(%d of %d actions kept)",
+            dropped,
+            len(kept),
+            len(actions),
+        )
+    return kept
+
+
+def _verbatim_existing_match(
+    action: dict[str, Any], candidates: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Return the candidate whose text is the same memory verbatim, if any.
+
+    The candidates were retrieved for this fact already, so this costs no extra
+    search. It only fires when retrieval surfaced the duplicate, which for a
+    near-identical text at threshold 0.35 is the normal case, not the lucky one.
+    """
+    key = _norm_fact_text(action.get("text"))
+    if not key:
+        return None
+    for cand in candidates or []:
+        if _norm_fact_text(cand.get("text")) == key:
+            return cand
+    return None
+
+
+def _batch_is_degenerate(texts: list[Any]) -> bool:
+    """True when a batch repeats itself the way a cut-off reply does.
+
+    2026-11-05 measured: 201 facts, 15 unique. A genuine batch of many facts
+    about one topic still has near-unique texts, so the ratio separates the two
+    without needing to know whether the response was truncated - which also
+    covers a model that loops inside a perfectly valid JSON reply.
+    """
+    total = len(texts)
+    if total < _DUPLICATE_FLOOD_MIN_BATCH:
+        return False
+    unique = len({_norm_fact_text(t) for t in texts if _norm_fact_text(t)})
+    if not unique:
+        return False
+    return (unique / total) < _DUPLICATE_FLOOD_UNIQUE_RATIO
+
+
 # Max length for user_id and agent_id to prevent abuse
 _MAX_ID_LENGTH = 256
 _SUPPRESS_SENSITIVE_LLM_LOGS: ContextVar[bool] = ContextVar(
@@ -1672,9 +1758,47 @@ class MemoryService:
         dedup each sub-batch with local indices; decisions carry fact text
         (never a global index), so the merged action list is unchanged.
         """
-        return self._dedup_llm_bounded(
-            facts_with_candidates, facts, trusted=trusted
+        # LOCAL-PATCH 2026-11-05: flood brake, applied here rather than inside
+        # _dedup_llm_bounded so it covers every return path (fast return, split
+        # sub-batches, partial apply). Deterministic: no LLM verdict is trusted
+        # for a fact that duplicates one already in hand or already stored.
+        texts = [f.get("text") for f in facts]
+        force_skip = _batch_is_degenerate(texts)
+        if force_skip:
+            logger.error(
+                "Remember batch shows pathological repetition (%d facts, %d "
+                "unique) - undecided facts are skipped for this call whatever "
+                "dedup_undecided says",
+                len(texts),
+                len({_norm_fact_text(t) for t in texts}),
+            )
+
+        actions = self._dedup_llm_bounded(
+            facts_with_candidates, facts, trusted=trusted,
+            force_skip_undecided=force_skip,
         )
+
+        actions = _collapse_duplicate_actions(actions)
+
+        cand_by_text = {
+            it.get("text"): (it.get("candidates") or [])
+            for it in facts_with_candidates
+        }
+        guarded = []
+        for action in actions:
+            if str(action.get("action", "")).upper() == "ADD":
+                match = _verbatim_existing_match(
+                    action, cand_by_text.get(action.get("text"), [])
+                )
+                if match is not None:
+                    logger.warning(
+                        "Remember duplicate guard: ADD downgraded to SKIP, the "
+                        "same text is already stored (existing id=%s)",
+                        match.get("id"),
+                    )
+                    action = {**action, "action": "SKIP", "target_id": None}
+            guarded.append(action)
+        return guarded
 
     def _dedup_llm_bounded(
         self,
@@ -1682,6 +1806,7 @@ class MemoryService:
         facts: list[dict[str, Any]],
         *,
         trusted: bool,
+        force_skip_undecided: bool = False,
     ) -> list[dict[str, Any]]:
         # isinstance guard: MagicMock answers __int__, which would turn a
         # mocked config into budget=1 and split every batch in tests.
@@ -1710,7 +1835,8 @@ class MemoryService:
                 reindexed = [{**it, "index": j} for j, it in enumerate(sub)]
                 merged_actions.extend(
                     self._dedup_llm_bounded(
-                        reindexed, sub_facts, trusted=trusted
+                        reindexed, sub_facts, trusted=trusted,
+                        force_skip_undecided=force_skip_undecided,
                     )
                 )
             return merged_actions
@@ -1793,7 +1919,12 @@ class MemoryService:
         for idx in sorted(missing):
             f = facts[idx]
             has_competitor = candidate_counts.get(f.get("text"), 0) > 0
-            action = "SKIP" if (has_competitor and undecided_mode == "skip") else "ADD"
+            action = (
+                "SKIP"
+                if force_skip_undecided
+                or (has_competitor and undecided_mode == "skip")
+                else "ADD"
+            )
             recovered.append(
                 {
                     "text": f["text"],

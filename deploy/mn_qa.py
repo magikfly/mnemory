@@ -825,6 +825,44 @@ except Exception:
     traceback.print_exc()
     FAILURES.append("write-guard wiring checks raised")
 
+# ------------------------------------------------- flood guards (2026-11-05)
+# One remember call stored 201 rows from 15 unique facts. These checks are
+# presence-only on purpose: they exist so a refactor that quietly removes a guard
+# from the write path fails the image gate instead of refilling the store for a
+# fortnight, which is exactly how the chat-parser unwiring stayed invisible.
+try:
+    import pathlib as _p8
+    import sys as _s8
+
+    _pkg8 = _p8.Path(_s8.modules['mnemory.memory'].__file__).parent
+    _mem8 = (_pkg8 / 'memory.py').read_text(encoding='utf-8')
+    _llm8 = (_pkg8 / 'llm.py').read_text(encoding='utf-8')
+
+    def _body8(src, start, end):
+        i = src.index(start)
+        return src[i:src.index(end, i)]
+
+    _dw8 = _body8(_mem8, 'def _dedup_with_llm(', 'def _dedup_llm_bounded(')
+    section('duplicate-flood guards (2026-11-05)')
+    check('guard helpers defined',
+          all(['def _collapse_duplicate_actions(' in _mem8,
+               'def _batch_is_degenerate(' in _mem8,
+               'def _verbatim_existing_match(' in _mem8]), True)
+    check('entry point collapses intra-batch duplicates',
+          '_collapse_duplicate_actions(' in _dw8, True)
+    check('entry point screens existing verbatim copies',
+          '_verbatim_existing_match(' in _dw8, True)
+    check('entry point screens degenerate batches',
+          '_batch_is_degenerate(' in _dw8, True)
+    check('degenerate flag is threaded to the worker',
+          'force_skip_undecided' in _dw8
+          and 'force_skip_undecided: bool = False' in _mem8, True)
+    check('salvage deduplicates exact repeated objects',
+          'seen_objects' in _llm8, True)
+except Exception:
+    traceback.print_exc()
+    FAILURES.append('flood guard checks raised')
+
 # ---------------------------------------------------------------- summary
 print("\n================ SUMMARY ================")
 if FAILURES:

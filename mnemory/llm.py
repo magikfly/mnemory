@@ -385,6 +385,12 @@ def salvage_json_objects(text: str, key: str = "memories") -> list[dict[str, Any
         return None
 
     objects: list[dict[str, Any]] = []
+    # LOCAL-PATCH 2026-11-05: a model that has entered a repetition loop before
+    # the cut emits the SAME object closed over and over, and every copy parses
+    # cleanly, so recovery used to hand them all up (201 rows from 15 unique
+    # facts in one remember call). Collapse exact duplicates at the recovery
+    # point so no caller has to defend against it separately.
+    seen_objects: set[str] = set()
     depth = 0
     obj_start = None
     in_str = False
@@ -419,6 +425,15 @@ def salvage_json_objects(text: str, key: str = "memories") -> list[dict[str, Any
                     # The walk only collects depth-0 items of the anchored array, i.e.
                     # exactly the payload entries, so accept any object.
                     if isinstance(obj, dict):
+                        fingerprint = json.dumps(
+                            obj,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        if fingerprint in seen_objects:
+                            continue
+                        seen_objects.add(fingerprint)
                         objects.append(obj)
                 except json.JSONDecodeError:
                     pass
