@@ -141,6 +141,16 @@ gh workflow run mnemory-ghcr.yml --repo magikfly/mnemory --ref mn-deployed \
   -f rebuild=true -f tag=v1.15.1
 ```
 
+Upstream CI files never enter a pushed merge: the merge step resets `.github/workflows` to this
+branch's own state before committing (since 2026-11-16). Why, measured: GitHub rejects a push whose
+ref update creates or updates a workflow file unless the pushing token holds `workflows` permission,
+and `MERGE_PUSH_PAT` does not. Upstream v1.15.3 added `openclaw-test.yml`; the merge was clean and two
+nightly runs still died on the push (43772815541 / 43779062886). The gate reads the ref diff, not every
+introduced commit - verified the same day by pushing a stripped merge with a workflows-less GITHUB_TOKEN
+(run 43866468651, 5 commits introduced, accepted). Consequence: upstream edits to their own workflow
+files never land here, so copy one in by hand if it is ever wanted. Patch the copy on `main` in the same
+breath - schedules and dispatches read the workflow from the default branch, the build reads this one.
+
 Rollback point for the v1.15.1 merge: tag `backup/pre-v1.15.1-merge` (= `b710b98`).
 
 ## Not deployed

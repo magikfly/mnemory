@@ -56,11 +56,14 @@ jobs:
         id: upstream
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
-          # PAT with Workflows write (repo secret MERGE_PUSH_PAT). GITHUB_TOKEN
-          # cannot push merge commits that touch .github/workflows/ - GitHub
-          # rejects with "refusing to allow a GitHub App to create or update
-          # workflow ... without `workflows` permission". Falls back to the
-          # default credential when the secret is absent.
+          # PAT with Contents write (repo secret MERGE_PUSH_PAT). It does NOT
+          # carry `workflows`, and after 2026-11-16 it does not need to: the merge
+          # step below leaves .github/workflows byte-identical to this branch, so
+          # the ref update never creates or updates a workflow file. When it did,
+          # GitHub rejected the push outright - "refusing to allow a GitHub App to
+          # create or update workflow ... without `workflows` permission" - which
+          # is what killed runs 43772815541 / 43779062886 on upstream v1.15.3.
+          # Falls back to the default credential when the secret is absent.
           MERGE_PUSH_PAT: ${{ secrets.MERGE_PUSH_PAT }}
         shell: bash
         run: |
@@ -81,11 +84,38 @@ jobs:
           echo "Newest upstream release: $TARGET"
           if ! git merge-base --is-ancestor "refs/tags/$TARGET" HEAD; then
             echo "Merging upstream $TARGET into the patched branch"
-            if ! git merge --no-edit "refs/tags/$TARGET"; then
+            # --no-commit, commit by hand: the workflow strip below has to land
+            # INSIDE the merge commit. A follow-up revert does not work - by then
+            # the workflow-adding change is already in the pushed history.
+            if ! git merge --no-commit --no-edit "refs/tags/$TARGET"; then
               git merge --abort 2>/dev/null || true
               echo "::error title=Upstream merge conflict::upstream $TARGET conflicts with the local mnemory patches. Merge $TARGET into mn-deployed by hand (the patched files are listed in deploy/DEPLOYED.md), push, and rerun. The last good image stays deployed."
               exit 1
             fi
+
+            # Put .github/workflows back to this branch's own state. Paths the
+            # merge added are not in HEAD, so they are rm'd; modified or
+            # upstream-deleted paths are checked out from HEAD.
+            # Result: the .github/workflows diff between the old branch tip and
+            # the merge commit comes out empty, which is what the push gate reads.
+            STRIPPED=""
+            while IFS= read -r wf; do
+              [ -n "$wf" ] || continue
+              if git cat-file -e "HEAD:$wf" 2>/dev/null; then
+                git checkout HEAD -- "$wf"
+              else
+                git rm -f --quiet -- "$wf"
+              fi
+              STRIPPED="$STRIPPED $wf"
+            done < <(git diff --cached --name-only HEAD -- .github/workflows)
+            if [ -n "$STRIPPED" ]; then
+              echo "Stripped upstream workflow files from the merge commit:$STRIPPED"
+              echo "::warning title=Upstream CI files not merged::Kept this branch .github/workflows as-is; skipped:$STRIPPED"
+            fi
+            # --allow-empty: an upstream release that touches nothing but
+            # .github/workflows strips down to an empty diff, and a bare
+            # commit would then die here under set -e.
+            git commit --allow-empty --no-edit --quiet
             if [ -n "$MERGE_PUSH_PAT" ]; then
               git push "https://x-access-token:${MERGE_PUSH_PAT}@github.com/magikfly/mnemory.git" "HEAD:refs/heads/mn-deployed"
             else
